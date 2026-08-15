@@ -115,9 +115,9 @@ export class PiRuntimeAdapter implements AgentRuntime {
 
     this.activeSessions.set(request.runId, session);
     let output = "";
-    const pendingEmissions: Promise<void>[] = [];
+    let emissionQueue = Promise.resolve();
     const forward = (event: Parameters<RuntimeRequest["emit"]>[0]): void => {
-      pendingEmissions.push(request.emit(event));
+      emissionQueue = emissionQueue.then(() => request.emit(event));
     };
     const unsubscribe = session.subscribe((event) => {
       if (
@@ -149,7 +149,7 @@ export class PiRuntimeAdapter implements AgentRuntime {
         throw abortError(request.signal.reason);
       }
       await session.prompt(buildUserPrompt(request));
-      await Promise.all(pendingEmissions);
+      await emissionQueue;
       if (session.agent.state.errorMessage) {
         throw new Error(`Pi model error: ${session.agent.state.errorMessage}`);
       }
