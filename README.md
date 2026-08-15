@@ -60,7 +60,7 @@ cp .env.example .env
 
 中国区 Z.AI/智谱 Coding Plan 使用 `ZAI_CODING_CN_API_KEY` 和
 `zai-coding-cn`；全球版使用 `ZAI_API_KEY` 和 `zai`。默认示例模型是
-`glm-5.3`。配置完成后执行：
+`glm-4.7`。配置完成后执行：
 
 ```bash
 pnpm demo -- --runtime=pi "@architect 评审当前多 Agent 架构"
@@ -69,7 +69,7 @@ pnpm demo -- --runtime=pi "@architect 评审当前多 Agent 架构"
 也可以在命令行覆盖模型选择：
 
 ```bash
-pnpm demo -- --runtime=pi --provider=zai-coding-cn --model=glm-5.3 --thinking=medium "@architect 评审当前架构"
+pnpm demo -- --runtime=pi --provider=zai-coding-cn --model=glm-4.7 --thinking=medium "@architect 评审当前架构"
 ```
 
 Pi 适配器默认只提供只读工具和 `send_message`。如果明确希望 Agent 修改当前仓库：
