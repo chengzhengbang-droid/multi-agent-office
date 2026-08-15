@@ -17,10 +17,18 @@ if (existsSync(envPath)) {
 const args = process.argv.slice(2);
 const usePi = args.includes("--runtime=pi");
 const allowPiWrite = args.includes("--pi-write");
-const provider = readOption(args, "provider") ?? process.env.MAO_PI_PROVIDER;
-const model = readOption(args, "model") ?? process.env.MAO_PI_MODEL;
+const provider =
+  readOption(args, "provider") ??
+  process.env.MAO_PI_PROVIDER ??
+  (usePi ? "zai-coding-cn" : undefined);
+const model =
+  readOption(args, "model") ??
+  process.env.MAO_PI_MODEL ??
+  (usePi ? "glm-5.2" : undefined);
 const thinkingLevel = parseThinkingLevel(
-  readOption(args, "thinking") ?? process.env.MAO_PI_THINKING,
+  readOption(args, "thinking") ??
+    process.env.MAO_PI_THINKING ??
+    (usePi ? "medium" : undefined),
 );
 const prompt = args
   .filter((arg) => !arg.startsWith("--"))
