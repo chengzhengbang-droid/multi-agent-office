@@ -1,6 +1,8 @@
-# Multi-Agent Pi MVP
+# multi-agent-office
 
-这是一个最小但完整的多 Agent 平台骨架。平台拥有线程、消息、因果链、A2A 路由、上下文编译、事件日志和取消；Pi 只是一个可替换的 Agent Runtime。
+一个面向办公协作与软件开发的多智能体系统。
+
+当前版本是一个最小但完整的多 Agent 平台骨架。平台拥有线程、消息、因果链、A2A 路由、上下文编译、事件日志和取消；Pi 只是一个可替换的 Agent Runtime。
 
 ## 已实现的链路
 
