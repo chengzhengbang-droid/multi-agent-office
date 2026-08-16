@@ -73,7 +73,7 @@ MAO_CODEX_COMMAND=/absolute/path/to/codex
 
 ## 生成安装包
 
-打包机需要 Node.js 22.12+ 和 pnpm。先安装依赖，然后按打包机当前系统生成安装包：
+打包机需要 Node.js 22.13+ 和 pnpm。先安装依赖，然后按打包机当前系统生成安装包：
 
 ```bash
 pnpm install
@@ -101,7 +101,7 @@ pnpm pack:desktop
 
 ## 从源码启动
 
-需要 Node.js 22.12+ 和 pnpm：
+需要 Node.js 22.13+ 和 pnpm：
 
 ```bash
 pnpm install
