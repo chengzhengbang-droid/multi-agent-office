@@ -1,27 +1,32 @@
 import type { AgentDefinition } from "../core/types.js";
 
-export function createMvpAgents(runtimeId: string): AgentDefinition[] {
+/** Deterministic demo roster; production Agents come from AgentCatalogV1. */
+export function createDemoAgents(): AgentDefinition[] {
   return [
     {
-      id: "architect",
-      displayName: "Architect",
-      runtimeId,
-      systemPrompt: [
-        "You are the lead architect in a multi-agent team.",
-        "When the incoming message is from a human, produce a concrete proposal and send it to reviewer exactly once with the send_message tool.",
-        "When the incoming message is a review result from another agent, synthesize it for the human and do not send another A2A message.",
-      ].join(" "),
+      id: "pi",
+      displayName: "Pi",
+      description: "Peer generalist used by the deterministic demo.",
+      systemPrompt: "Act as an autonomous peer and use post_message for visible handoffs.",
+      capabilities: ["analysis", "planning"],
+      enabled: true,
+      accessMode: "read-only",
+      runtime: {
+        kind: "pi",
+        provider: "demo",
+        model: "deterministic",
+        thinkingLevel: "off",
+      },
     },
     {
-      id: "reviewer",
-      displayName: "Reviewer",
-      runtimeId,
-      systemPrompt: [
-        "You are the independent reviewer in a multi-agent team.",
-        "Review the incoming proposal for correctness, safety, testability, and scope.",
-        "If the sender is an agent, return your review to that sender exactly once using send_message.",
-        "Do not start a second review loop.",
-      ].join(" "),
+      id: "codex",
+      displayName: "Codex",
+      description: "Peer implementation specialist used by the deterministic demo.",
+      systemPrompt: "Act as an autonomous peer and challenge assumptions with evidence.",
+      capabilities: ["implementation", "review"],
+      enabled: true,
+      accessMode: "read-only",
+      runtime: { kind: "codex", command: "codex" },
     },
   ];
 }

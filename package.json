@@ -1,25 +1,112 @@
 {
   "name": "multi-agent-pi-mvp",
-  "version": "0.1.0",
+  "version": "0.2.1",
   "private": true,
   "type": "module",
-  "description": "A platform-owned multi-agent MVP with Pi as a replaceable runtime adapter.",
+  "packageManager": "pnpm@11.19.0",
+  "main": "dist/src/electron-main.js",
+  "author": "Multi-Agent Office contributors",
+  "description": "A local peer multi-Agent workspace for Pi and Codex CLI runtimes.",
   "scripts": {
-    "build": "tsc -p tsconfig.json",
-    "check": "tsc -p tsconfig.json --noEmit",
+    "build": "pnpm run build:core && pnpm run build:web",
+    "build:core": "tsc -p tsconfig.json",
+    "build:web": "vite build",
+    "check": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.web.json --noEmit",
+    "dev": "tsx src/server.ts --dev",
+    "desktop": "pnpm build && electron .",
+    "pack:desktop": "pnpm build && electron-builder --dir",
+    "dist:desktop": "pnpm build && electron-builder",
+    "dist:mac": "pnpm build && electron-builder --mac",
+    "dist:win": "pnpm build && electron-builder --win nsis --x64",
+    "dist:linux": "pnpm build && electron-builder --linux",
     "demo": "node --import tsx src/demo.ts",
-    "test": "tsc -p tsconfig.json && node --test dist/test/**/*.test.js"
+    "start": "node dist/src/server.js",
+    "test": "pnpm run build:core && node --test dist/test/**/*.test.js"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=22.12"
   },
   "dependencies": {
     "@earendil-works/pi-coding-agent": "0.84.2",
-    "typebox": "1.3.14"
+    "@modelcontextprotocol/sdk": "1.30.0",
+    "lucide-react": "^1.31.0",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8",
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1",
+    "typebox": "1.3.14",
+    "zod": "4.4.3"
+  },
+  "optionalDependencies": {
+    "@mariozechner/clipboard-win32-x64-msvc": "0.3.9"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.4",
+    "@vitejs/plugin-react": "^6.0.5",
+    "electron": "43.4.0",
+    "electron-builder": "26.15.3",
     "tsx": "4.23.12",
-    "typescript": "7.0.2"
+    "typescript": "7.0.2",
+    "vite": "^8.2.1"
+  },
+  "build": {
+    "appId": "com.multiagentoffice.desktop",
+    "productName": "Multi-Agent Office",
+    "artifactName": "${productName}-${version}-${os}-${arch}.${ext}",
+    "toolsets": {
+      "nsis": "1.2.1"
+    },
+    "directories": {
+      "output": "release",
+      "buildResources": "build"
+    },
+    "icon": "build/icon.png",
+    "files": [
+      "dist/src/**/*",
+      "dist-web/**/*",
+      "build/icon.png",
+      "package.json"
+    ],
+    "asarUnpack": [
+      "**/*.node",
+      "**/*.wasm"
+    ],
+    "mac": {
+      "category": "public.app-category.developer-tools",
+      "target": [
+        "dmg",
+        "zip"
+      ]
+    },
+    "win": {
+      "artifactName": "${productName}-Setup-${version}-windows-${arch}.${ext}",
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "build/icon.png"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "installerLanguages": [
+        "zh_CN",
+        "en_US"
+      ]
+    },
+    "linux": {
+      "category": "Development",
+      "target": [
+        "AppImage"
+      ]
+    }
   }
 }

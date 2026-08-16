@@ -8,11 +8,17 @@ export interface EventStore {
 }
 
 export class JsonlEventStore implements EventStore {
+  private appendQueue = Promise.resolve();
+
   public constructor(private readonly filePath: string) {}
 
   public async append(event: StoredPlatformEvent): Promise<void> {
-    await mkdir(dirname(this.filePath), { recursive: true });
-    await appendFile(this.filePath, `${JSON.stringify(event)}\n`, "utf8");
+    const write = this.appendQueue.then(async () => {
+      await mkdir(dirname(this.filePath), { recursive: true });
+      await appendFile(this.filePath, `${JSON.stringify(event)}\n`, "utf8");
+    });
+    this.appendQueue = write.catch(() => undefined);
+    await write;
   }
 
   public async readAll(): Promise<StoredPlatformEvent[]> {
