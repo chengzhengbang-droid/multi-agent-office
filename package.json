@@ -17,7 +17,7 @@
     "pack:desktop": "pnpm build && electron-builder --dir",
     "dist:desktop": "pnpm build && electron-builder",
     "dist:mac": "pnpm build && electron-builder --mac",
-    "dist:win": "pnpm build && electron-builder --win nsis --x64",
+    "dist:win": "pnpm build && electron-builder --win nsis --x64 --publish never",
     "dist:linux": "pnpm build && electron-builder --linux",
     "demo": "node --import tsx src/demo.ts",
     "start": "node dist/src/server.js",
