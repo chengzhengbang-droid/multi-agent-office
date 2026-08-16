@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -82,14 +82,13 @@ test("run callback tokens are scoped to one run identity and expire", async () =
 
 test("Codex adapter starts with exec JSONL and resumes the saved CLI thread", async () => {
   const directory = await mkdtemp(join(tmpdir(), "mao-codex-fixture-"));
-  const command = join(directory, "fake-codex.mjs");
+  const fixture = join(directory, "exec");
   const logPath = join(directory, "args.jsonl");
   const previousLog = process.env.FAKE_CODEX_LOG;
   process.env.FAKE_CODEX_LOG = logPath;
   try {
-    await writeFile(command, `#!/usr/bin/env node
-import { appendFileSync } from "node:fs";
-const args = process.argv.slice(2);
+    await writeFile(fixture, `const { appendFileSync } = require("node:fs");
+const args = ["exec", ...process.argv.slice(2)];
 appendFileSync(process.env.FAKE_CODEX_LOG, JSON.stringify(args) + "\\n");
 const resumed = args.includes("resume");
 console.log(JSON.stringify({ type: "thread.started", thread_id: "codex-session-123" }));
@@ -100,14 +99,13 @@ if (!resumed) {
 }
 console.log(JSON.stringify({ type: "item.completed", item: { id: resumed ? "m2" : "m1", type: "agent_message", text: resumed ? "resumed answer" : "first answer" } }));
 `, "utf8");
-    await chmod(command, 0o755);
 
     const sessions = new InMemoryRuntimeSessionStore();
     const callbacks = new RunCallbackRegistry();
     const adapter = new CodexRuntimeAdapter({
       id: "codex",
       cwd: directory,
-      spec: { kind: "codex", command },
+      spec: { kind: "codex", command: process.execPath },
       accessMode: "workspace-write",
       fingerprint: "fingerprint-1",
       sessionStore: sessions,
@@ -141,10 +139,10 @@ console.log(JSON.stringify({ type: "item.completed", item: { id: resumed ? "m2" 
 
 test("Codex adapter reports nonzero exits and cancels the child process", async () => {
   const directory = await mkdtemp(join(tmpdir(), "mao-codex-control-"));
-  const command = join(directory, "controlled-codex.mjs");
+  const fixture = join(directory, "exec");
   const previousMode = process.env.FAKE_CODEX_MODE;
   try {
-    await writeFile(command, `#!/usr/bin/env node
+    await writeFile(fixture, `
 if (process.env.FAKE_CODEX_MODE === "fail") {
   console.error("fixture failure");
   process.exit(7);
@@ -152,11 +150,10 @@ if (process.env.FAKE_CODEX_MODE === "fail") {
 process.on("SIGTERM", () => process.exit(0));
 setInterval(() => {}, 1000);
 `, "utf8");
-    await chmod(command, 0o755);
     const adapter = new CodexRuntimeAdapter({
       id: "codex",
       cwd: directory,
-      spec: { kind: "codex", command },
+      spec: { kind: "codex", command: process.execPath },
       accessMode: "read-only",
       fingerprint: "control",
       sessionStore: new InMemoryRuntimeSessionStore(),
