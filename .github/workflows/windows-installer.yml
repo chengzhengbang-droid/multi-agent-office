@@ -63,16 +63,17 @@ jobs:
             throw "Installed executable was not found at $executable"
           }
 
+          $smokeData = Join-Path $env:RUNNER_TEMP "multi-agent-office-user-data"
           $appProcess = Start-Process `
             -FilePath $executable `
-            -ArgumentList "--smoke-test" `
+            -ArgumentList "--smoke-test", "--user-data-dir=$smokeData" `
             -Wait `
             -PassThru
           if ($appProcess.ExitCode -ne 0) {
             throw "Installed application exited with code $($appProcess.ExitCode)"
           }
 
-          $desktopLog = Join-Path $env:APPDATA "Multi-Agent Office\desktop.log"
+          $desktopLog = Join-Path $smokeData "desktop.log"
           if (-not (Test-Path $desktopLog)) {
             throw "Installed application did not create desktop.log"
           }
