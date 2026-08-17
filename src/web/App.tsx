@@ -13,6 +13,7 @@ import {
   ChevronDown,
   CirclePlus,
   Clock3,
+  Download,
   Eye,
   EyeOff,
   Folder,
@@ -22,6 +23,7 @@ import {
   Moon,
   PanelRight,
   Plus,
+  RefreshCw,
   Save,
   SendHorizontal,
   Settings2,
@@ -49,6 +51,7 @@ import type {
   Thread,
   ThinkingLevel,
 } from "../core/types";
+import type { DesktopUpdateSnapshot } from "../desktop/update-contract";
 
 interface WorkspaceSummary {
   name: string;
@@ -105,6 +108,10 @@ export function App() {
   const [selectedWorkspace, setSelectedWorkspace] = useState<WorkspaceSummary>();
   const [workspacePickerOpen, setWorkspacePickerOpen] = useState(false);
   const [catalogOpen, setCatalogOpen] = useState(false);
+  const [updateOpen, setUpdateOpen] = useState(false);
+  const [desktopUpdate, setDesktopUpdate] = useState<DesktopUpdateSnapshot>();
+  const [updateActionRunning, setUpdateActionRunning] = useState(false);
+  const [updateActionError, setUpdateActionError] = useState("");
   const [mentionAgent, setMentionAgent] = useState("codex");
   const [draft, setDraft] = useState("");
   const [sending, setSending] = useState(false);
@@ -123,6 +130,24 @@ export function App() {
     document.documentElement.dataset.theme = theme;
     window.localStorage.setItem("mao-theme", theme);
   }, [theme]);
+
+  useEffect(() => {
+    const bridge = window.maoDesktop;
+    if (!bridge) return;
+    let disposed = false;
+    void bridge.getUpdateState().then((snapshot) => {
+      if (!disposed) setDesktopUpdate(snapshot);
+    }).catch((error: unknown) => {
+      if (!disposed) setUpdateActionError(errorMessage(error));
+    });
+    const unsubscribe = bridge.onUpdateState((snapshot) => {
+      if (!disposed) setDesktopUpdate(snapshot);
+    });
+    return () => {
+      disposed = true;
+      unsubscribe();
+    };
+  }, []);
 
   useEffect(() => {
     fetch("/api/bootstrap")
@@ -170,6 +195,7 @@ export function App() {
         setSidebarOpen(false);
         setWorkspacePickerOpen(false);
         setCatalogOpen(false);
+        setUpdateOpen(false);
       }
     };
     window.addEventListener("keydown", onKeyDown);
@@ -271,6 +297,20 @@ export function App() {
     setSelectedWorkspace({ name: workspaceName(firstPath), path: firstPath });
   };
 
+  const performUpdateAction = async () => {
+    const bridge = window.maoDesktop;
+    if (!bridge || updateActionRunning) return;
+    setUpdateActionRunning(true);
+    setUpdateActionError("");
+    try {
+      setDesktopUpdate(await bridge.performUpdateAction());
+    } catch (error) {
+      setUpdateActionError(errorMessage(error));
+    } finally {
+      setUpdateActionRunning(false);
+    }
+  };
+
   if (data?.setup.required) {
     return <FirstRunSetup onComplete={finishSetup} />;
   }
@@ -302,6 +342,7 @@ export function App() {
             <span className={`runtime-dot ${onlineCount > 0 && connectionState === "connected" ? "runtime-dot--ready" : ""}`} />
             <span><strong>{onlineCount}/{data?.catalog.agents.length ?? 0} Agent 在线</strong><small>{connectionLabel(configured, connectionState)}</small></span>
           </button>
+          <button className={`icon-button update-button update-button--${desktopUpdate?.state.phase ?? "browser"}`} type="button" onClick={() => { setUpdateActionError(""); setUpdateOpen(true); }} aria-label="检查应用更新" title={updateButtonTitle(desktopUpdate)}><RefreshCw size={17} /><span /></button>
           <button className="icon-button" type="button" onClick={() => setCatalogOpen(true)} aria-label="管理 Agent"><Settings2 size={17} /></button>
           <button className="icon-button" type="button" onClick={() => setTheme(theme === "dark" ? "light" : "dark")} aria-label="切换主题">{theme === "dark" ? <Sun size={17} /> : <Moon size={17} />}</button>
         </div>
@@ -351,6 +392,7 @@ export function App() {
       <DetailsDrawer open={drawerOpen} onClose={() => setDrawerOpen(false)} thread={selectedThread} agents={data?.agents ?? []} workspace={activeWorkspace} events={data?.events ?? []} />
       <WorkspacePicker open={workspacePickerOpen} current={activeWorkspace} recent={recentWorkspaces} onClose={() => setWorkspacePickerOpen(false)} onSelect={(workspace) => { setSelectedWorkspace(workspace); setSelectedThreadId(undefined); setDrawerOpen(false); setSidebarOpen(false); setWorkspacePickerOpen(false); }} />
       {data && <AgentCatalogEditor open={catalogOpen} catalog={data.catalog} agents={data.agents} onClose={() => setCatalogOpen(false)} onSave={saveCatalog} />}
+      <UpdateDialog open={updateOpen} snapshot={desktopUpdate} actionRunning={updateActionRunning} error={updateActionError} onClose={() => setUpdateOpen(false)} onAction={() => void performUpdateAction()} />
     </div>
   );
 }
@@ -470,6 +512,76 @@ function FirstRunSetup({ onComplete }: { onComplete(data: BootstrapData): void }
 
 function SearchIcon() {
   return <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="11" cy="11" r="8" /><path d="m21 21-4.3-4.3" /></svg>;
+}
+
+interface UpdateDialogProps {
+  open: boolean;
+  snapshot?: DesktopUpdateSnapshot;
+  actionRunning: boolean;
+  error: string;
+  onClose(): void;
+  onAction(): void;
+}
+
+function UpdateDialog({ open, snapshot, actionRunning, error, onClose, onAction }: UpdateDialogProps) {
+  if (!open) return null;
+  const phase = snapshot?.state.phase ?? "browser";
+  const supported = snapshot?.supported ?? false;
+  const busy = actionRunning || phase === "checking" || phase === "downloading";
+  const status = updateStatusCopy(snapshot);
+  return <div className="update-dialog-scrim" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><section className="update-dialog" role="dialog" aria-modal="true" aria-labelledby="update-dialog-title">
+    <header><div><strong id="update-dialog-title">应用更新</strong><span>{snapshot ? `${desktopPlatformLabel(snapshot.platform)} · ${snapshot.packaged ? "桌面安装版" : "桌面开发模式"}` : "浏览器模式"}</span></div><button className="icon-button" type="button" onClick={onClose} aria-label="关闭更新窗口"><X size={18} /></button></header>
+    <div className="update-dialog-body">
+      <div className={`update-hero update-hero--${phase}`}><span className="update-hero-icon">{phase === "available" || phase === "downloading" ? <Download size={23} /> : phase === "downloaded" ? <Check size={23} /> : <RefreshCw className={busy ? "update-spin" : ""} size={23} />}</span><div><strong>{status.title}</strong><p>{status.detail}</p></div></div>
+      {snapshot && <div className="update-version-grid"><div><span>当前版本</span><strong>v{snapshot.state.currentVersion}</strong></div><div><span>最新版本</span><strong>{snapshot.state.latestVersion ? `v${snapshot.state.latestVersion}` : "检查后显示"}</strong></div></div>}
+      {phase === "downloading" && <div className="update-progress" aria-label={`下载进度 ${Math.round(snapshot?.state.percent ?? 0)}%`}><span style={{ width: `${Math.round(snapshot?.state.percent ?? 0)}%` }} /></div>}
+      {(error || snapshot?.state.error) && <div className="update-inline-error"><XCircle size={14} />{error || snapshot?.state.error}</div>}
+      <p className="update-note">桌面安装版会在启动 30 秒后自动检查，此后每 6 小时检查一次。更新不会覆盖本地配置、Agent 或任务记录。</p>
+    </div>
+    <footer><button className="update-secondary" type="button" onClick={onClose}>{phase === "downloaded" ? "稍后安装" : "关闭"}</button><button className="update-primary" type="button" onClick={onAction} disabled={!supported || busy}>{updateActionLabel(snapshot, actionRunning)}</button></footer>
+  </section></div>;
+}
+
+function updateStatusCopy(snapshot?: DesktopUpdateSnapshot): { title: string; detail: string } {
+  if (!snapshot) return { title: "浏览器界面无需单独更新", detail: "此页面与桌面安装版使用同一套界面；桌面程序的版本更新请在安装版中执行。" };
+  if (!snapshot.supported) return snapshot.packaged
+    ? { title: "当前安装包未启用更新通道", detail: "请使用 GitHub Release 中的 Windows 或 macOS 正式安装包。" }
+    : { title: "桌面开发模式", detail: "界面与正式安装版一致，但源码模式不会连接发布更新服务。" };
+  switch (snapshot.state.phase) {
+    case "checking": return { title: "正在检查更新", detail: "正在连接 GitHub Release 更新通道…" };
+    case "available": return { title: `发现新版本 v${snapshot.state.latestVersion ?? ""}`, detail: "可以直接在应用内下载，无需前往浏览器下载安装包。" };
+    case "downloading": return { title: `正在下载 ${Math.round(snapshot.state.percent ?? 0)}%`, detail: `v${snapshot.state.latestVersion ?? ""} 下载完成后即可重启安装。` };
+    case "downloaded": return { title: `v${snapshot.state.latestVersion ?? ""} 已准备好`, detail: "点击重启安装；选择稍后时，会在退出应用时自动安装。" };
+    case "error": return { title: "更新检查失败", detail: "可以稍后重试，详细错误也已写入桌面运行日志。" };
+    case "idle": return { title: "检查 Multi-Agent Office 更新", detail: "点击下方按钮检查 GitHub Release 中是否有新版本。" };
+  }
+}
+
+function updateActionLabel(snapshot: DesktopUpdateSnapshot | undefined, running: boolean): string {
+  if (running) return "正在处理…";
+  if (!snapshot?.supported) return "当前无需操作";
+  switch (snapshot.state.phase) {
+    case "checking": return "正在检查…";
+    case "available": return "下载更新";
+    case "downloading": return `正在下载 ${Math.round(snapshot.state.percent ?? 0)}%`;
+    case "downloaded": return "重启并安装";
+    case "error": return "重新检查";
+    case "idle": return "检查更新";
+  }
+}
+
+function updateButtonTitle(snapshot?: DesktopUpdateSnapshot): string {
+  if (snapshot?.state.phase === "available") return `发现新版本 v${snapshot.state.latestVersion ?? ""}`;
+  if (snapshot?.state.phase === "downloading") return `正在下载更新 ${Math.round(snapshot.state.percent ?? 0)}%`;
+  if (snapshot?.state.phase === "downloaded") return `v${snapshot.state.latestVersion ?? ""} 等待安装`;
+  return "检查应用更新";
+}
+
+function desktopPlatformLabel(platform: string): string {
+  if (platform === "darwin") return "macOS";
+  if (platform === "win32") return "Windows";
+  if (platform === "linux") return "Linux";
+  return platform;
 }
 
 function EmptyTask({ agents, onSuggestion }: { agents: AgentSummary[]; onSuggestion(value: string): void }) {

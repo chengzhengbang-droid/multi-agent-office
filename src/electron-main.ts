@@ -9,11 +9,26 @@ import {
   app,
   BrowserWindow,
   dialog,
+  ipcMain,
   Menu,
   shell,
   Tray,
+  type MessageBoxOptions,
   type MenuItemConstructorOptions,
 } from "electron";
+import electronUpdater from "electron-updater";
+import {
+  AppUpdaterController,
+  updateMenuPresentation,
+  type AppUpdateState,
+  type UpdateClient,
+} from "./desktop/app-updater.js";
+import {
+  DESKTOP_UPDATE_GET_STATE,
+  DESKTOP_UPDATE_PERFORM_ACTION,
+  DESKTOP_UPDATE_STATE_CHANGED,
+  type DesktopUpdateSnapshot,
+} from "./desktop/update-contract.js";
 import {
   APP_NAME,
   migrateLegacyUserData,
@@ -61,9 +76,13 @@ let serverProcess: ChildProcessWithoutNullStreams | undefined;
 let serverUrl: string | undefined;
 let quitting = false;
 let fatalErrorShown = false;
+let desktopPaths: DesktopPaths | undefined;
+let desktopUpdater: AppUpdaterController | undefined;
 const isWindows = process.platform === "win32";
+const isMac = process.platform === "darwin";
 const isSmokeTest = process.argv.includes("--smoke-test");
 const isWindowSmokeTest = process.argv.includes("--smoke-test-window");
+const automaticUpdatesSupported = (isWindows || isMac) && app.isPackaged;
 const appDataRoot = app.getPath("appData");
 const userDataDirectory = selectUserDataDirectory(appDataRoot, process.argv);
 mkdirSync(userDataDirectory.path, { recursive: true });
@@ -89,6 +108,7 @@ app.on("second-instance", () => {
 
 app.on("before-quit", () => {
   quitting = true;
+  desktopUpdater?.dispose();
   stopServer();
 });
 
@@ -98,6 +118,17 @@ app.on("window-all-closed", () => {
 
 app.on("activate", () => {
   showMainWindow();
+});
+
+ipcMain.handle(DESKTOP_UPDATE_GET_STATE, (event) => {
+  assertTrustedUpdateSender(event.sender);
+  return desktopUpdateSnapshot();
+});
+
+ipcMain.handle(DESKTOP_UPDATE_PERFORM_ACTION, async (event) => {
+  assertTrustedUpdateSender(event.sender);
+  await handleUpdateMenuAction();
+  return desktopUpdateSnapshot();
 });
 
 if (hasSingleInstanceLock) {
@@ -158,8 +189,10 @@ async function startDesktopApp(): Promise<void> {
     return;
   }
 
-  installApplicationMenu({ configPath, dataRoot, logPath });
-  if (isWindows) installWindowsTray({ configPath, dataRoot, logPath });
+  desktopPaths = { configPath, dataRoot, logPath };
+  installApplicationMenu(desktopPaths);
+  if (isWindows) installWindowsTray(desktopPaths);
+  if (!isWindowSmokeTest) initializeDesktopUpdater();
   const window = mainWindow ?? createMainWindow();
   mainWindow = window;
   void window.loadURL(serverUrl);
@@ -227,6 +260,13 @@ function createMainWindow(): BrowserWindow {
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
+      preload: join(
+        app.getAppPath(),
+        "dist",
+        "src",
+        "desktop",
+        "preload.js",
+      ),
     },
   });
   window.once("ready-to-show", () => window.show());
@@ -298,13 +338,22 @@ async function openFrontendInBrowser(url: string): Promise<void> {
   }
 }
 
-function installWindowsTray(paths: {
+interface DesktopPaths {
   configPath: string;
   dataRoot: string;
   logPath: string;
-}): void {
-  tray = new Tray(join(app.getAppPath(), "build", "icon.png"));
-  tray.setToolTip("Multi-Agent Office");
+}
+
+function installWindowsTray(paths: DesktopPaths): void {
+  if (!tray) {
+    tray = new Tray(join(app.getAppPath(), "build", "icon.png"));
+    tray.on("double-click", () => showMainWindow());
+  }
+  tray.setToolTip(updateTrayTooltip(desktopUpdater?.state));
+  const updateItem = updateMenuPresentation(
+    desktopUpdater?.state,
+    automaticUpdatesSupported,
+  );
   tray.setContextMenu(
     Menu.buildFromTemplate([
       {
@@ -332,19 +381,28 @@ function installWindowsTray(paths: {
       },
       { type: "separator" },
       {
+        label: updateItem.label,
+        enabled: updateItem.enabled,
+        click: () => void handleUpdateMenuAction(),
+      },
+      {
+        label: `当前版本 v${app.getVersion()}`,
+        enabled: false,
+      },
+      { type: "separator" },
+      {
         label: "退出",
         click: () => app.quit(),
       },
     ]),
   );
-  tray.on("double-click", () => showMainWindow());
 }
 
-function installApplicationMenu(paths: {
-  configPath: string;
-  dataRoot: string;
-  logPath: string;
-}): void {
+function installApplicationMenu(paths: DesktopPaths): void {
+  const updateItem = updateMenuPresentation(
+    desktopUpdater?.state,
+    automaticUpdatesSupported,
+  );
   const template: MenuItemConstructorOptions[] = [];
   if (process.platform === "darwin") {
     template.push({
@@ -413,8 +471,175 @@ function installApplicationMenu(paths: {
         { role: "togglefullscreen" },
       ],
     },
+    {
+      label: "帮助",
+      submenu: [
+        {
+          label: updateItem.label,
+          enabled: updateItem.enabled,
+          click: () => void handleUpdateMenuAction(),
+        },
+        { type: "separator" },
+        {
+          label: `当前版本 v${app.getVersion()}`,
+          enabled: false,
+        },
+      ],
+    },
   );
   Menu.setApplicationMenu(Menu.buildFromTemplate(template));
+}
+
+function initializeDesktopUpdater(): void {
+  if (!automaticUpdatesSupported || desktopUpdater) return;
+  try {
+    desktopUpdater = new AppUpdaterController({
+      updater: electronUpdater.autoUpdater as unknown as UpdateClient,
+      currentVersion: app.getVersion(),
+      onStateChange: (state) => updateDesktopUpdateState(state),
+      log: (message) => void writeDesktopLog(message),
+      askToDownload: async (version) => {
+        if (quitting) return false;
+        const result = await showDesktopMessage({
+          type: "info",
+          title: "发现新版本",
+          message: `Multi-Agent Office v${version} 已发布`,
+          detail: `当前版本为 v${app.getVersion()}。下载完成后可以直接重启安装，现有配置、Agent 和任务记录都会保留。`,
+          buttons: ["下载更新", "稍后"],
+          defaultId: 0,
+          cancelId: 1,
+          noLink: true,
+        });
+        return result.response === 0;
+      },
+      askToInstall: async (version) => {
+        if (quitting) return false;
+        const result = await showDesktopMessage({
+          type: "info",
+          title: "更新已下载",
+          message: `v${version} 已准备好安装`,
+          detail:
+            "立即安装会重启应用并停止当前正在运行的 Agent 任务。选择稍后时，更新会在退出应用时自动安装。",
+          buttons: ["立即重启并安装", "退出应用时安装"],
+          defaultId: 0,
+          cancelId: 1,
+          noLink: true,
+        });
+        return result.response === 0;
+      },
+      showNoUpdate: async (version) => {
+        if (quitting) return;
+        await showDesktopMessage({
+          type: "info",
+          title: "检查更新",
+          message: "当前已是最新版本",
+          detail: `Multi-Agent Office v${version}`,
+          buttons: ["确定"],
+          defaultId: 0,
+          noLink: true,
+        });
+      },
+      showError: async (message) => {
+        if (quitting) return;
+        await showDesktopMessage({
+          type: "error",
+          title: "更新失败",
+          message: "无法完成更新操作",
+          detail: `${message}\n\n详细信息已写入：${desktopLogPath}`,
+          buttons: ["确定"],
+          defaultId: 0,
+          noLink: true,
+        });
+      },
+      prepareToInstall: () => {
+        quitting = true;
+        desktopUpdater?.dispose();
+        stopServer();
+        void writeDesktopLog("Stopping local server before update installation");
+      },
+    });
+    desktopUpdater.initialize();
+    desktopUpdater.scheduleBackgroundChecks();
+    void writeDesktopLog("Automatic updater initialized");
+  } catch (error) {
+    void writeDesktopLog(`Could not initialize automatic updater: ${errorStack(error)}`);
+  }
+}
+
+async function handleUpdateMenuAction(): Promise<void> {
+  if (desktopUpdater) {
+    await desktopUpdater.performMenuAction();
+    return;
+  }
+  const detail = app.isPackaged
+    ? "当前安装包没有可用的自动更新通道。"
+    : "源码开发模式不会连接发布更新服务；请在 Windows 或 macOS 安装版中使用此功能。";
+  await showDesktopMessage({
+    type: "info",
+    title: "检查更新",
+    message: "当前运行方式不支持自动更新",
+    detail,
+    buttons: ["确定"],
+    defaultId: 0,
+    noLink: true,
+  });
+}
+
+function updateDesktopUpdateState(state: AppUpdateState): void {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.setProgressBar(
+      state.phase === "downloading" ? (state.percent ?? 0) / 100 : -1,
+    );
+    mainWindow.webContents.send(
+      DESKTOP_UPDATE_STATE_CHANGED,
+      desktopUpdateSnapshot(state),
+    );
+  }
+  refreshDesktopMenus();
+}
+
+function desktopUpdateSnapshot(
+  state: AppUpdateState = desktopUpdater?.state ?? {
+    phase: "idle",
+    currentVersion: app.getVersion(),
+  },
+): DesktopUpdateSnapshot {
+  return {
+    mode: "desktop",
+    platform: process.platform,
+    packaged: app.isPackaged,
+    supported: automaticUpdatesSupported,
+    state,
+  };
+}
+
+function assertTrustedUpdateSender(sender: Electron.WebContents): void {
+  if (!mainWindow || mainWindow.isDestroyed() || sender !== mainWindow.webContents) {
+    throw new Error("拒绝来自未知窗口的更新请求");
+  }
+}
+
+function refreshDesktopMenus(): void {
+  if (!desktopPaths) return;
+  installApplicationMenu(desktopPaths);
+  if (isWindows && tray) installWindowsTray(desktopPaths);
+}
+
+function updateTrayTooltip(state: AppUpdateState | undefined): string {
+  if (state?.phase === "downloading") {
+    return `Multi-Agent Office · 正在下载更新 ${Math.round(state.percent ?? 0)}%`;
+  }
+  if (state?.phase === "downloaded") {
+    return `Multi-Agent Office · v${state.latestVersion ?? ""} 等待安装`;
+  }
+  return "Multi-Agent Office";
+}
+
+function showDesktopMessage(options: MessageBoxOptions) {
+  const window = mainWindow;
+  return window && !window.isDestroyed()
+    ? dialog.showMessageBox(window, options)
+    : dialog.showMessageBox(options);
 }
 
 async function ensureConfigFile(path: string): Promise<void> {
