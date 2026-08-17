@@ -3,6 +3,8 @@ name: Windows installer
 on:
   workflow_dispatch:
   push:
+    branches:
+      - main
     tags:
       - "v*"
 
@@ -94,7 +96,7 @@ jobs:
 
   publish-release:
     name: Publish Windows installer
-    if: github.ref_type == 'tag'
+    if: github.ref_type == 'tag' || github.ref == 'refs/heads/main'
     needs: build-windows-installer
     runs-on: ubuntu-latest
     permissions:
@@ -110,6 +112,10 @@ jobs:
       - name: Add installer to GitHub Release
         uses: softprops/action-gh-release@v3
         with:
+          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || format('main-build-{0}', github.run_number) }}
+          name: ${{ github.ref_type == 'tag' && github.ref_name || format('Main build #{0}', github.run_number) }}
+          prerelease: ${{ github.ref_type != 'tag' }}
+          target_commitish: ${{ github.sha }}
           generate_release_notes: true
           files: |
             release/*.exe
