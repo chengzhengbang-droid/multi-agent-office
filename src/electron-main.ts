@@ -46,11 +46,21 @@ MAO_SETUP_COMPLETED=0
 MAO_MAX_PARALLEL_READ_RUNS=4
 `;
 
+const LOADING_PAGE = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>Multi-Agent Office</title><style>
+html,body{height:100%;margin:0;font-family:"Segoe UI","Microsoft YaHei",system-ui,sans-serif;background:#f5f1e8;color:#3f3a33;display:flex;align-items:center;justify-content:center}
+main{text-align:center}
+.spinner{width:36px;height:36px;border:3px solid #d8d0c0;border-top-color:#7a6f5d;border-radius:50%;margin:0 auto 16px;animation:s 1s linear infinite}
+@keyframes s{to{transform:rotate(360deg)}}
+h1{font-size:18px;font-weight:600;margin:0 0 8px}
+p{font-size:13px;margin:0;color:#6f675a}
+</style></head><body><main><div class="spinner"></div><h1>Multi-Agent Office 正在启动</h1><p>正在启动本地服务，首次启动或磁盘较慢时可能需要一分钟左右…</p></main></body></html>`;
+
 let mainWindow: BrowserWindow | undefined;
 let tray: Tray | undefined;
 let serverProcess: ChildProcessWithoutNullStreams | undefined;
 let serverUrl: string | undefined;
 let quitting = false;
+let fatalErrorShown = false;
 const isWindows = process.platform === "win32";
 const isSmokeTest = process.argv.includes("--smoke-test");
 const isWindowSmokeTest = process.argv.includes("--smoke-test-window");
@@ -60,6 +70,15 @@ mkdirSync(userDataDirectory.path, { recursive: true });
 app.setName(APP_NAME);
 app.setPath("userData", userDataDirectory.path);
 const desktopLogPath = join(userDataDirectory.path, "desktop.log");
+
+// A double-click on the shortcut must never be silently swallowed: any crash the
+// launcher itself did not anticipate is logged and surfaced before exiting.
+process.on("uncaughtException", (error) => {
+  void reportFatalError("Uncaught exception", error, true);
+});
+process.on("unhandledRejection", (reason) => {
+  void reportFatalError("Unhandled rejection", reason, false);
+});
 
 const hasSingleInstanceLock = app.requestSingleInstanceLock();
 if (!hasSingleInstanceLock) app.quit();
@@ -88,7 +107,7 @@ if (hasSingleInstanceLock) {
       type: "error",
       title: "Multi-Agent Office 启动失败",
       message: errorMessage(error),
-      detail: "请查看用户数据目录中的 desktop.log。",
+      detail: `请查看运行日志：${desktopLogPath}`,
     });
     app.quit();
   });
@@ -118,6 +137,11 @@ async function startDesktopApp(): Promise<void> {
   await ensureConfigFile(configPath);
   await mkdir(dataRoot, { recursive: true });
 
+  // Show feedback immediately: the local server may need a while on a cold
+  // disk or behind antivirus scanning, and an invisible launch reads as "the
+  // app does not start" on end-user machines.
+  if (!isSmokeTest) mainWindow = createMainWindow();
+
   const port = await findAvailablePort();
   serverUrl = `http://127.0.0.1:${port}`;
   serverProcess = startServerProcess({
@@ -136,9 +160,11 @@ async function startDesktopApp(): Promise<void> {
 
   installApplicationMenu({ configPath, dataRoot, logPath });
   if (isWindows) installWindowsTray({ configPath, dataRoot, logPath });
-  mainWindow = createMainWindow(serverUrl);
+  const window = mainWindow ?? createMainWindow();
+  mainWindow = window;
+  void window.loadURL(serverUrl);
   if (isWindowSmokeTest) {
-    await waitForMainWindow(mainWindow, serverUrl);
+    await waitForMainWindow(window, serverUrl);
     await writeDesktopLog("Main window ready");
     app.quit();
   }
@@ -188,7 +214,7 @@ function startServerProcess(input: {
   return child;
 }
 
-function createMainWindow(url: string): BrowserWindow {
+function createMainWindow(): BrowserWindow {
   const window = new BrowserWindow({
     title: "Multi-Agent Office",
     width: 1440,
@@ -205,7 +231,9 @@ function createMainWindow(url: string): BrowserWindow {
   });
   window.once("ready-to-show", () => window.show());
   window.on("close", (event) => {
-    if (isWindows && !quitting) {
+    // On Windows the tray owns the lifecycle: closing the window hides it and
+    // keeps the local server running, matching the documented behavior.
+    if (isWindows && !quitting && tray) {
       event.preventDefault();
       window.hide();
     }
@@ -218,20 +246,25 @@ function createMainWindow(url: string): BrowserWindow {
     return { action: "deny" };
   });
   window.webContents.on("will-navigate", (event, target) => {
-    if (!target.startsWith(url)) event.preventDefault();
+    if (!serverUrl || !target.startsWith(serverUrl)) event.preventDefault();
   });
-  void window.loadURL(url);
+  void window.loadURL(
+    `data:text/html;charset=utf-8,${encodeURIComponent(LOADING_PAGE)}`,
+  );
   return window;
 }
 
 function showMainWindow(): void {
-  if (!serverUrl) return;
-  if (!mainWindow || mainWindow.isDestroyed()) {
-    mainWindow = createMainWindow(serverUrl);
+  let window = mainWindow;
+  if (!window || window.isDestroyed()) {
+    if (!serverUrl) return;
+    window = createMainWindow();
+    mainWindow = window;
+    void window.loadURL(serverUrl);
   }
-  if (mainWindow.isMinimized()) mainWindow.restore();
-  mainWindow.show();
-  mainWindow.focus();
+  if (window.isMinimized()) window.restore();
+  window.show();
+  window.focus();
 }
 
 async function waitForMainWindow(
@@ -304,9 +337,7 @@ function installWindowsTray(paths: {
       },
     ]),
   );
-  tray.on("double-click", () => {
-    showMainWindow();
-  });
+  tray.on("double-click", () => showMainWindow());
 }
 
 function installApplicationMenu(paths: {
@@ -420,7 +451,10 @@ async function waitForServer(
   url: string,
   child: ChildProcessWithoutNullStreams,
 ): Promise<void> {
-  for (let attempt = 0; attempt < 100; attempt += 1) {
+  // Slow disks and antivirus scans can make the first server start take tens
+  // of seconds; the loading window keeps the user informed meanwhile.
+  const deadline = Date.now() + 120_000;
+  while (Date.now() < deadline) {
     if (child.exitCode !== null || child.signalCode !== null) {
       throw new Error("本地服务在启动完成前退出，请查看 desktop.log");
     }
@@ -432,7 +466,7 @@ async function waitForServer(
     }
     await delay(100);
   }
-  throw new Error("等待本地服务启动超时，请查看 desktop.log");
+  throw new Error("等待本地服务启动超时（120 秒），请查看 desktop.log");
 }
 
 function desktopPath(): string {
@@ -464,6 +498,27 @@ function errorMessage(error: unknown): string {
 
 function errorStack(error: unknown): string {
   return error instanceof Error && error.stack ? error.stack : errorMessage(error);
+}
+
+async function reportFatalError(
+  kind: string,
+  error: unknown,
+  fatal: boolean,
+): Promise<void> {
+  await writeDesktopLog(`${kind}: ${errorStack(error)}`);
+  if (!fatal) return;
+  if (!fatalErrorShown) {
+    fatalErrorShown = true;
+    try {
+      dialog.showErrorBox(
+        "Multi-Agent Office 无法启动",
+        `${errorMessage(error)}\n\n日志：${desktopLogPath}`,
+      );
+    } catch {
+      // The dialog is best-effort; the log above is the source of truth.
+    }
+  }
+  app.exit(1);
 }
 
 async function writeDesktopLog(message: string): Promise<void> {
