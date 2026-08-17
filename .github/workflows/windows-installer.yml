@@ -125,6 +125,18 @@ jobs:
       contents: write
 
     steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Read package version
+        id: package_version
+        shell: bash
+        run: |
+          version=$(node -p "require('./package.json').version")
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
       - name: Download Windows installer
         uses: actions/download-artifact@v6
         with:
@@ -135,7 +147,7 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ github.ref_type == 'tag' && github.ref_name || format('main-build-{0}', github.run_number) }}
-          name: ${{ github.ref_type == 'tag' && github.ref_name || format('Main build {0}', github.run_number) }}
+          name: ${{ github.ref_type == 'tag' && github.ref_name || format('v{0}', steps.package_version.outputs.version) }}
           prerelease: false
           make_latest: true
           target_commitish: ${{ github.sha }}
