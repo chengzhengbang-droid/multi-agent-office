@@ -2,13 +2,57 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
   AppUpdaterController,
+  appUpdateSupport,
   updateMenuPresentation,
   type UpdateClient,
 } from "../src/desktop/app-updater.js";
+import { signatureDetailsIndicateDeveloperId } from "../src/desktop/mac-signature.js";
+
+test("update support requires a packaged and Developer ID signed macOS app", () => {
+  assert.deepEqual(appUpdateSupport("darwin", true, true), {
+    supported: true,
+    reason: "supported",
+    manualDownloadAvailable: false,
+  });
+  assert.deepEqual(appUpdateSupport("darwin", true, false), {
+    supported: false,
+    reason: "unsigned-macos",
+    manualDownloadAvailable: true,
+  });
+  assert.deepEqual(appUpdateSupport("darwin", false, false), {
+    supported: false,
+    reason: "development",
+    manualDownloadAvailable: false,
+  });
+  assert.deepEqual(appUpdateSupport("linux", true), {
+    supported: false,
+    reason: "unsupported-platform",
+    manualDownloadAvailable: true,
+  });
+});
+
+test("Developer ID signature details reject ad-hoc macOS builds", () => {
+  assert.equal(
+    signatureDetailsIndicateDeveloperId(
+      "Authority=Developer ID Application: Example Corp (ABCDE12345)\nTeamIdentifier=ABCDE12345",
+    ),
+    true,
+  );
+  assert.equal(
+    signatureDetailsIndicateDeveloperId(
+      "Signature=adhoc\nTeamIdentifier=not set",
+    ),
+    false,
+  );
+});
 
 test("update menu describes each actionable updater state", () => {
   assert.deepEqual(updateMenuPresentation(undefined, false), {
     label: "检查更新…",
+    enabled: true,
+  });
+  assert.deepEqual(updateMenuPresentation(undefined, false, true), {
+    label: "手动下载更新…",
     enabled: true,
   });
   assert.deepEqual(

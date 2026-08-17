@@ -19,10 +19,15 @@ import {
 import electronUpdater from "electron-updater";
 import {
   AppUpdaterController,
+  appUpdateSupport,
   updateMenuPresentation,
   type AppUpdateState,
   type UpdateClient,
 } from "./desktop/app-updater.js";
+import {
+  isDeveloperIdSignedMacApp,
+  macApplicationBundlePath,
+} from "./desktop/mac-signature.js";
 import {
   DESKTOP_UPDATE_GET_STATE,
   DESKTOP_UPDATE_PERFORM_ACTION,
@@ -82,7 +87,21 @@ const isWindows = process.platform === "win32";
 const isMac = process.platform === "darwin";
 const isSmokeTest = process.argv.includes("--smoke-test");
 const isWindowSmokeTest = process.argv.includes("--smoke-test-window");
-const automaticUpdatesSupported = (isWindows || isMac) && app.isPackaged;
+const RELEASE_DOWNLOAD_URL =
+  "https://github.com/chengzhengbang-droid/multi-agent-office/releases/latest";
+const macDeveloperIdSigned =
+  !isMac ||
+  !app.isPackaged ||
+  isDeveloperIdSignedMacApp(macApplicationBundlePath(process.execPath));
+const updateSupport = appUpdateSupport(
+  process.platform,
+  app.isPackaged,
+  macDeveloperIdSigned,
+);
+const automaticUpdatesSupported = updateSupport.supported;
+const manualUpdateUrl = updateSupport.manualDownloadAvailable
+  ? RELEASE_DOWNLOAD_URL
+  : undefined;
 const appDataRoot = app.getPath("appData");
 const userDataDirectory = selectUserDataDirectory(appDataRoot, process.argv);
 mkdirSync(userDataDirectory.path, { recursive: true });
@@ -192,6 +211,9 @@ async function startDesktopApp(): Promise<void> {
   desktopPaths = { configPath, dataRoot, logPath };
   installApplicationMenu(desktopPaths);
   if (isWindows) installWindowsTray(desktopPaths);
+  await writeDesktopLog(
+    `Update support: ${updateSupport.reason}${manualUpdateUrl ? "; manual download fallback enabled" : ""}`,
+  );
   if (!isWindowSmokeTest) initializeDesktopUpdater();
   const window = mainWindow ?? createMainWindow();
   mainWindow = window;
@@ -353,6 +375,7 @@ function installWindowsTray(paths: DesktopPaths): void {
   const updateItem = updateMenuPresentation(
     desktopUpdater?.state,
     automaticUpdatesSupported,
+    Boolean(manualUpdateUrl),
   );
   tray.setContextMenu(
     Menu.buildFromTemplate([
@@ -402,6 +425,7 @@ function installApplicationMenu(paths: DesktopPaths): void {
   const updateItem = updateMenuPresentation(
     desktopUpdater?.state,
     automaticUpdatesSupported,
+    Boolean(manualUpdateUrl),
   );
   const template: MenuItemConstructorOptions[] = [];
   if (process.platform === "darwin") {
@@ -571,6 +595,42 @@ async function handleUpdateMenuAction(): Promise<void> {
     await desktopUpdater.performMenuAction();
     return;
   }
+  if (manualUpdateUrl) {
+    const unsignedMac = updateSupport.reason === "unsigned-macos";
+    const result = await showDesktopMessage({
+      type: "warning",
+      title: "手动下载更新",
+      message: unsignedMac
+        ? "此 macOS 安装包无法执行自动更新"
+        : "当前系统需要手动下载安装更新",
+      detail: unsignedMac
+        ? "当前应用没有有效的 Developer ID 签名。请从 GitHub Releases 手动安装下一版已签名安装包；完成这次迁移后，应用内自动更新即可恢复。"
+        : "请从 GitHub Releases 下载适合当前系统的最新安装包。",
+      buttons: ["打开下载页", "取消"],
+      defaultId: 0,
+      cancelId: 1,
+      noLink: true,
+    });
+    if (result.response === 0) {
+      try {
+        await shell.openExternal(manualUpdateUrl);
+      } catch (error) {
+        await writeDesktopLog(
+          `Could not open release download page: ${errorStack(error)}`,
+        );
+        await showDesktopMessage({
+          type: "error",
+          title: "无法打开下载页",
+          message: "请在浏览器中手动打开 GitHub Releases",
+          detail: manualUpdateUrl,
+          buttons: ["确定"],
+          defaultId: 0,
+          noLink: true,
+        });
+      }
+    }
+    return;
+  }
   const detail = app.isPackaged
     ? "当前安装包没有可用的自动更新通道。"
     : "源码开发模式不会连接发布更新服务；请在 Windows 或 macOS 安装版中使用此功能。";
@@ -609,6 +669,8 @@ function desktopUpdateSnapshot(
     platform: process.platform,
     packaged: app.isPackaged,
     supported: automaticUpdatesSupported,
+    supportReason: updateSupport.reason,
+    manualDownloadUrl: manualUpdateUrl,
     state,
   };
 }

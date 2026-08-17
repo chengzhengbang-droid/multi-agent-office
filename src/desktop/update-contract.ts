@@ -1,4 +1,7 @@
-import type { AppUpdateState } from "./app-updater.js";
+import type {
+  AppUpdateState,
+  AppUpdateSupportReason,
+} from "./app-updater.js";
 
 export const DESKTOP_UPDATE_GET_STATE = "desktop-update:get-state";
 export const DESKTOP_UPDATE_PERFORM_ACTION = "desktop-update:perform-action";
@@ -9,6 +12,8 @@ export interface DesktopUpdateSnapshot {
   platform: string;
   packaged: boolean;
   supported: boolean;
+  supportReason: AppUpdateSupportReason;
+  manualDownloadUrl: string | undefined;
   state: AppUpdateState;
 }
 

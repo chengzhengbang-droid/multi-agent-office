@@ -69,11 +69,13 @@ Windows 版运行时会在通知区域保留图标，以便重新打开窗口、
 
 ### 应用内更新
 
-Windows 和 macOS 安装版会在启动 30 秒后检查一次更新，此后每 6 小时后台检查。也可以随时点击网页侧边栏底部的更新按钮，或从应用的 **帮助 → 检查更新** 手动检查；Windows 通知区域图标的右键菜单也保留同一入口。发现新版后，应用会在后台下载安装包并显示下载进度；下载完成后可以立即重启安装，也可以在稍后退出应用时自动安装。用户目录中的 `config.env`、Agent 花名册、任务记录和日志不会被覆盖。
+Windows 和已使用 Developer ID 签名的 macOS 安装版会在启动 30 秒后检查一次更新，此后每 6 小时后台检查。首次启动设置页提供 **检查更新** 按钮；进入工作台后，也可以随时点击侧边栏底部带文字的 **更新** 按钮，或从应用的 **帮助 → 检查更新** 手动检查；Windows 通知区域图标的右键菜单也保留同一入口。发现新版后，应用会在后台下载安装包并显示下载进度；下载完成后可以立即重启安装，也可以在稍后退出应用时自动安装。用户目录中的 `config.env`、Agent 花名册、任务记录和日志不会被覆盖。
 
 浏览器和桌面安装版使用同一套 Web 界面，因此更新入口在两者中位置一致。普通浏览器无需单独更新；只有桌面安装版会通过安全的 preload/IPC 桥接执行系统级安装。源码开发模式不会连接发布更新服务。
 
-macOS Release 同时包含通用架构 DMG 安装包和自动更新所需的 ZIP。macOS 自动更新必须使用 Developer ID 签名并通过 Apple 公证；在仓库 Secrets 中配置 `MAC_CSC_LINK`、`MAC_CSC_KEY_PASSWORD`、`APPLE_ID`、`APPLE_APP_SPECIFIC_PASSWORD` 和 `APPLE_TEAM_ID` 后，流水线会自动完成签名与公证。没有这些 Secrets 时仍会生成用于测试的未签名 DMG，但不能作为可靠的正式自动更新渠道。
+macOS Release 同时包含通用架构 DMG 安装包和自动更新所需的 ZIP。macOS 自动更新必须使用 Developer ID 签名并通过 Apple 公证；在仓库 Secrets 中配置 `MAC_CSC_LINK`、`MAC_CSC_KEY_PASSWORD`、`APPLE_ID`、`APPLE_APP_SPECIFIC_PASSWORD` 和 `APPLE_TEAM_ID` 后，流水线会自动完成签名、公证和发布前验证。没有这些 Secrets 时只会生成保留 7 天的未签名测试 artifact，不会创建或覆盖 GitHub latest Release，避免客户端收到无法安装的更新。
+
+应用启动时会验证当前 macOS 安装包是否具有有效的 Developer ID 签名。旧的未签名版本不会再尝试运行必然失败的自动更新器，而会明确显示 **手动下载更新**。用户需要从 GitHub Releases 手动安装一次已签名版本；此后即可进入正常的应用内自动更新通道。
 
 Pi 运行时已包含在桌面应用中。`@codex` 仍需要用户另外安装并登录 Codex CLI；如果命令不在系统 PATH 中，请在 `config.env` 配置绝对路径：
 
@@ -101,7 +103,7 @@ pnpm dist:linux
 建议分别在 macOS、Windows、Linux 构建并测试对应产物。公开分发前还应为 macOS 应用和 Windows 安装包配置代码签名；未签名的测试包可能触发系统安全警告，macOS 自动更新还会因缺少有效签名而不可用。
 
 Windows 安装包固定为 x64 NSIS 安装器，文件名格式为
-`Multi-Agent Office-Setup-<version>-windows-x64.exe`。仓库中的 **Desktop installers** GitHub Actions 工作流会分别在原生 Windows 和 macOS 环境完成构建与启动验证，并发布 Windows x64 NSIS 安装器、macOS universal DMG/ZIP，以及各平台的 `.blockmap`、`latest.yml` / `latest-mac.yml`。每次推送 `main` 都会自动发布标记为 latest 的 Release，推送 `v*` 标签则会创建对应标签的正式 Release。流水线会根据 `package.json` 的 major/minor/patch 与 GitHub run number 生成单调递增的安装版版本号，供两个平台的应用内更新共同使用。
+`Multi-Agent Office-Setup-<version>-windows-x64.exe`。仓库中的 **Desktop installers** GitHub Actions 工作流会分别在原生 Windows 和 macOS 环境完成构建与启动验证，并发布 Windows x64 NSIS 安装器、macOS universal DMG/ZIP，以及各平台的 `.blockmap`、`latest.yml` / `latest-mac.yml`。macOS 签名和公证凭据齐全、且签名验证通过时，每次推送 `main` 都会自动发布标记为 latest 的 Release，推送 `v*` 标签则会创建对应标签的正式 Release；缺少凭据时仍会完成 Windows 构建和未签名 macOS 冒烟测试，但产物仅保留为 Actions artifact，不会进入任何客户端更新通道。流水线会根据 `package.json` 的 major/minor/patch 与 GitHub run number 生成单调递增的安装版版本号，供两个平台的应用内更新共同使用。
 
 仅生成当前平台可直接运行、但不制作安装器的目录：
 
