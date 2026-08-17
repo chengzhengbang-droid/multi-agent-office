@@ -38,7 +38,7 @@ JSONL EventStore 使用串行 append。旧日志中的 `recipientAgentId`、`roo
 桌面版把 Electron/Node.js 运行时、服务端和网页界面打进同一个应用。用户不需要安装 Node.js 或 pnpm：
 
 1. 下载自己系统对应的文件：macOS 使用 `.dmg`，Windows x64 使用文件名包含 `Setup` 的 `.exe`，Linux 使用 `.AppImage`。
-2. 安装并双击桌面上的 **Multi-Agent Office** 快捷方式。应用会立即显示启动窗口，等本地服务就绪后自动进入前端界面（首次启动或磁盘较慢、杀毒软件扫描时可能需要一分钟左右）；再次双击快捷方式会重新显示窗口。第一个界面会要求选择 API 提供商并输入 API Key。
+2. 安装并双击桌面上的 **Multi-Agent Office** 快捷方式。应用会立即显示启动窗口，等本地服务就绪后自动进入前端界面（首次启动或磁盘较慢、杀毒软件扫描时可能需要一分钟左右）；再次双击快捷方式会把已有窗口显示到前台。第一个界面会要求选择 API 提供商并输入 API Key。
 3. 选择“仅使用 API”即可完全不使用 Codex；如本机已经安装并登录 Codex CLI，也可以选择“API + Codex”。
 4. 点击“保存并进入工作台”。配置会立即生效，不需要打开配置文件或重启应用。
 
@@ -63,7 +63,9 @@ MAO_SETUP_COMPLETED=1
 
 其中 `config.env` 保存密钥，`data/` 保存 Agent 花名册、事件和 session，`desktop.log` 用于排查启动问题。不要把 `config.env` 发给别人或提交到 Git。
 
-Windows 版运行时会在通知区域保留图标，以便重新打开窗口、改用系统浏览器打开前端、查看配置或日志以及退出应用。关闭应用窗口只会把它隐藏到通知区域，不会停止本地服务；要完全退出，请右键通知区域图标并选择“退出”。
+Windows 旧版曾错误地把这些文件放在 `%APPDATA%\multi-agent-pi-mvp\`。新版首次启动时会把旧配置、数据和日志复制到正确目录；已存在的新目录内容不会被覆盖，旧目录也会保留以便恢复。
+
+Windows 版运行时会在通知区域保留图标，以便重新打开窗口、在默认浏览器中打开、查看配置或日志以及退出应用。关闭窗口只会隐藏到通知区域，不会停止本地服务；要完全退出，请右键通知区域图标并选择“退出”。
 
 Pi 运行时已包含在桌面应用中。`@codex` 仍需要用户另外安装并登录 Codex CLI；如果命令不在系统 PATH 中，请在 `config.env` 配置绝对路径：
 
@@ -91,7 +93,7 @@ pnpm dist:linux
 建议分别在 macOS、Windows、Linux 构建并测试对应产物。公开分发前还应为 macOS 应用和 Windows 安装包配置代码签名；未签名的测试包可能触发系统安全警告。
 
 Windows 安装包固定为 x64 NSIS 安装器，文件名格式为
-`Multi-Agent Office-Setup-<version>-windows-x64.exe`。仓库中的 **Windows installer** GitHub Actions 工作流会在原生 Windows 环境完成类型检查、测试和打包：可以在 Actions 页面手动运行并下载构建产物；推送 `v*` 标签时，安装包也会自动附加到对应的 GitHub Release。这样无需在 macOS 上安装 Wine，也不会再只生成 macOS 产物。
+`Multi-Agent Office-Setup-<version>-windows-x64.exe`。仓库中的 **Windows installer** GitHub Actions 工作流会在原生 Windows 环境完成类型检查、测试、安装以及真实窗口启动验证：可以在 Actions 页面手动运行并下载构建产物；每次推送 `main` 都会自动发布以 package.json 版本命名、标记为 latest 的 Release，推送 `v*` 标签则会创建对应标签的正式 Release。这样无需在 macOS 上安装 Wine，也不会再只生成 macOS 产物。
 
 仅生成当前平台可直接运行、但不制作安装器的目录：
 

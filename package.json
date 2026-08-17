@@ -1,6 +1,7 @@
 {
   "name": "multi-agent-pi-mvp",
-  "version": "0.2.2",
+  "productName": "Multi-Agent Office",
+  "version": "0.2.3",
   "private": true,
   "type": "module",
   "packageManager": "pnpm@11.19.0",
