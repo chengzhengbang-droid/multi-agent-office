@@ -84,6 +84,28 @@ jobs:
             throw "Installed application did not start its local server"
           }
 
+          $windowSmokeData = Join-Path $env:RUNNER_TEMP "multi-agent-office-window-user-data"
+          $windowProcess = Start-Process `
+            -FilePath $executable `
+            -ArgumentList "--smoke-test-window", "--user-data-dir=$windowSmokeData" `
+            -PassThru
+          if (-not $windowProcess.WaitForExit(30000)) {
+            Stop-Process -Id $windowProcess.Id -Force
+            throw "Installed application did not finish its window smoke test"
+          }
+          if ($windowProcess.ExitCode -ne 0) {
+            throw "Window smoke test exited with code $($windowProcess.ExitCode)"
+          }
+
+          $windowLog = Join-Path $windowSmokeData "desktop.log"
+          if (-not (Test-Path $windowLog)) {
+            throw "Window smoke test did not create desktop.log"
+          }
+          if (-not (Select-String -Path $windowLog -Pattern "Main window ready" -Quiet)) {
+            Get-Content $windowLog
+            throw "Installed application did not load its main window"
+          }
+
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v7
         with:
@@ -113,7 +135,7 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ github.ref_type == 'tag' && github.ref_name || format('main-build-{0}', github.run_number) }}
-          name: ${{ github.ref_type == 'tag' && github.ref_name || format('Main build #{0}', github.run_number) }}
+          name: ${{ github.ref_type == 'tag' && github.ref_name || format('Main build {0}', github.run_number) }}
           prerelease: ${{ github.ref_type != 'tag' }}
           target_commitish: ${{ github.sha }}
           generate_release_notes: true

@@ -1,5 +1,5 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { createWriteStream, existsSync } from "node:fs";
+import { createWriteStream, existsSync, mkdirSync } from "node:fs";
 import { appendFile, mkdir, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { homedir } from "node:os";
@@ -14,6 +14,11 @@ import {
   Tray,
   type MenuItemConstructorOptions,
 } from "electron";
+import {
+  APP_NAME,
+  migrateLegacyUserData,
+  selectUserDataDirectory,
+} from "./desktop/user-data.js";
 
 const CONFIG_TEMPLATE = `# Multi-Agent Office local configuration
 # Keep this file private. Restart the app after changing it.
@@ -45,23 +50,22 @@ let mainWindow: BrowserWindow | undefined;
 let tray: Tray | undefined;
 let serverProcess: ChildProcessWithoutNullStreams | undefined;
 let serverUrl: string | undefined;
-let desktopLogPath: string | undefined;
 let quitting = false;
 const isWindows = process.platform === "win32";
 const isSmokeTest = process.argv.includes("--smoke-test");
+const isWindowSmokeTest = process.argv.includes("--smoke-test-window");
+const appDataRoot = app.getPath("appData");
+const userDataDirectory = selectUserDataDirectory(appDataRoot, process.argv);
+mkdirSync(userDataDirectory.path, { recursive: true });
+app.setName(APP_NAME);
+app.setPath("userData", userDataDirectory.path);
+const desktopLogPath = join(userDataDirectory.path, "desktop.log");
 
 const hasSingleInstanceLock = app.requestSingleInstanceLock();
 if (!hasSingleInstanceLock) app.quit();
 
 app.on("second-instance", () => {
-  if (isWindows && serverUrl) {
-    void openFrontendInBrowser(serverUrl);
-    return;
-  }
-  if (!mainWindow) return;
-  if (mainWindow.isMinimized()) mainWindow.restore();
-  mainWindow.show();
-  mainWindow.focus();
+  showMainWindow();
 });
 
 app.on("before-quit", () => {
@@ -70,15 +74,11 @@ app.on("before-quit", () => {
 });
 
 app.on("window-all-closed", () => {
-  if (process.platform !== "darwin") app.quit();
+  if (process.platform !== "darwin" && !isWindows) app.quit();
 });
 
 app.on("activate", () => {
-  if (isWindows && serverUrl) {
-    void openFrontendInBrowser(serverUrl);
-    return;
-  }
-  if (!mainWindow && serverUrl) mainWindow = createMainWindow(serverUrl);
+  showMainWindow();
 });
 
 if (hasSingleInstanceLock) {
@@ -95,13 +95,25 @@ if (hasSingleInstanceLock) {
 }
 
 async function startDesktopApp(): Promise<void> {
-  app.setName("Multi-Agent Office");
   if (isWindows) app.setAppUserModelId("com.multiagentoffice.desktop");
-  const userDataRoot = app.getPath("userData");
+  const userDataRoot = userDataDirectory.path;
   const dataRoot = join(userDataRoot, "data");
   const configPath = join(userDataRoot, "config.env");
-  const logPath = join(userDataRoot, "desktop.log");
-  desktopLogPath = logPath;
+  const logPath = desktopLogPath;
+  if (!userDataDirectory.overridden) {
+    try {
+      const migrated = await migrateLegacyUserData(appDataRoot, userDataRoot);
+      if (migrated.length > 0) {
+        await writeDesktopLog(
+          `Migrated legacy user data: ${migrated.join(", ")}`,
+        );
+      }
+    } catch (error) {
+      await writeDesktopLog(
+        `Legacy user data migration failed: ${errorStack(error)}`,
+      );
+    }
+  }
   await writeDesktopLog("Desktop launcher starting");
   await ensureConfigFile(configPath);
   await mkdir(dataRoot, { recursive: true });
@@ -123,11 +135,12 @@ async function startDesktopApp(): Promise<void> {
   }
 
   installApplicationMenu({ configPath, dataRoot, logPath });
-  if (isWindows) {
-    installWindowsTray({ configPath, dataRoot, logPath });
-    await openFrontendInBrowser(serverUrl);
-  } else {
-    mainWindow = createMainWindow(serverUrl);
+  if (isWindows) installWindowsTray({ configPath, dataRoot, logPath });
+  mainWindow = createMainWindow(serverUrl);
+  if (isWindowSmokeTest) {
+    await waitForMainWindow(mainWindow, serverUrl);
+    await writeDesktopLog("Main window ready");
+    app.quit();
   }
 }
 
@@ -191,6 +204,12 @@ function createMainWindow(url: string): BrowserWindow {
     },
   });
   window.once("ready-to-show", () => window.show());
+  window.on("close", (event) => {
+    if (isWindows && !quitting) {
+      event.preventDefault();
+      window.hide();
+    }
+  });
   window.on("closed", () => {
     if (mainWindow === window) mainWindow = undefined;
   });
@@ -203,6 +222,33 @@ function createMainWindow(url: string): BrowserWindow {
   });
   void window.loadURL(url);
   return window;
+}
+
+function showMainWindow(): void {
+  if (!serverUrl) return;
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    mainWindow = createMainWindow(serverUrl);
+  }
+  if (mainWindow.isMinimized()) mainWindow.restore();
+  mainWindow.show();
+  mainWindow.focus();
+}
+
+async function waitForMainWindow(
+  window: BrowserWindow,
+  url: string,
+): Promise<void> {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    if (
+      !window.isDestroyed() &&
+      window.webContents.getURL().startsWith(url) &&
+      !window.webContents.isLoadingMainFrame()
+    ) {
+      return;
+    }
+    await delay(100);
+  }
+  throw new Error("等待主窗口加载超时");
 }
 
 async function openFrontendInBrowser(url: string): Promise<void> {
@@ -230,6 +276,10 @@ function installWindowsTray(paths: {
     Menu.buildFromTemplate([
       {
         label: "打开 Multi-Agent Office",
+        click: () => showMainWindow(),
+      },
+      {
+        label: "在默认浏览器中打开",
         click: () => {
           if (serverUrl) void openFrontendInBrowser(serverUrl);
         },
@@ -255,7 +305,7 @@ function installWindowsTray(paths: {
     ]),
   );
   tray.on("double-click", () => {
-    if (serverUrl) void openFrontendInBrowser(serverUrl);
+    showMainWindow();
   });
 }
 
@@ -417,7 +467,6 @@ function errorStack(error: unknown): string {
 }
 
 async function writeDesktopLog(message: string): Promise<void> {
-  if (!desktopLogPath) return;
   try {
     await appendFile(
       desktopLogPath,
