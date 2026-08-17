@@ -212,14 +212,21 @@ jobs:
             echo "Apple notarization secrets are not configured; producing an unsigned test installer."
           fi
 
-      - name: Build macOS DMG and update ZIP
+      - name: Build signed macOS DMG and update ZIP
+        if: steps.notarization.outputs.enabled == 'true'
         env:
           CSC_LINK: ${{ secrets.MAC_CSC_LINK }}
           CSC_KEY_PASSWORD: ${{ secrets.MAC_CSC_KEY_PASSWORD }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-        run: pnpm exec electron-builder --mac --publish never -c.mac.notarize=${{ steps.notarization.outputs.enabled }}
+        run: pnpm exec electron-builder --mac --publish never -c.mac.notarize=true
+
+      - name: Build unsigned macOS DMG and update ZIP
+        if: steps.notarization.outputs.enabled != 'true'
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+        run: pnpm exec electron-builder --mac --publish never -c.mac.notarize=false
 
       - name: Smoke-test packaged application
         run: |
