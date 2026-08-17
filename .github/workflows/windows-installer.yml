@@ -187,6 +187,15 @@ jobs:
         run: |
           node -e 'const fs = require("node:fs"); const packageJson = require("./package.json"); packageJson.version = process.env.RELEASE_VERSION; fs.writeFileSync("package.json", `${JSON.stringify(packageJson, null, 2)}\n`);'
 
+      - name: Check types
+        run: pnpm run check
+
+      - name: Run tests
+        run: pnpm test
+
+      - name: Build application
+        run: pnpm run build
+
       - name: Detect notarization credentials
         id: notarization
         env:
