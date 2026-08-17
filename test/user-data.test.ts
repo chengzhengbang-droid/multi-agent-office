@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { test } from "node:test";
 import {
   APP_NAME,
@@ -18,7 +18,7 @@ test("user data uses the product name unless an explicit override is supplied", 
   assert.deepEqual(
     selectUserDataDirectory("/app-data", ["--user-data-dir=smoke"], "/work"),
     {
-      path: join("/work", "smoke"),
+      path: resolve("/work", "smoke"),
       overridden: true,
     },
   );
