@@ -1,4 +1,4 @@
-name: Windows installer
+name: Desktop installers
 
 on:
   workflow_dispatch:
@@ -12,8 +12,41 @@ permissions:
   contents: read
 
 jobs:
+  prepare-release:
+    name: Prepare release version
+    runs-on: ubuntu-latest
+    outputs:
+      release-version: ${{ steps.release_version.outputs.version }}
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "22.13.0"
+
+      - name: Compute monotonically increasing release version
+        id: release_version
+        shell: bash
+        run: |
+          base_version=$(node -p "require('./package.json').version")
+          IFS=. read -r major minor patch <<< "$base_version"
+          if [[ -z "$major" || -z "$minor" || -z "$patch" ]]; then
+            echo "package.json version must contain major.minor.patch" >&2
+            exit 1
+          fi
+          release_patch=$((patch * 100000 + GITHUB_RUN_NUMBER))
+          release_version="$major.$minor.$release_patch"
+          echo "version=$release_version" >> "$GITHUB_OUTPUT"
+          echo "Building Multi-Agent Office v$release_version"
+
   build-windows-installer:
     name: Build Windows x64 installer
+    needs: prepare-release
     runs-on: windows-latest
     timeout-minutes: 30
 
@@ -34,6 +67,13 @@ jobs:
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
+
+      - name: Apply release version
+        shell: pwsh
+        run: |
+          $package = Get-Content "package.json" -Raw | ConvertFrom-Json
+          $package.version = "${{ needs.prepare-release.outputs.release-version }}"
+          $package | ConvertTo-Json -Depth 100 | Set-Content "package.json" -Encoding utf8
 
       - name: Check types
         run: pnpm run check
@@ -113,16 +153,17 @@ jobs:
           path: |
             release/*.exe
             release/*.blockmap
+            release/latest.yml
           if-no-files-found: error
           retention-days: 30
 
-  publish-release:
-    name: Publish Windows installer
-    if: github.ref_type == 'tag' || github.ref == 'refs/heads/main'
-    needs: build-windows-installer
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
+  build-macos-installer:
+    name: Build macOS universal installer
+    needs: prepare-release
+    runs-on: macos-latest
+    timeout-minutes: 45
+    outputs:
+      signed-release-ready: ${{ steps.notarization.outputs.enabled }}
 
     steps:
       - name: Check out source
@@ -130,24 +171,158 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Read package version
-        id: package_version
-        shell: bash
-        run: |
-          version=$(node -p "require('./package.json').version")
-          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Install pnpm
+        uses: pnpm/action-setup@v6
 
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "22.13.0"
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Apply release version
+        env:
+          RELEASE_VERSION: ${{ needs.prepare-release.outputs.release-version }}
+        run: |
+          node -e 'const fs = require("node:fs"); const packageJson = require("./package.json"); packageJson.version = process.env.RELEASE_VERSION; fs.writeFileSync("package.json", `${JSON.stringify(packageJson, null, 2)}\n`);'
+
+      - name: Check types
+        run: pnpm run check
+
+      - name: Run tests
+        run: pnpm test
+
+      - name: Build application
+        run: pnpm run build
+
+      - name: Detect notarization credentials
+        id: notarization
+        env:
+          CSC_LINK: ${{ secrets.MAC_CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.MAC_CSC_KEY_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          if [[ -n "$CSC_LINK" && -n "$CSC_KEY_PASSWORD" && -n "$APPLE_ID" && -n "$APPLE_APP_SPECIFIC_PASSWORD" && -n "$APPLE_TEAM_ID" ]]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::Apple signing/notarization secrets are not configured. The macOS build will be uploaded only as an unsigned test artifact and no GitHub Release will be published."
+            {
+              echo "## macOS release was not published"
+              echo
+              echo "Configure MAC_CSC_LINK, MAC_CSC_KEY_PASSWORD, APPLE_ID, APPLE_APP_SPECIFIC_PASSWORD, and APPLE_TEAM_ID to produce an auto-updatable macOS release."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Build signed macOS DMG and update ZIP
+        if: steps.notarization.outputs.enabled == 'true'
+        env:
+          CSC_LINK: ${{ secrets.MAC_CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.MAC_CSC_KEY_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: pnpm exec electron-builder --mac --publish never -c.mac.notarize=true
+
+      - name: Build unsigned macOS DMG and update ZIP
+        if: steps.notarization.outputs.enabled != 'true'
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+        run: pnpm exec electron-builder --mac --publish never -c.mac.notarize=false -c.mac.hardenedRuntime=false
+
+      - name: Smoke-test packaged application
+        run: |
+          executable="release/mac-universal/Multi-Agent Office.app/Contents/MacOS/Multi-Agent Office"
+          if [[ ! -x "$executable" ]]; then
+            echo "Packaged application executable was not found" >&2
+            exit 1
+          fi
+          smoke_data="$RUNNER_TEMP/multi-agent-office-mac-user-data"
+          "$executable" --smoke-test --user-data-dir="$smoke_data"
+          if ! grep -q "Local server ready" "$smoke_data/desktop.log"; then
+            cat "$smoke_data/desktop.log"
+            echo "Packaged macOS application did not start its local server" >&2
+            exit 1
+          fi
+
+      - name: Verify Developer ID signature and notarization
+        if: steps.notarization.outputs.enabled == 'true'
+        run: |
+          app_path="release/mac-universal/Multi-Agent Office.app"
+          codesign --verify --deep --strict --verbose=2 "$app_path"
+          signature_details=$(codesign --display --verbose=4 "$app_path" 2>&1)
+          echo "$signature_details"
+          if ! grep -q '^Authority=Developer ID Application:' <<< "$signature_details"; then
+            echo "Packaged application is not signed with a Developer ID Application certificate" >&2
+            exit 1
+          fi
+          if grep -q '^TeamIdentifier=not set$' <<< "$signature_details"; then
+            echo "Packaged application has no signing TeamIdentifier" >&2
+            exit 1
+          fi
+          spctl --assess --type execute --verbose=2 "$app_path"
+          xcrun stapler validate "$app_path"
+
+      - name: Upload signed macOS release artifact
+        if: steps.notarization.outputs.enabled == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: multi-agent-office-macos-universal-${{ github.run_number }}
+          path: |
+            release/*.dmg
+            release/*.zip
+            release/*.blockmap
+            release/latest-mac.yml
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload unsigned macOS test artifact
+        if: steps.notarization.outputs.enabled != 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: multi-agent-office-macos-unsigned-test-${{ github.run_number }}
+          path: |
+            release/*.dmg
+            release/*.zip
+          if-no-files-found: error
+          retention-days: 7
+
+  publish-release:
+    name: Publish desktop installers
+    if: >-
+      (github.ref_type == 'tag' || github.ref == 'refs/heads/main') &&
+      needs.build-macos-installer.outputs.signed-release-ready == 'true'
+    needs:
+      - prepare-release
+      - build-windows-installer
+      - build-macos-installer
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
       - name: Download Windows installer
         uses: actions/download-artifact@v6
         with:
           name: multi-agent-office-windows-x64-${{ github.run_number }}
           path: release
 
+      - name: Download macOS installer
+        uses: actions/download-artifact@v6
+        with:
+          name: multi-agent-office-macos-universal-${{ github.run_number }}
+          path: release
+
       - name: Add installer to GitHub Release
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ github.ref_type == 'tag' && github.ref_name || format('main-build-{0}', github.run_number) }}
-          name: ${{ github.ref_type == 'tag' && github.ref_name || format('v{0}', steps.package_version.outputs.version) }}
+          name: ${{ github.ref_type == 'tag' && github.ref_name || format('v{0}', needs.prepare-release.outputs.release-version) }}
           prerelease: false
           make_latest: true
           target_commitish: ${{ github.sha }}
@@ -155,3 +330,7 @@ jobs:
           files: |
             release/*.exe
             release/*.blockmap
+            release/latest.yml
+            release/*.dmg
+            release/*.zip
+            release/latest-mac.yml

@@ -1,10 +1,14 @@
 {
   "name": "multi-agent-pi-mvp",
   "productName": "Multi-Agent Office",
-  "version": "0.2.3",
+  "version": "0.3.0",
   "private": true,
   "type": "module",
   "packageManager": "pnpm@11.19.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/chengzhengbang-droid/multi-agent-office.git"
+  },
   "main": "dist/src/electron-main.js",
   "author": "Multi-Agent Office contributors",
   "description": "A local peer multi-Agent workspace for Pi and Codex CLI runtimes.",
@@ -30,6 +34,7 @@
   "dependencies": {
     "@earendil-works/pi-coding-agent": "0.84.2",
     "@modelcontextprotocol/sdk": "1.30.0",
+    "electron-updater": "6.8.9",
     "lucide-react": "^1.31.0",
     "react": "^19.2.8",
     "react-dom": "^19.2.8",
@@ -55,6 +60,15 @@
   "build": {
     "appId": "com.multiagentoffice.desktop",
     "productName": "Multi-Agent Office",
+    "electronUpdaterCompatibility": ">=2.16",
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "chengzhengbang-droid",
+        "repo": "multi-agent-office",
+        "releaseType": "release"
+      }
+    ],
     "artifactName": "${productName}-${version}-${os}-${arch}.${ext}",
     "toolsets": {
       "nsis": "1.2.1"
@@ -76,9 +90,23 @@
     ],
     "mac": {
       "category": "public.app-category.developer-tools",
+      "hardenedRuntime": true,
+      "entitlements": "build/entitlements.mac.plist",
+      "entitlementsInherit": "build/entitlements.mac.inherit.plist",
+      "x64ArchFiles": "**/*darwin*/**",
       "target": [
-        "dmg",
-        "zip"
+        {
+          "target": "dmg",
+          "arch": [
+            "universal"
+          ]
+        },
+        {
+          "target": "zip",
+          "arch": [
+            "universal"
+          ]
+        }
       ]
     },
     "win": {
