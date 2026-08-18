@@ -11,8 +11,9 @@ import {
 } from "../src/runtime/codex-runtime.js";
 import type { RuntimeEvent, RuntimeRequest } from "../src/runtime/runtime.js";
 import {
-  piToolsForAccess,
+  piExcludedTools,
   resolvePiAvailability,
+  summarizeToolPayload,
 } from "../src/runtime/pi-runtime.js";
 import {
   FileRuntimeSessionStore,
@@ -28,12 +29,24 @@ test("Codex JSONL projection separates messages, tools, errors, and sessions", (
   assert.deepEqual(projectCodexJsonlEvent({ type: "turn.failed", error: { message: "bad turn" } }), { type: "error", message: "bad turn" });
 });
 
-test("Pi access modes expose the intended Bash/edit/write capabilities", () => {
-  assert.deepEqual(piToolsForAccess("read-only"), ["read", "grep", "find", "ls", "post_message"]);
-  assert.equal(piToolsForAccess("workspace-write").includes("bash"), false);
-  assert.equal(piToolsForAccess("workspace-write").includes("edit"), true);
-  assert.equal(piToolsForAccess("full").includes("bash"), true);
-  assert.equal(piToolsForAccess("full").includes("write"), true);
+test("Pi access modes deny capabilities instead of allow-listing them", () => {
+  // A denylist keeps extension-registered tools reachable; an allowlist would
+  // silently drop every tool an extension contributes.
+  assert.deepEqual(piExcludedTools("read-only"), ["bash", "edit", "write"]);
+  assert.deepEqual(piExcludedTools("workspace-write"), ["bash"]);
+  assert.deepEqual(piExcludedTools("full"), []);
+});
+
+test("tool payload summaries are bounded so the event log stays small", () => {
+  assert.equal(summarizeToolPayload(undefined), undefined);
+  assert.equal(summarizeToolPayload({ command: "ls" }), '{"command":"ls"}');
+  const long = summarizeToolPayload("x".repeat(5_000));
+  assert.ok(long);
+  assert.ok(long.length < 2_100);
+  assert.ok(long.endsWith("（已截断）"));
+  const cyclic: Record<string, unknown> = {};
+  cyclic.self = cyclic;
+  assert.equal(summarizeToolPayload(cyclic), undefined);
 });
 
 test("DeepSeek runtime requires and recognizes its API key", () => {
@@ -52,6 +65,49 @@ test("DeepSeek runtime requires and recognizes its API key", () => {
     available: true,
     label: "deepseek/deepseek-v4-flash",
   });
+});
+
+test("Pi credentials stored in auth.json count as configured", () => {
+  const configured = { hasConfiguredAuth: (provider: string) => provider === "anthropic" };
+  const anthropic = {
+    kind: "pi" as const,
+    provider: "anthropic",
+    model: "claude-sonnet-5",
+    thinkingLevel: "medium" as const,
+  };
+  // An OAuth or auth.json login sets no environment variable, yet the Agent
+  // must still be routable.
+  assert.equal(resolvePiAvailability(anthropic, {}, configured).available, true);
+  assert.equal(
+    resolvePiAvailability({ ...anthropic, provider: "openai", model: "gpt-5.5" }, {}, configured)
+      .available,
+    false,
+  );
+  // Environment variables still work when the credential store knows nothing.
+  assert.equal(
+    resolvePiAvailability(
+      { ...anthropic, provider: "deepseek", model: "deepseek-v4-flash" },
+      { DEEPSEEK_API_KEY: "sk-example" },
+      configured,
+    ).available,
+    true,
+  );
+});
+
+test("providers outside the preset table are not blocked without a probe", () => {
+  // The preset table only covers the first-run page; judging an unlisted
+  // provider offline from it would block a valid auth.json setup.
+  const xai = {
+    kind: "pi" as const,
+    provider: "xai",
+    model: "grok-4",
+    thinkingLevel: "medium" as const,
+  };
+  assert.equal(resolvePiAvailability(xai, {}).available, true);
+  assert.equal(
+    resolvePiAvailability(xai, {}, { hasConfiguredAuth: () => false }).available,
+    false,
+  );
 });
 
 test("run callback tokens are scoped to one run identity and expire", async () => {

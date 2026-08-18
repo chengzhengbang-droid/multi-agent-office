@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
 import { RecentContextCompiler } from "../src/core/context-compiler.js";
 import { InMemoryEventStore } from "../src/core/event-store.js";
@@ -324,6 +327,171 @@ test("rejects configuration changes to an Agent with a live run", async () => {
   assert.throws(() => platform.beginRosterUpdate([{ ...definition, systemPrompt: "changed" }]), /active or queued run/);
   await platform.cancelGroup(chain.chainId);
   await chain.completion;
+});
+
+test("observability runtime events are projected onto the shared event log", async () => {
+  const platform = createPlatform([agent("pi")], new Map([["pi", runtime("pi", async (request) => {
+    await request.emit({ type: "thinking_delta", text: "weighing options" });
+    await request.emit({ type: "text_delta", text: "draft" });
+    await request.emit({ type: "output_reset", reason: "retry" });
+    await request.emit({ type: "lifecycle", phase: "retry_start", detail: "overloaded" });
+    await request.emit({ type: "tool_start", toolName: "bash", toolCallId: "call-1", args: '{"command":"ls"}' });
+    await request.emit({ type: "tool_end", toolName: "bash", toolCallId: "call-1", isError: false, resultSummary: "README.md" });
+    await request.emit({ type: "diagnostic", source: "extension", message: "hooks.ts failed" });
+    await request.emit({
+      type: "usage",
+      inputTokens: 120,
+      outputTokens: 40,
+      cacheReadTokens: 8,
+      cacheWriteTokens: 0,
+      totalTokens: 168,
+      costUsd: 0.0123,
+      contextTokens: 900,
+      contextWindow: 200_000,
+    });
+    return { output: "final" };
+  })]]), "pi");
+  await platform.postUserMessage({ content: "@pi go" });
+  const events = await platform.getEvents();
+
+  const thinking = events.find((event) => event.type === "run.thinking");
+  assert.equal(thinking?.type === "run.thinking" ? thinking.text : "", "weighing options");
+  assert.equal(countEvents(events, "run.reset"), 1);
+
+  const lifecycle = events.find((event) => event.type === "run.lifecycle");
+  assert.equal(lifecycle?.type === "run.lifecycle" ? lifecycle.phase : "", "retry_start");
+  assert.equal(lifecycle?.type === "run.lifecycle" ? lifecycle.detail : "", "overloaded");
+
+  // The existing phase/toolName/isError shape is preserved; the new call id,
+  // arguments, and result summary ride alongside as optional fields.
+  const toolStart = events.find((event) => event.type === "run.tool" && event.phase === "start");
+  assert.equal(toolStart?.type === "run.tool" ? toolStart.args : undefined, '{"command":"ls"}');
+  assert.equal(toolStart?.type === "run.tool" ? toolStart.toolCallId : undefined, "call-1");
+  const toolEnd = events.find((event) => event.type === "run.tool" && event.phase === "end");
+  assert.equal(toolEnd?.type === "run.tool" ? toolEnd.resultSummary : undefined, "README.md");
+  assert.equal(toolEnd?.type === "run.tool" ? toolEnd.isError : undefined, false);
+
+  const diagnostic = events.find((event) => event.type === "run.diagnostic");
+  assert.equal(diagnostic?.type === "run.diagnostic" ? diagnostic.source : "", "extension");
+
+  const usage = events.find((event) => event.type === "run.usage");
+  assert.equal(usage?.type === "run.usage" ? usage.totalTokens : 0, 168);
+  assert.equal(usage?.type === "run.usage" ? usage.contextWindow : 0, 200_000);
+  // The usage payload must not smuggle a second `type` field into the log.
+  assert.equal(usage?.type, "run.usage");
+
+  // Reset does not rewrite history; the completed output is authoritative.
+  const completed = events.find((event) => event.type === "run.completed");
+  assert.equal(completed?.type === "run.completed" ? completed.output : "", "final");
+});
+
+test("a steerable runtime takes a human message mid-run instead of queueing", async () => {
+  const steered: Array<{ runId: string; text: string }> = [];
+  let release: (() => void) | undefined;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  let started: (() => void) | undefined;
+  const running = new Promise<void>((resolve) => { started = resolve; });
+  const base = runtime("pi", async (request) => {
+    started?.();
+    await held;
+    return { output: "done" };
+  });
+  const steerable: AgentRuntime = {
+    ...base,
+    execute: base.execute.bind(base),
+    cancel: base.cancel.bind(base),
+    steer: async (runId, text) => { steered.push({ runId, text }); return true; },
+  };
+  const platform = createPlatform([agent("pi")], new Map([["pi", steerable]]), "pi");
+  const first = await platform.startUserMessage({ content: "@pi start" });
+  await running;
+
+  const second = await platform.startUserMessage({ content: "@pi also check the logs", threadId: first.threadId, steer: true });
+  assert.deepEqual(second.steered, ["pi"]);
+  // A steered message resolves immediately: it joins the in-flight run rather
+  // than starting a chain of its own.
+  await second.completion;
+  assert.equal(steered.length, 1);
+  assert.match(steered[0]?.text ?? "", /also check the logs/);
+
+  release?.();
+  await first.completion;
+
+  const events = await platform.getEvents();
+  // Exactly one run: the second message never queued behind the first.
+  assert.equal(countEvents(events, "run.queued"), 1);
+  assert.equal(countEvents(events, "run.steered"), 1);
+  // Both human messages are still recorded in the shared thread, so the
+  // transcript shows what was said mid-run.
+  const humanMessages = events.filter((event) => event.type === "message.created" && event.message.sender.type === "human");
+  assert.equal(humanMessages.length, 2);
+});
+
+test("steering falls back to a queued run when the runtime cannot take it", async () => {
+  let release: (() => void) | undefined;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  let started: (() => void) | undefined;
+  const running = new Promise<void>((resolve) => { started = resolve; });
+  let first = true;
+  const platform = createPlatform([agent("pi")], new Map([["pi", runtime("pi", async () => {
+    if (first) { first = false; started?.(); await held; }
+    return { output: "done" };
+  })]]), "pi");
+  const initial = await platform.startUserMessage({ content: "@pi start" });
+  await running;
+  const followUp = await platform.startUserMessage({ content: "@pi more", threadId: initial.threadId, steer: true });
+  assert.deepEqual(followUp.steered, []);
+  release?.();
+  await initial.completion;
+  await followUp.completion;
+  const events = await platform.getEvents();
+  assert.equal(countEvents(events, "run.queued"), 2);
+  assert.equal(countEvents(events, "run.steered"), 0);
+});
+
+test("image attachments reach the runtime as bytes and stay off the event log", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "mao-attachments-"));
+  try {
+    const png = Buffer.from("89504e470d0a1a0a", "hex");
+    const path = join(directory, "shot.png");
+    await writeFile(path, png);
+    let seen: RuntimeRequest | undefined;
+    const platform = createPlatform([agent("pi")], new Map([["pi", runtime("pi", async (request) => {
+      seen = request;
+      return { output: "looked" };
+    })]]), "pi");
+    await platform.postUserMessage({
+      content: "@pi what is this",
+      attachments: [{ id: "att_1", mediaType: "image/png", path, byteSize: png.length }],
+    });
+    assert.equal(seen?.images?.length, 1);
+    assert.equal(seen?.images?.[0]?.mediaType, "image/png");
+    assert.equal(seen?.images?.[0]?.data, png.toString("base64"));
+    assert.equal(seen?.attachments?.[0]?.path, path);
+
+    const events = await platform.getEvents();
+    const message = events.find((event) => event.type === "message.created");
+    // The log keeps the reference, never the bytes.
+    assert.equal(message?.type === "message.created" ? message.message.attachments?.[0]?.id : "", "att_1");
+    assert.ok(!JSON.stringify(events).includes(png.toString("base64")));
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("a missing attachment file is skipped instead of failing the run", async () => {
+  let seen: RuntimeRequest | undefined;
+  const platform = createPlatform([agent("pi")], new Map([["pi", runtime("pi", async (request) => {
+    seen = request;
+    return { output: "ok" };
+  })]]), "pi");
+  await platform.postUserMessage({
+    content: "@pi look",
+    attachments: [{ id: "att_gone", mediaType: "image/png", path: join(tmpdir(), "mao-missing-attachment.png"), byteSize: 4 }],
+  });
+  assert.equal(seen?.images, undefined);
+  const events = await platform.getEvents();
+  assert.equal(countEvents(events, "run.completed"), 1);
 });
 
 function createPlatform(
