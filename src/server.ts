@@ -31,6 +31,7 @@ import type {
   ThinkingLevel,
 } from "./core/types.js";
 import { RunCallbackRegistry, type CallbackRequest } from "./runtime/callback-registry.js";
+import { PiSharedRuntime } from "./runtime/pi-shared.js";
 import { createAgentRuntimes, type RuntimeFactoryOptions } from "./runtime/runtime-factory.js";
 import { FileRuntimeSessionStore } from "./runtime/session-store.js";
 
@@ -61,8 +62,10 @@ const sessionStore = new FileRuntimeSessionStore(
   resolve(dataRoot, "runtime-sessions", "index.json"),
 );
 const callbackRegistry = new RunCallbackRegistry();
+const piShared = new PiSharedRuntime();
 const runtimeFactoryOptions: RuntimeFactoryOptions = {
   projectRoot: defaultWorkspaceRoot,
+  piShared,
   sessionRoot: resolve(dataRoot, "runtime-sessions"),
   sessionStore,
   callbackRegistry,
@@ -72,7 +75,7 @@ const runtimeFactoryOptions: RuntimeFactoryOptions = {
     ? ["--import", "tsx", resolve(appRoot, "src", "mcp", "collaboration-server.ts")]
     : [resolve(appRoot, "dist", "src", "mcp", "collaboration-server.js")],
 };
-let runtimes = createAgentRuntimes(catalog.agents, runtimeFactoryOptions);
+let runtimes = await createAgentRuntimes(catalog.agents, runtimeFactoryOptions);
 const platform = new MultiAgentPlatform({
   agents: catalog.agents,
   defaultAgentId: catalog.defaultAgentId,
@@ -137,7 +140,7 @@ const server = createServer(async (request, response) => {
         });
         platform.beginRosterUpdate(requested.agents);
         try {
-          const nextRuntimes = createAgentRuntimes(requested.agents, runtimeFactoryOptions);
+          const nextRuntimes = await createAgentRuntimes(requested.agents, runtimeFactoryOptions);
           const saved = await catalogStore.replace(requested, requested.revision);
           await platform.replaceRoster(saved.agents, nextRuntimes, saved.defaultAgentId);
           catalog = saved;
@@ -178,7 +181,7 @@ const server = createServer(async (request, response) => {
         assertHandlesWereNotRemoved(catalog, requested);
         platform.beginRosterUpdate(requested.agents);
         try {
-          const nextRuntimes = createAgentRuntimes(requested.agents, runtimeFactoryOptions);
+          const nextRuntimes = await createAgentRuntimes(requested.agents, runtimeFactoryOptions);
           const saved = await catalogStore.replace(requested, requested.revision);
           await platform.replaceRoster(saved.agents, nextRuntimes, saved.defaultAgentId);
           catalog = saved;

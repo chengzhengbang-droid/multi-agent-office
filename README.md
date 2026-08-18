@@ -125,6 +125,8 @@ pnpm dev
 
 中国区 Z.AI/智谱 Coding Plan 使用 `ZAI_CODING_CN_API_KEY` 和 `zai-coding-cn`；全球版使用 `ZAI_API_KEY` 和 `zai`。Codex 可以使用本机 ChatGPT 登录或环境变量中的 `OPENAI_API_KEY`。运行时状态会显示在花名册和运行详情中。
 
+Pi 的凭据同时从环境变量和 `~/.pi/agent/auth.json` 读取，因此用 `pi` 登录过的 API Key 与 OAuth 订阅（Claude Pro/Max、ChatGPT、GitHub Copilot、xAI、OpenRouter 等）可以直接使用，不必再设一遍环境变量。花名册里的在线状态以这两者的并集为准。
+
 生产构建与启动：
 
 ```bash
@@ -161,3 +163,11 @@ pnpm build
 ## 安全边界
 
 Pi 的 `full` 模式会开放 Bash/edit/write，但 Pi SDK 本身不提供完整文件系统沙箱。只应在可信的本地工作目录或额外隔离环境中使用。Codex v1 即使配置 `full` 也只映射为 `workspace-write`，不会启用 `danger-full-access`。
+
+工作目录里的 `.pi/extensions`、`.pi/skills`、`.pi/settings.json` 等项目级资源属于可执行代码，默认**不**加载。这与 pi 非交互模式的默认行为一致。已经用 `pi` 保存过信任决定的目录按该决定处理；其余目录需要显式开启：
+
+```dotenv
+MAO_PI_PROJECT_TRUST=always
+```
+
+只在你信任该仓库时才打开。用户级的 `~/.pi/agent/extensions` 与 `~/.agents/skills` 始终加载，它们属于你自己的配置。

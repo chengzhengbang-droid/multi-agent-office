@@ -756,6 +756,59 @@ export class MultiAgentPlatform {
       });
       return;
     }
+    if (event.type === "thinking_delta") {
+      await this.record({
+        type: "run.thinking",
+        runId: run.id,
+        threadId: run.threadId,
+        agentId: run.agentId,
+        text: event.text,
+      });
+      return;
+    }
+    if (event.type === "output_reset") {
+      await this.record({
+        type: "run.reset",
+        runId: run.id,
+        threadId: run.threadId,
+        agentId: run.agentId,
+        reason: event.reason,
+      });
+      return;
+    }
+    if (event.type === "lifecycle") {
+      await this.record({
+        type: "run.lifecycle",
+        runId: run.id,
+        threadId: run.threadId,
+        agentId: run.agentId,
+        phase: event.phase,
+        ...(event.detail ? { detail: event.detail } : {}),
+      });
+      return;
+    }
+    if (event.type === "diagnostic") {
+      await this.record({
+        type: "run.diagnostic",
+        runId: run.id,
+        threadId: run.threadId,
+        agentId: run.agentId,
+        source: event.source,
+        message: event.message,
+      });
+      return;
+    }
+    if (event.type === "usage") {
+      const { type: _type, ...usage } = event;
+      await this.record({
+        type: "run.usage",
+        runId: run.id,
+        threadId: run.threadId,
+        agentId: run.agentId,
+        ...usage,
+      });
+      return;
+    }
     await this.record({
       type: "run.tool",
       runId: run.id,
@@ -763,7 +816,14 @@ export class MultiAgentPlatform {
       agentId: run.agentId,
       phase: event.type === "tool_start" ? "start" : "end",
       toolName: event.toolName,
-      ...(event.type === "tool_end" ? { isError: event.isError } : {}),
+      ...(event.toolCallId ? { toolCallId: event.toolCallId } : {}),
+      ...(event.type === "tool_start" && event.args ? { args: event.args } : {}),
+      ...(event.type === "tool_end"
+        ? {
+            isError: event.isError,
+            ...(event.resultSummary ? { resultSummary: event.resultSummary } : {}),
+          }
+        : {}),
     });
   }
 

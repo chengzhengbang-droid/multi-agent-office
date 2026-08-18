@@ -69,6 +69,15 @@ export interface CausalMetadata {
 
 export type ThreadMessageKind = "chat" | "collaboration";
 
+/** An image the human attached to a message, stored outside the event log. */
+export interface MessageAttachment {
+  id: Id;
+  mediaType: string;
+  /** Absolute path under the data directory. */
+  path: string;
+  byteSize: number;
+}
+
 export interface ThreadMessage {
   id: Id;
   threadId: Id;
@@ -79,6 +88,7 @@ export interface ThreadMessage {
   intent?: string;
   createdAt: string;
   causal?: CausalMetadata;
+  attachments?: MessageAttachment[];
   /** Legacy field accepted while replaying pre-catalog event logs. */
   recipientAgentId?: Id;
 }
@@ -123,6 +133,9 @@ export type PlatformEventPayload =
       phase: "start" | "end";
       toolName: string;
       isError?: boolean;
+      toolCallId?: string;
+      args?: string;
+      resultSummary?: string;
     }
   | {
       type: "run.session";
@@ -167,6 +180,59 @@ export type PlatformEventPayload =
       threadId: Id;
       agentId: Id;
       reason: string;
+    }
+  | {
+      type: "run.thinking";
+      runId: Id;
+      threadId: Id;
+      agentId: Id;
+      text: string;
+    }
+  | {
+      /** Streamed output so far is stale; clients must clear it for this run. */
+      type: "run.reset";
+      runId: Id;
+      threadId: Id;
+      agentId: Id;
+      reason: "retry";
+    }
+  | {
+      type: "run.lifecycle";
+      runId: Id;
+      threadId: Id;
+      agentId: Id;
+      phase: "retry_start" | "retry_end" | "compaction_start" | "compaction_end";
+      detail?: string;
+    }
+  | {
+      type: "run.diagnostic";
+      runId: Id;
+      threadId: Id;
+      agentId: Id;
+      source: "extension" | "runtime";
+      message: string;
+    }
+  | {
+      type: "run.usage";
+      runId: Id;
+      threadId: Id;
+      agentId: Id;
+      inputTokens: number;
+      outputTokens: number;
+      cacheReadTokens: number;
+      cacheWriteTokens: number;
+      totalTokens: number;
+      costUsd: number;
+      contextTokens?: number;
+      contextWindow?: number;
+    }
+  | {
+      /** A human message delivered into a run that was already in flight. */
+      type: "run.steered";
+      runId: Id;
+      threadId: Id;
+      agentId: Id;
+      messageId: Id;
     }
   | {
       type: "routing.accepted";
