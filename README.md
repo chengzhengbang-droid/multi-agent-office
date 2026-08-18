@@ -22,6 +22,10 @@
 
 平台保留深度 4、每条协作链最多 8 次运行、幂等去重、同一对 Agent 连续 4 次乒乓限制和整链取消。
 
+Agent 正在运行时，用户可以直接插话：消息会送进当前这一轮（Pi 在本轮工具调用结束、下一次模型请求之前收到），而不是排队等下一轮。只有用户消息可以插话；`post_message` 的 A2A 仍然走完整的排队与限额，协作链语义不变。运行时不支持插话时自动回退为排队。
+
+消息可以附带图片。Pi 直接把图片交给模型；Codex CLI 不接受内联图片，因此改为在 prompt 里给出附件的绝对路径。图片保存在数据目录的 `attachments/`，事件日志里只记录引用。
+
 ## 会话、并发与恢复
 
 - 每个 `{threadId, agentId}` 都有独立的持久 session。
@@ -144,9 +148,12 @@ pnpm demo -- "@pi @codex 请独立评估这个方案"
 
 - `GET /api/agents`：安全花名册、revision、运行时在线/认证状态。
 - `PUT /api/agents`：用 revision 乐观锁原子替换花名册；不接受或返回密钥。
-- `POST /api/messages`：接收 `content`、可选 `threadId` 和新 Thread 的 `workspacePath`。
+- `POST /api/messages`：接收 `content`、可选 `threadId`、新 Thread 的 `workspacePath`、`attachments`（PNG/JPEG/WebP/GIF，最多 4 张、每张 5 MB）和 `steer`。
 - `POST /api/chains/:chainId/cancel`：取消整条协作链。
 - `GET /api/events`：SSE 事件投影。
+- `GET /api/models`：Pi 可用的 provider 与模型目录，以及每个 provider 是否已配置凭据；不返回密钥。
+- `GET /api/agents/:agentId/session?threadId=`：该 Agent 在此 Thread 的 session 统计。
+- `POST /api/agents/:agentId/session?threadId=&action=compact|export&format=html|jsonl`：手动压缩上下文或导出 session。
 
 Codex 的 `post_message` 通过本机 MCP stdio server 回调内部端点。每次 run 使用独立随机 token，并校验 run、Thread 和 Agent 身份；token 在 run 结束后立即失效。
 
@@ -158,7 +165,7 @@ pnpm test
 pnpm build
 ```
 
-测试覆盖花名册、mention 解析、对等路由、A2A、幂等与乒乓限制、读写调度、整链取消、上下文游标、session 隔离、Codex JSONL 首次执行与 resume、MCP token，以及现有历史事件的完整兼容回放。
+测试覆盖花名册、mention 解析、对等路由、A2A、幂等与乒乓限制、读写调度、整链取消、上下文游标、session 隔离、Codex JSONL 首次执行与 resume、MCP token、Pi 凭据判定、可观测性事件投影、运行中插话与回退、图片附件，以及现有历史事件的完整兼容回放。
 
 ## 安全边界
 

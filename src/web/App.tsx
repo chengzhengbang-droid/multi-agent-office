@@ -22,6 +22,7 @@ import {
   MessageSquare,
   Moon,
   PanelRight,
+  Paperclip,
   Plus,
   RefreshCw,
   Save,
@@ -137,6 +138,7 @@ export function App() {
   const [updateActionError, setUpdateActionError] = useState("");
   const [mentionAgent, setMentionAgent] = useState("codex");
   const [draft, setDraft] = useState("");
+  const [attachments, setAttachments] = useState<ComposerAttachment[]>([]);
   const [sending, setSending] = useState(false);
   const [cancelling, setCancelling] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
@@ -258,7 +260,7 @@ export function App() {
     setSidebarOpen(false);
   };
 
-  const sendTask = async () => {
+  const sendTask = async (steer = false) => {
     const content = draft.trim();
     if (!content || sending || !configured) return;
     setSending(true);
@@ -271,12 +273,17 @@ export function App() {
           content,
           ...(selectedThreadId ? { threadId: selectedThreadId } : {}),
           ...(!selectedThreadId && activeWorkspace ? { workspacePath: activeWorkspace.path } : {}),
+          ...(attachments.length > 0
+            ? { attachments: attachments.map(({ mediaType, dataBase64 }) => ({ mediaType, dataBase64 })) }
+            : {}),
+          ...(steer ? { steer: true } : {}),
         }),
       });
       const result = (await response.json()) as { threadId?: string; error?: string };
       if (!response.ok || !result.threadId) throw new Error(result.error ?? "任务发送失败");
       setSelectedThreadId(result.threadId);
       setDraft("");
+      setAttachments([]);
     } catch (error) {
       setActionError(errorMessage(error));
     } finally {
@@ -418,7 +425,7 @@ export function App() {
         </section>
 
         {actionError && <div className="action-error" role="alert"><XCircle size={14} />{actionError}<button type="button" onClick={() => setActionError("")} aria-label="关闭错误"><X size={13} /></button></div>}
-        <Composer agents={data?.agents ?? []} mentionAgent={mentionAgent} onMentionAgentChange={setMentionAgent} fallbackAgent={fallbackAgent} configured={configured} value={draft} onChange={setDraft} onSend={sendTask} onCancel={cancelTask} sending={sending} cancelling={cancelling} active={Boolean(activeChainId)} workspace={activeWorkspace} onWorkspaceClick={() => setWorkspacePickerOpen(true)} />
+        <Composer agents={data?.agents ?? []} mentionAgent={mentionAgent} onMentionAgentChange={setMentionAgent} fallbackAgent={fallbackAgent} configured={configured} value={draft} onChange={setDraft} onSend={sendTask} onCancel={cancelTask} attachments={attachments} onAttachmentsChange={setAttachments} sending={sending} cancelling={cancelling} active={Boolean(activeChainId)} workspace={activeWorkspace} onWorkspaceClick={() => setWorkspacePickerOpen(true)} />
       </main>
 
       <DetailsDrawer open={drawerOpen} onClose={() => setDrawerOpen(false)} thread={selectedThread} agents={data?.agents ?? []} workspace={activeWorkspace} events={data?.events ?? []} />
@@ -646,6 +653,28 @@ function EmptyTask({ agents, onSuggestion }: { agents: AgentSummary[]; onSuggest
   return <div className="empty-task"><div className="empty-task-mark"><Sparkles size={24} /></div><h1>让 Agent 帮你完成工作</h1><p>{handles.length > 1 ? `在正文中写 ${handles.join(" 或 ")} 可指定 Agent；` : handles.length === 1 ? `在正文中写 ${handles[0]} 可指定 Agent；` : ""}无 @ 时会交给最近成功回复且在线的默认 Agent。</p><div className="suggestion-grid"><button type="button" onClick={() => onSuggestion(directedPrompt)}>{handles.length > 1 ? "让两个 Agent 独立评估" : "让 Agent 评估当前架构"}</button><button type="button" onClick={() => onSuggestion("请实现这个需求，并在必要时通过 post_message 邀请队友。")}>由默认 Agent 自主完成</button></div></div>;
 }
 
+const ALLOWED_IMAGE_TYPES = ["image/png", "image/jpeg", "image/webp", "image/gif"];
+const MAX_COMPOSER_ATTACHMENTS = 4;
+const MAX_ATTACHMENT_BYTES = 5 * 1024 * 1024;
+
+function readAsBase64(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error(`无法读取 ${file.name}`));
+    // readAsDataURL yields "data:<type>;base64,<payload>"; the server strips
+    // the prefix, so the whole value can be sent as-is.
+    reader.onload = () => resolve(String(reader.result));
+    reader.readAsDataURL(file);
+  });
+}
+
+interface ComposerAttachment {
+  id: string;
+  name: string;
+  mediaType: string;
+  dataBase64: string;
+}
+
 interface ComposerProps {
   agents: AgentSummary[];
   mentionAgent: string;
@@ -654,8 +683,10 @@ interface ComposerProps {
   configured: boolean;
   value: string;
   onChange(value: string): void;
-  onSend(): void;
+  onSend(steer?: boolean): void;
   onCancel(): void;
+  attachments: ComposerAttachment[];
+  onAttachmentsChange(value: ComposerAttachment[]): void;
   sending: boolean;
   cancelling: boolean;
   active: boolean;
@@ -687,13 +718,35 @@ function Composer(props: ComposerProps) {
     setCursor(nextCursor);
     window.setTimeout(() => { element?.focus(); element?.setSelectionRange(nextCursor, nextCursor); }, 0);
   };
-  const onKeyDown = (event: ReactKeyboardEvent<HTMLTextAreaElement>) => { if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); props.onSend(); } };
+  const onKeyDown = (event: ReactKeyboardEvent<HTMLTextAreaElement>) => { if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); props.onSend(props.active); } };
   const disabled = !props.configured || !props.value.trim() || props.sending;
+  const addFiles = async (files: FileList | null) => {
+    if (!files || files.length === 0) return;
+    const accepted: ComposerAttachment[] = [];
+    for (const file of Array.from(files).slice(0, MAX_COMPOSER_ATTACHMENTS - props.attachments.length)) {
+      if (!ALLOWED_IMAGE_TYPES.includes(file.type)) continue;
+      if (file.size > MAX_ATTACHMENT_BYTES) continue;
+      accepted.push({ id: `${file.name}-${file.size}-${file.lastModified}`, name: file.name, mediaType: file.type, dataBase64: await readAsBase64(file) });
+    }
+    if (accepted.length > 0) props.onAttachmentsChange([...props.attachments, ...accepted]);
+  };
   return <div className="composer-wrap">{!props.configured && <div className="credential-warning">当前没有可用 Agent；请打开花名册检查 Pi 密钥或 Codex 登录状态。</div>}<div className="composer">
     {suggestions.length > 0 && <div className="mention-menu">{suggestions.map((agent) => <button type="button" key={agent.id} onMouseDown={(event) => { event.preventDefault(); insertMention(agent.id, true); }}><AgentAvatar agentId={agent.id} /><span><strong>@{agent.id}</strong><small>{agent.displayName} · {agent.availability.available ? "在线" : "离线"}</small></span></button>)}</div>}
+    {props.attachments.length > 0 && <div className="composer-attachments">{props.attachments.map((attachment) => <span key={attachment.id}><Paperclip size={11} />{attachment.name}<button type="button" onClick={() => props.onAttachmentsChange(props.attachments.filter((item) => item.id !== attachment.id))} aria-label={`移除 ${attachment.name}`}><X size={11} /></button></span>)}</div>}
     <textarea ref={textareaRef} value={props.value} onChange={(event) => { props.onChange(event.target.value); setCursor(event.target.selectionStart); }} onClick={(event) => setCursor(event.currentTarget.selectionStart)} onKeyUp={(event) => setCursor(event.currentTarget.selectionStart)} onKeyDown={onKeyDown} placeholder="描述任务；输入 @ 可指定最多两个 Agent…" rows={2} disabled={!props.configured} aria-label="任务内容" />
-    <div className="composer-toolbar"><button className="composer-workspace" type="button" onClick={props.onWorkspaceClick} title={props.workspace?.path} aria-label="选择工作目录"><Folder size={14} /><span>{props.workspace?.name ?? "选择目录"}</span></button><label className="agent-select" title="选择后插入 @mention"><AgentAvatar agentId={props.mentionAgent} /><select value={props.mentionAgent} onChange={(event) => { props.onMentionAgentChange(event.target.value); insertMention(event.target.value); }} disabled={!props.configured} aria-label="插入 Agent mention">{props.agents.filter((agent) => agent.enabled).map((agent) => <option value={agent.id} key={agent.id} disabled={!agent.availability.available}>@{agent.id}{agent.availability.available ? "" : "（离线）"}</option>)}</select><ChevronDown size={14} /></label><span className="fallback-hint">无 @ → @{props.fallbackAgent?.id ?? "—"}</span><span className="composer-hint">Enter 发送 · Shift Enter 换行</span>{props.active ? <button className="stop-button" type="button" onClick={props.onCancel} disabled={props.cancelling} aria-label="停止整个协作链"><Square size={11} fill="currentColor" /></button> : <button className="send-button" type="button" onClick={props.onSend} disabled={disabled} aria-label="发送任务">{props.sending ? <span className="button-spinner" /> : <SendHorizontal size={17} />}</button>}</div>
+    <div className="composer-toolbar"><button className="composer-workspace" type="button" onClick={props.onWorkspaceClick} title={props.workspace?.path} aria-label="选择工作目录"><Folder size={14} /><span>{props.workspace?.name ?? "选择目录"}</span></button><label className="agent-select" title="选择后插入 @mention"><AgentAvatar agentId={props.mentionAgent} /><select value={props.mentionAgent} onChange={(event) => { props.onMentionAgentChange(event.target.value); insertMention(event.target.value); }} disabled={!props.configured} aria-label="插入 Agent mention">{props.agents.filter((agent) => agent.enabled).map((agent) => <option value={agent.id} key={agent.id} disabled={!agent.availability.available}>@{agent.id}{agent.availability.available ? "" : "（离线）"}</option>)}</select><ChevronDown size={14} /></label><span className="fallback-hint">无 @ → @{props.fallbackAgent?.id ?? "—"}</span><span className="composer-hint">{props.active ? "Enter 插话 · Shift Enter 换行" : "Enter 发送 · Shift Enter 换行"}</span><label className="composer-attach" title="添加图片（仅 Pi 运行时可直接读取）"><Paperclip size={14} /><input type="file" accept={ALLOWED_IMAGE_TYPES.join(",")} multiple disabled={!props.configured || props.attachments.length >= MAX_COMPOSER_ATTACHMENTS} onChange={(event) => { void addFiles(event.target.files); event.target.value = ""; }} aria-label="添加图片" /></label>{props.active && <button className="steer-button" type="button" onClick={() => props.onSend(true)} disabled={disabled} aria-label="插话到正在运行的 Agent">{props.sending ? <span className="button-spinner" /> : <SendHorizontal size={16} />}插话</button>}{props.active ? <button className="stop-button" type="button" onClick={props.onCancel} disabled={props.cancelling} aria-label="停止整个协作链"><Square size={11} fill="currentColor" /></button> : <button className="send-button" type="button" onClick={() => props.onSend()} disabled={disabled} aria-label="发送任务">{props.sending ? <span className="button-spinner" /> : <SendHorizontal size={17} />}</button>}</div>
   </div></div>;
+}
+
+interface ModelCatalog {
+  providers: Array<{
+    id: string;
+    name: string;
+    configured: boolean;
+    subscription: boolean;
+    models: Array<{ id: string; name: string }>;
+  }>;
+  error?: string;
 }
 
 interface CatalogEditorProps { open: boolean; catalog: AgentCatalogV1; agents: AgentSummary[]; onClose(): void; onSave(catalog: AgentCatalogV1): Promise<void> }
@@ -704,7 +757,16 @@ function AgentCatalogEditor({ open, catalog, agents, onClose, onSave }: CatalogE
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
   const originalIds = useMemo(() => new Set(catalog.agents.map((agent) => agent.id)), [catalog]);
+  const [catalogModels, setCatalogModels] = useState<ModelCatalog>({ providers: [] });
   useEffect(() => { if (open) { setDraft(structuredClone(catalog)); setSelectedId(catalog.defaultAgentId); setError(""); } }, [open, catalog]);
+  useEffect(() => {
+    if (!open) return;
+    let cancelled = false;
+    // Advisory only: the inputs stay free text so custom providers declared in
+    // models.json remain usable when the catalog cannot be read.
+    void fetch("/api/models").then((response) => response.json()).then((value: ModelCatalog) => { if (!cancelled) setCatalogModels(value); }).catch(() => undefined);
+    return () => { cancelled = true; };
+  }, [open]);
   if (!open) return null;
   const selected = draft.agents.find((agent) => agent.id === selectedId) ?? draft.agents[0];
   const update = (changes: Partial<AgentDefinition>) => { if (selected) setDraft((current) => ({ ...current, agents: current.agents.map((agent) => agent.id === selected.id ? { ...agent, ...changes } : agent) })); };
@@ -727,7 +789,7 @@ function AgentCatalogEditor({ open, catalog, agents, onClose, onSave }: CatalogE
     <div className="form-grid"><label>Handle<input value={selected.id} onChange={(event) => renameNewAgent(event.target.value)} disabled={originalIds.has(selected.id)} /></label><label>显示名<input value={selected.displayName} onChange={(event) => update({ displayName: event.target.value })} /></label></div>
     <label>简介<input value={selected.description} onChange={(event) => update({ description: event.target.value })} /></label><label>能力（逗号分隔）<input value={selected.capabilities.join(", ")} onChange={(event) => update({ capabilities: event.target.value.split(/[,，]/).map((item) => item.trim()).filter(Boolean) })} /></label><label>System prompt<textarea value={selected.systemPrompt} onChange={(event) => update({ systemPrompt: event.target.value })} rows={5} /></label>
     <div className="form-grid"><label>Runtime<select value={selected.runtime.kind} onChange={(event) => update({ runtime: event.target.value === "pi" ? { kind: "pi", provider: "zai-coding-cn", model: "glm-5.2", thinkingLevel: "medium" } : { kind: "codex", command: "codex" } })}><option value="codex">Codex CLI</option><option value="pi">Pi SDK</option></select></label><label>访问级别<select value={selected.accessMode} onChange={(event) => update({ accessMode: event.target.value as AccessMode })}><option value="read-only">read-only</option><option value="workspace-write">workspace-write</option><option value="full">full</option></select></label></div>
-    {selected.runtime.kind === "pi" ? <div className="form-grid form-grid--three"><label>Provider<input value={selected.runtime.provider} onChange={(event) => update({ runtime: { ...selected.runtime, provider: event.target.value } as AgentDefinition["runtime"] })} /></label><label>Model<input value={selected.runtime.model} onChange={(event) => update({ runtime: { ...selected.runtime, model: event.target.value } as AgentDefinition["runtime"] })} /></label><label>Thinking<select value={selected.runtime.thinkingLevel} onChange={(event) => update({ runtime: { ...selected.runtime, thinkingLevel: event.target.value as ThinkingLevel } as AgentDefinition["runtime"] })}>{["off", "minimal", "low", "medium", "high", "xhigh", "max"].map((level) => <option key={level}>{level}</option>)}</select></label></div> : <><div className="form-grid"><label>CLI 路径<input value={selected.runtime.command} onChange={(event) => update({ runtime: { ...selected.runtime, command: event.target.value } as AgentDefinition["runtime"] })} /></label><label>Model<input value={selected.runtime.model ?? ""} placeholder="使用 profile 默认值" onChange={(event) => update({ runtime: { ...selected.runtime, model: event.target.value || undefined } as AgentDefinition["runtime"] })} /></label></div><div className="form-grid"><label>Profile<input value={selected.runtime.profile ?? ""} onChange={(event) => update({ runtime: { ...selected.runtime, profile: event.target.value || undefined } as AgentDefinition["runtime"] })} /></label><label>Reasoning<select value={selected.runtime.reasoningEffort ?? ""} onChange={(event) => update({ runtime: { ...selected.runtime, reasoningEffort: (event.target.value || undefined) as "low" | "medium" | "high" | "xhigh" | undefined } as AgentDefinition["runtime"] })}><option value="">profile 默认值</option>{["low", "medium", "high", "xhigh"].map((level) => <option key={level}>{level}</option>)}</select></label></div></>}
+    {selected.runtime.kind === "pi" ? <div className="form-grid form-grid--three"><label>Provider<input list="pi-provider-options" value={selected.runtime.provider} onChange={(event) => update({ runtime: { ...selected.runtime, provider: event.target.value } as AgentDefinition["runtime"] })} /><datalist id="pi-provider-options">{catalogModels.providers.map((provider) => <option value={provider.id} key={provider.id}>{provider.name}{provider.configured ? (provider.subscription ? "（订阅已登录）" : "（凭据已配置）") : "（未配置凭据）"}</option>)}</datalist></label><label>Model<input list="pi-model-options" value={selected.runtime.model} onChange={(event) => update({ runtime: { ...selected.runtime, model: event.target.value } as AgentDefinition["runtime"] })} /><datalist id="pi-model-options">{(catalogModels.providers.find((provider) => provider.id === (selected.runtime as { provider: string }).provider)?.models ?? []).map((model) => <option value={model.id} key={model.id}>{model.name}</option>)}</datalist></label><label>Thinking<select value={selected.runtime.thinkingLevel} onChange={(event) => update({ runtime: { ...selected.runtime, thinkingLevel: event.target.value as ThinkingLevel } as AgentDefinition["runtime"] })}>{["off", "minimal", "low", "medium", "high", "xhigh", "max"].map((level) => <option key={level}>{level}</option>)}</select></label></div> : <><div className="form-grid"><label>CLI 路径<input value={selected.runtime.command} onChange={(event) => update({ runtime: { ...selected.runtime, command: event.target.value } as AgentDefinition["runtime"] })} /></label><label>Model<input value={selected.runtime.model ?? ""} placeholder="使用 profile 默认值" onChange={(event) => update({ runtime: { ...selected.runtime, model: event.target.value || undefined } as AgentDefinition["runtime"] })} /></label></div><div className="form-grid"><label>Profile<input value={selected.runtime.profile ?? ""} onChange={(event) => update({ runtime: { ...selected.runtime, profile: event.target.value || undefined } as AgentDefinition["runtime"] })} /></label><label>Reasoning<select value={selected.runtime.reasoningEffort ?? ""} onChange={(event) => update({ runtime: { ...selected.runtime, reasoningEffort: (event.target.value || undefined) as "low" | "medium" | "high" | "xhigh" | undefined } as AgentDefinition["runtime"] })}><option value="">profile 默认值</option>{["low", "medium", "high", "xhigh"].map((level) => <option key={level}>{level}</option>)}</select></label></div></>}
     <div className="catalog-switches"><label><input type="checkbox" checked={selected.enabled} disabled={selected.id === draft.defaultAgentId} onChange={(event) => update({ enabled: event.target.checked })} />启用</label><label><input type="radio" name="default-agent" checked={selected.id === draft.defaultAgentId} onChange={() => setDraft((current) => ({ ...current, defaultAgentId: selected.id, agents: current.agents.map((agent) => agent.id === selected.id ? { ...agent, enabled: true } : agent) }))} />设为默认 Agent</label></div>
     {selected.runtime.kind === "pi" && selected.accessMode === "full" && <p className="risk-warning">Pi full 会开放 Bash/edit/write，缺少完整文件系统沙箱。只在信任的本地工作目录使用。</p>}{selected.runtime.kind === "codex" && selected.accessMode === "full" && <p className="risk-warning">Codex v1 会把 full 映射为 workspace-write，不启用 danger-full-access。</p>}
   </div>}</div><footer>{error && <span className="catalog-error"><XCircle size={13} />{error}</span>}<button type="button" className="catalog-cancel" onClick={onClose}>取消</button><button type="button" className="catalog-save" onClick={() => void submit()} disabled={saving}><Save size={14} />{saving ? "保存中…" : "原子保存花名册"}</button></footer></section></div>;
@@ -747,7 +809,63 @@ interface DetailsDrawerProps { open: boolean; onClose(): void; thread?: ThreadSu
 
 function DetailsDrawer({ open, onClose, thread, agents, workspace, events }: DetailsDrawerProps) {
   const threadEvents = useMemo(() => selectThreadEvents(events, thread?.id), [events, thread?.id]); const runCount = threadEvents.filter((event) => event.type === "run.queued").length; const toolCount = threadEvents.filter((event) => event.type === "run.tool" && event.phase === "start").length; const messageCount = threadEvents.filter((event) => event.type === "message.created").length; const timeline = threadEvents.filter((event) => event.type !== "run.delta" && event.type !== "run.thinking" && event.type !== "run.reset" && event.type !== "thread.created");
-  return <>{open && <button className="drawer-scrim" type="button" onClick={onClose} aria-label="关闭运行详情" />}<aside className={`details-drawer ${open ? "details-drawer--open" : ""}`} aria-hidden={!open}><header className="drawer-header"><div><strong>运行详情</strong><span>{thread ? cleanTitle(thread.title) : "尚未创建任务"}</span></div><button className="icon-button" type="button" onClick={onClose} aria-label="关闭运行详情"><X size={18} /></button></header><div className="drawer-content"><section className="drawer-section workspace-card"><Folder size={16} /><div><span>工作目录与写锁作用域</span><code title={workspace?.path}>{workspace?.path ?? "正在读取"}</code></div></section><section className="drawer-section"><h2>概览</h2><div className="stat-grid"><div><strong>{runCount}</strong><span>运行</span></div><div><strong>{messageCount}</strong><span>消息</span></div><div><strong>{toolCount}</strong><span>工具</span></div></div></section><section className="drawer-section"><h2>团队运行时健康</h2><div className="agent-roster">{agents.map((agent) => <div className="roster-item" key={agent.id}><AgentAvatar agentId={agent.id} /><span><strong>{agent.displayName} · {runtimeLabel(agent)}</strong><small>@{agent.id} · {agent.accessMode} · {agent.availability.label}</small></span><i>{!agent.enabled ? "已停用" : threadEvents.some((event) => event.type === "run.started" && event.agentId === agent.id) ? "已参与" : agent.availability.available ? "待命" : "离线"}</i></div>)}</div></section><section className="drawer-section"><h2>A2A 与运行时间线</h2>{timeline.length > 0 ? <div className="event-timeline">{timeline.map((event) => <TimelineEvent event={event} agents={agents} key={event.eventId} />)}</div> : <p className="drawer-empty">发送任务后，这里会显示 session、排队、工具调用、结构化转交和运行状态。</p>}</section></div></aside></>;
+  return <>{open && <button className="drawer-scrim" type="button" onClick={onClose} aria-label="关闭运行详情" />}<aside className={`details-drawer ${open ? "details-drawer--open" : ""}`} aria-hidden={!open}><header className="drawer-header"><div><strong>运行详情</strong><span>{thread ? cleanTitle(thread.title) : "尚未创建任务"}</span></div><button className="icon-button" type="button" onClick={onClose} aria-label="关闭运行详情"><X size={18} /></button></header><div className="drawer-content"><section className="drawer-section workspace-card"><Folder size={16} /><div><span>工作目录与写锁作用域</span><code title={workspace?.path}>{workspace?.path ?? "正在读取"}</code></div></section><section className="drawer-section"><h2>概览</h2><div className="stat-grid"><div><strong>{runCount}</strong><span>运行</span></div><div><strong>{messageCount}</strong><span>消息</span></div><div><strong>{toolCount}</strong><span>工具</span></div></div></section><section className="drawer-section"><h2>团队运行时健康</h2><div className="agent-roster">{agents.map((agent) => <div className="roster-item" key={agent.id}><AgentAvatar agentId={agent.id} /><span><strong>{agent.displayName} · {runtimeLabel(agent)}</strong><small>@{agent.id} · {agent.accessMode} · {agent.availability.label}</small></span><i>{!agent.enabled ? "已停用" : threadEvents.some((event) => event.type === "run.started" && event.agentId === agent.id) ? "已参与" : agent.availability.available ? "待命" : "离线"}</i></div>)}</div></section><section className="drawer-section"><h2>Agent Session</h2><SessionPanel thread={thread} agents={agents} /></section><section className="drawer-section"><h2>A2A 与运行时间线</h2>{timeline.length > 0 ? <div className="event-timeline">{timeline.map((event) => <TimelineEvent event={event} agents={agents} key={event.eventId} />)}</div> : <p className="drawer-empty">发送任务后，这里会显示 session、排队、工具调用、结构化转交和运行状态。</p>}</section></div></aside></>;
+}
+
+function SessionPanel({ thread, agents }: { thread?: ThreadSummary; agents: AgentSummary[] }) {
+  const piAgents = agents.filter((agent) => agent.runtime.kind === "pi");
+  const [agentId, setAgentId] = useState("");
+  const [stats, setStats] = useState<RuntimeSessionStatsView | null>(null);
+  const [busy, setBusy] = useState("");
+  const [notice, setNotice] = useState("");
+  const selectedId = agentId || piAgents[0]?.id || "";
+  const threadId = thread?.id;
+  useEffect(() => {
+    if (!threadId || !selectedId) { setStats(null); return; }
+    let cancelled = false;
+    void fetch(`/api/agents/${encodeURIComponent(selectedId)}/session?threadId=${encodeURIComponent(threadId)}`)
+      .then((response) => response.json())
+      .then((value: { stats?: RuntimeSessionStatsView | null }) => { if (!cancelled) setStats(value.stats ?? null); })
+      .catch(() => { if (!cancelled) setStats(null); });
+    return () => { cancelled = true; };
+  }, [threadId, selectedId, notice]);
+  if (piAgents.length === 0) return <p className="drawer-empty">Session 统计、压缩与导出目前只对 Pi 运行时可用。</p>;
+  if (!threadId) return <p className="drawer-empty">创建任务后可以查看每个 Agent 的私有 session。</p>;
+  const act = async (action: "compact" | "export", format?: "html" | "jsonl") => {
+    setBusy(action); setNotice("");
+    try {
+      const query = new URLSearchParams({ threadId, action, ...(format ? { format } : {}) });
+      const response = await fetch(`/api/agents/${encodeURIComponent(selectedId)}/session?${query.toString()}`, { method: "POST" });
+      const value = (await response.json()) as { detail?: string; path?: string; error?: string };
+      if (!response.ok) throw new Error(value.error ?? "操作失败");
+      setNotice(value.path ?? value.detail ?? "已完成");
+    } catch (error) { setNotice(errorMessage(error)); } finally { setBusy(""); }
+  };
+  return <div className="session-panel">
+    <label className="session-agent">Agent<select value={selectedId} onChange={(event) => { setAgentId(event.target.value); setNotice(""); }}>{piAgents.map((agent) => <option value={agent.id} key={agent.id}>@{agent.id}</option>)}</select></label>
+    {stats ? <>
+      <div className="stat-grid"><div><strong>{stats.assistantMessages}</strong><span>回复</span></div><div><strong>{stats.toolCalls}</strong><span>工具调用</span></div><div><strong>{formatTokens(stats.totalTokens)}</strong><span>累计 token</span></div></div>
+      <p className="session-meta">累计成本 ${stats.costUsd.toFixed(4)}{stats.contextTokens !== undefined && stats.contextWindow ? ` · 上下文 ${Math.round((stats.contextTokens / stats.contextWindow) * 100)}%` : ""}</p>
+    </> : <p className="drawer-empty">该 Agent 在这个任务里还没有 session。</p>}
+    <div className="session-actions">
+      <button type="button" onClick={() => void act("compact")} disabled={!stats || busy !== ""}>{busy === "compact" ? "压缩中…" : "压缩上下文"}</button>
+      <button type="button" onClick={() => void act("export", "html")} disabled={!stats || busy !== ""}>导出 HTML</button>
+      <button type="button" onClick={() => void act("export", "jsonl")} disabled={!stats || busy !== ""}>导出 JSONL</button>
+    </div>
+    {notice && <p className="session-notice">{notice}</p>}
+  </div>;
+}
+
+interface RuntimeSessionStatsView {
+  sessionId: string;
+  sessionFile?: string;
+  userMessages: number;
+  assistantMessages: number;
+  toolCalls: number;
+  totalTokens: number;
+  costUsd: number;
+  contextTokens?: number;
+  contextWindow?: number;
 }
 
 function TimelineEvent({ event, agents }: { event: StoredPlatformEvent; agents: AgentSummary[] }) { const description = describeEvent(event, agents); const Icon = description.icon; return <div className={`timeline-event timeline-event--${description.tone}`}><span className="timeline-icon"><Icon size={13} /></span><div><strong>{description.title}</strong><span>{description.detail}</span></div><time>{formatClock(event.recordedAt)}</time></div>; }

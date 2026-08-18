@@ -16,6 +16,7 @@ import type {
   PostAgentMessageInput,
   RuntimeRequest,
   RuntimeResult,
+  RuntimeSessionStats,
 } from "./runtime.js";
 import type { RuntimeSessionStore } from "./session-store.js";
 
@@ -34,6 +35,7 @@ export class PiRuntimeAdapter implements AgentRuntime {
   public readonly id: string;
   public readonly availability: RuntimeAvailability;
   private readonly activeSessions = new Map<string, AgentSession>();
+  private readonly sessionsByThread = new Map<string, AgentSession>();
 
   public constructor(private readonly options: PiRuntimeAdapterOptions) {
     this.id = options.id;
@@ -154,6 +156,7 @@ export class PiRuntimeAdapter implements AgentRuntime {
     await request.emit({ type: "session", runtimeKind: "pi", resumed: canResume });
 
     this.activeSessions.set(request.runId, session);
+    this.sessionsByThread.set(request.threadId, session);
     // Text is collected from completed assistant messages rather than from the
     // delta stream: auto-retry drops a failed message and re-streams it, so
     // accumulating deltas would emit the failed partial and the retried text.
@@ -252,6 +255,7 @@ export class PiRuntimeAdapter implements AgentRuntime {
       request.signal.removeEventListener("abort", onAbort);
       unsubscribe();
       this.activeSessions.delete(request.runId);
+      this.sessionsByThread.delete(request.threadId);
       session.dispose();
     }
   }
@@ -265,6 +269,103 @@ export class PiRuntimeAdapter implements AgentRuntime {
     if (!session || !session.isStreaming) return false;
     await session.steer(text);
     return true;
+  }
+
+  public async dispose(): Promise<void> {
+    for (const session of this.activeSessions.values()) await session.abort();
+    this.activeSessions.clear();
+    this.sessionsByThread.clear();
+  }
+
+  public async sessionStats(threadId: string): Promise<RuntimeSessionStats | undefined> {
+    return this.withSession(threadId, async (session) => {
+      const stats = session.getSessionStats();
+      const context = session.getContextUsage();
+      return {
+        sessionId: stats.sessionId,
+        ...(stats.sessionFile ? { sessionFile: stats.sessionFile } : {}),
+        userMessages: stats.userMessages,
+        assistantMessages: stats.assistantMessages,
+        toolCalls: stats.toolCalls,
+        totalTokens: stats.tokens.total,
+        costUsd: stats.cost,
+        ...(context?.tokens !== null && context !== undefined
+          ? { contextTokens: context.tokens, contextWindow: context.contextWindow }
+          : {}),
+      };
+    });
+  }
+
+  public async compactSession(
+    threadId: string,
+  ): Promise<{ compacted: boolean; detail: string }> {
+    // Compaction aborts the agent, so it must not run against a live session.
+    if (this.sessionsByThread.has(threadId)) {
+      return { compacted: false, detail: "该 Agent 正在运行，请等待本轮结束后再压缩" };
+    }
+    const result = await this.withSession(threadId, async (session) => {
+      const compaction = await session.compact();
+      const after = compaction.estimatedTokensAfter;
+      return {
+        compacted: true,
+        detail:
+          after === undefined
+            ? `已压缩，压缩前约 ${compaction.tokensBefore} tokens`
+            : `已压缩：约 ${compaction.tokensBefore} → ${after} tokens`,
+      };
+    });
+    return result ?? { compacted: false, detail: "该 Agent 在此任务中还没有 session" };
+  }
+
+  public async exportSession(
+    threadId: string,
+    format: "html" | "jsonl",
+  ): Promise<string> {
+    const path = await this.withSession(threadId, async (session) =>
+      format === "html" ? await session.exportToHtml() : session.exportToJsonl(),
+    );
+    if (!path) throw new Error("该 Agent 在此任务中还没有 session");
+    return path;
+  }
+
+  /**
+   * Runs an operation against this Agent's session for a thread. A live session
+   * is reused; otherwise the persisted session file is reopened read-mostly and
+   * disposed afterwards, so idle threads hold no resources.
+   */
+  private async withSession<T>(
+    threadId: string,
+    operation: (session: AgentSession) => Promise<T>,
+  ): Promise<T | undefined> {
+    const live = this.sessionsByThread.get(threadId);
+    if (live) return operation(live);
+    const binding = await this.options.sessionStore.get(threadId, this.id);
+    if (
+      !binding ||
+      binding.runtimeKind !== "pi" ||
+      binding.fingerprint !== this.options.fingerprint ||
+      !existsSync(binding.locator)
+    ) {
+      return undefined;
+    }
+    const cwd = this.options.cwd;
+    const { loader: sharedLoader, settingsManager } =
+      await this.options.shared.resourcesFor(cwd);
+    const modelRuntime = await this.options.shared.modelRuntime();
+    const selectedModel = this.resolveModel(modelRuntime);
+    const { session } = await createAgentSession({
+      cwd,
+      resourceLoader: new RequestResourceLoader(sharedLoader, ""),
+      sessionManager: SessionManager.open(binding.locator),
+      settingsManager,
+      modelRuntime,
+      ...(selectedModel.model ? { model: selectedModel.model } : {}),
+    });
+    try {
+      return await operation(session);
+    } finally {
+      session.dispose();
+    }
   }
 
   private async emitUsage(request: RuntimeRequest, session: AgentSession): Promise<void> {

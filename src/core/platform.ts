@@ -1,3 +1,4 @@
+import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { createId } from "./ids.js";
 import type { ContextCompiler } from "./context-compiler.js";
@@ -9,6 +10,7 @@ import type {
   AgentRun,
   CausalMetadata,
   Id,
+  MessageAttachment,
   PlatformEventPayload,
   StoredPlatformEvent,
   Thread,
@@ -19,6 +21,7 @@ import type {
   PostAgentMessageInput,
   PostAgentMessageResult,
   RuntimeEvent,
+  RuntimeImage,
 } from "../runtime/runtime.js";
 
 export interface MultiAgentPlatformOptions {
@@ -40,11 +43,19 @@ export interface PostUserMessageInput {
   title?: string;
   humanId?: string;
   workingDirectory?: string;
+  attachments?: MessageAttachment[];
+  /**
+   * Deliver into a run that is already in flight instead of queueing behind it.
+   * Targets whose runtime cannot steer fall back to a queued run.
+   */
+  steer?: boolean;
 }
 
 export interface PostUserMessageResult {
   threadId: Id;
   chainId: Id;
+  /** Agents that received the message mid-run rather than through a new run. */
+  steered: Id[];
 }
 
 export interface StartedUserMessage extends PostUserMessageResult {
@@ -230,12 +241,20 @@ export class MultiAgentPlatform {
       content,
       createdAt: now(),
       causal,
+      ...(input.attachments && input.attachments.length > 0
+        ? { attachments: input.attachments }
+        : {}),
     };
     await this.addMessage(message);
 
+    const steered: Id[] = [];
     for (const target of targets) {
       const agent = this.agents.get(target);
       if (!agent) continue;
+      if (input.steer && (await this.trySteer(threadId, target, message))) {
+        steered.push(target);
+        continue;
+      }
       await this.enqueueRun({
         id: createId("run"),
         threadId,
@@ -249,7 +268,50 @@ export class MultiAgentPlatform {
     }
     this.startScheduler();
     const completion = this.waitForChain(chainId);
-    return { threadId, chainId, completion };
+    return { threadId, chainId, steered, completion };
+  }
+
+  /**
+   * Hands a human message to a run that is already streaming. Only human
+   * messages steer: routing an A2A post this way would bypass the depth,
+   * ping-pong, and idempotency accounting that collaboration chains rely on.
+   */
+  private async trySteer(
+    threadId: Id,
+    agentId: Id,
+    message: ThreadMessage,
+  ): Promise<boolean> {
+    const active = [...this.activeRuns.values()].find(
+      (candidate) => candidate.run.agentId === agentId && candidate.run.threadId === threadId,
+    );
+    if (!active || !active.runtime.steer) return false;
+    const text = [
+      "<steering-message>",
+      `sender_type: ${message.sender.type}`,
+      `sender_id: ${message.sender.id}`,
+      message.content,
+      "</steering-message>",
+      "",
+      "This arrived while you were working. Take it into account before continuing.",
+    ].join("\n");
+    let delivered = false;
+    try {
+      delivered = await active.runtime.steer(active.run.id, text);
+    } catch {
+      return false;
+    }
+    if (!delivered) return false;
+    // The cursor moves so the steered message is not replayed as fresh context
+    // on this Agent's next run.
+    this.deliveryCursors.set(cursorKey(threadId, agentId), message.id);
+    await this.record({
+      type: "run.steered",
+      runId: active.run.id,
+      threadId,
+      agentId,
+      messageId: message.id,
+    });
+    return true;
   }
 
   public async cancelGroup(chainId: Id, reason = "Cancelled by operator"): Promise<void> {
@@ -482,6 +544,8 @@ export class MultiAgentPlatform {
 
     try {
       const workingDirectory = this.threads.get(run.threadId)?.workingDirectory;
+      const attachments = incoming.attachments ?? [];
+      const images = await loadAttachmentImages(attachments);
       const result = await runtime.execute({
         runId: run.id,
         threadId: run.threadId,
@@ -490,6 +554,8 @@ export class MultiAgentPlatform {
         roster: [...this.agents.values()].filter((candidate) => candidate.enabled),
         incoming,
         context,
+        ...(attachments.length > 0 ? { attachments } : {}),
+        ...(images.length > 0 ? { images } : {}),
         signal: controller.signal,
         emit: (event) => this.recordRuntimeEvent(active, event),
         postMessage: (message) => this.acceptAgentMessage(run, message),
@@ -1028,4 +1094,24 @@ function abortReason(signal: AbortSignal): string {
   return signal.reason instanceof Error
     ? signal.reason.message
     : String(signal.reason ?? "Run aborted");
+}
+
+/**
+ * Reads image attachments off disk for runtimes that accept inline images. A
+ * file that has been moved or removed is skipped rather than failing the run.
+ */
+async function loadAttachmentImages(
+  attachments: MessageAttachment[],
+): Promise<RuntimeImage[]> {
+  const images: RuntimeImage[] = [];
+  for (const attachment of attachments) {
+    if (!attachment.mediaType.startsWith("image/")) continue;
+    try {
+      const bytes = await readFile(attachment.path);
+      images.push({ mediaType: attachment.mediaType, data: bytes.toString("base64") });
+    } catch {
+      continue;
+    }
+  }
+  return images;
 }

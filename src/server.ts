@@ -20,6 +20,10 @@ import {
   saveFirstRunConfig,
 } from "./config/first-run.js";
 import { findApiProvider } from "./config/provider-presets.js";
+import {
+  parseAttachmentInputs,
+  saveAttachments,
+} from "./core/attachments.js";
 import { RecentContextCompiler } from "./core/context-compiler.js";
 import { JsonlEventStore } from "./core/event-store.js";
 import { MultiAgentPlatform } from "./core/platform.js";
@@ -232,7 +236,9 @@ const server = createServer(async (request, response) => {
     }
 
     if (url.pathname === "/api/messages" && request.method === "POST") {
-      const body = await readJson(request);
+      // Images arrive base64-encoded, so this endpoint needs more headroom
+      // than the default JSON budget.
+      const body = await readJson(request, 24_000_000);
       const content = typeof body.content === "string" ? body.content.trim() : "";
       const threadId = typeof body.threadId === "string" ? body.threadId : undefined;
       const workspacePath =
@@ -256,10 +262,16 @@ const server = createServer(async (request, response) => {
         }
       }
       try {
+        const attachments = await saveAttachments(
+          dataRoot,
+          parseAttachmentInputs(body.attachments),
+        );
         const started = await platform.startUserMessage({
           content,
           ...(threadId ? { threadId } : {}),
           ...(workspace ? { workingDirectory: workspace.path } : {}),
+          ...(attachments.length > 0 ? { attachments } : {}),
+          ...(body.steer === true ? { steer: true } : {}),
         });
         void started.completion.catch((error: unknown) => {
           console.error("Background Agent chain failed", error);
@@ -267,12 +279,71 @@ const server = createServer(async (request, response) => {
         sendJson(response, 202, {
           threadId: started.threadId,
           chainId: started.chainId,
+          steered: started.steered,
           ...(workspace ? { workspace } : {}),
         });
       } catch (error) {
         sendJson(response, 400, { error: errorMessage(error) });
       }
       return;
+    }
+
+    if (url.pathname === "/api/models" && request.method === "GET") {
+      sendJson(response, 200, await buildModelCatalog());
+      return;
+    }
+
+    const sessionMatch = url.pathname.match(/^\/api\/agents\/([^/]+)\/session$/);
+    if (sessionMatch) {
+      const agentId = decodeURIComponent(sessionMatch[1] ?? "");
+      const runtime = runtimes.get(agentId);
+      const requestedThreadId = url.searchParams.get("threadId") ?? "";
+      if (!runtime) {
+        sendJson(response, 404, { error: `未知 Agent：@${agentId}` });
+        return;
+      }
+      if (!requestedThreadId) {
+        sendJson(response, 400, { error: "缺少 threadId" });
+        return;
+      }
+      try {
+        if (request.method === "GET") {
+          if (!runtime.sessionStats) {
+            sendJson(response, 501, { error: "该运行时不提供 session 统计" });
+            return;
+          }
+          const stats = await runtime.sessionStats(requestedThreadId);
+          sendJson(response, 200, { stats: stats ?? null });
+          return;
+        }
+        if (request.method === "POST") {
+          const action = url.searchParams.get("action") ?? "compact";
+          if (action === "compact") {
+            if (!runtime.compactSession) {
+              sendJson(response, 501, { error: "该运行时不支持手动压缩" });
+              return;
+            }
+            sendJson(response, 200, await runtime.compactSession(requestedThreadId));
+            return;
+          }
+          if (action === "export") {
+            const format = url.searchParams.get("format") === "jsonl" ? "jsonl" : "html";
+            if (!runtime.exportSession) {
+              sendJson(response, 501, { error: "该运行时不支持导出" });
+              return;
+            }
+            sendJson(response, 200, {
+              path: await runtime.exportSession(requestedThreadId, format),
+            });
+            return;
+          }
+          sendJson(response, 400, { error: `未知操作：${action}` });
+          return;
+        }
+      } catch (error) {
+        sendJson(response, 400, { error: errorMessage(error) });
+        return;
+      }
     }
 
     const cancelMatch = url.pathname.match(/^\/api\/chains\/([^/]+)\/cancel$/);
@@ -375,6 +446,38 @@ async function buildBootstrapData() {
     events,
     cursor: events.at(-1)?.eventId,
   };
+}
+
+/**
+ * The Pi model catalog, so the roster editor can offer real provider and model
+ * choices instead of free text. Credentials are never included — only whether
+ * a provider has one configured.
+ */
+async function buildModelCatalog(): Promise<{
+  providers: Array<{
+    id: string;
+    name: string;
+    configured: boolean;
+    subscription: boolean;
+    models: Array<{ id: string; name: string }>;
+  }>;
+  error?: string;
+}> {
+  try {
+    const modelRuntime = await piShared.modelRuntime();
+    const providers = modelRuntime.getProviders().map((provider) => ({
+      id: provider.id,
+      name: provider.name ?? provider.id,
+      configured: modelRuntime.hasConfiguredAuth(provider.id),
+      subscription: modelRuntime.isUsingSubscription(provider.id),
+      models: modelRuntime
+        .getModels(provider.id)
+        .map((model) => ({ id: model.id, name: model.name ?? model.id })),
+    }));
+    return { providers };
+  } catch (error) {
+    return { providers: [], error: errorMessage(error) };
+  }
 }
 
 function configureCatalogForSetup(
@@ -507,13 +610,16 @@ async function streamEvents(
   });
 }
 
-async function readJson(request: IncomingMessage): Promise<Record<string, unknown>> {
+async function readJson(
+  request: IncomingMessage,
+  maxBytes = 1_000_000,
+): Promise<Record<string, unknown>> {
   const chunks: Buffer[] = [];
   let length = 0;
   for await (const chunk of request) {
     const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
     length += buffer.length;
-    if (length > 1_000_000) throw new Error("Request body is too large");
+    if (length > maxBytes) throw new Error("Request body is too large");
     chunks.push(buffer);
   }
   if (chunks.length === 0) return {};

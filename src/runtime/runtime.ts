@@ -82,6 +82,20 @@ export interface RuntimeResult {
   output: string;
 }
 
+export interface RuntimeSessionStats {
+  sessionId: string;
+  sessionFile?: string;
+  userMessages: number;
+  assistantMessages: number;
+  toolCalls: number;
+  totalTokens: number;
+  costUsd: number;
+  contextTokens?: number;
+  contextWindow?: number;
+}
+
+export type RuntimeSessionExportFormat = "html" | "jsonl";
+
 export interface AgentRuntime {
   readonly id: string;
   readonly availability: RuntimeAvailability;
@@ -92,5 +106,11 @@ export interface AgentRuntime {
    * the runtime cannot steer, so the caller can fall back to queueing a run.
    */
   steer?(runId: Id, text: string): Promise<boolean>;
+  /** Statistics for this Agent's private session in a thread, if it has one. */
+  sessionStats?(threadId: Id): Promise<RuntimeSessionStats | undefined>;
+  /** Summarize the session's older history to reclaim context window. */
+  compactSession?(threadId: Id): Promise<{ compacted: boolean; detail: string }>;
+  /** Write the session transcript to a file and return its path. */
+  exportSession?(threadId: Id, format: RuntimeSessionExportFormat): Promise<string>;
   dispose?(): Promise<void>;
 }
