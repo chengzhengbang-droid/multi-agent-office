@@ -3,6 +3,7 @@ import type {
   CompiledContext,
   Id,
   MessageAttachment,
+  ReviewSubmission,
   RuntimeAvailability,
   ThreadMessage,
 } from "../core/types.js";
@@ -55,6 +56,22 @@ export interface PostAgentMessageResult {
   reason?: string;
 }
 
+export type SubmitReviewInput = ReviewSubmission;
+
+export interface SubmitReviewResult {
+  accepted: boolean;
+  reason?: string;
+}
+
+/** What a review run is reviewing. Present only on review runs. */
+export interface ReviewAssignment {
+  taskRunId: Id;
+  authorAgentId: Id;
+  /** This review round, 1-based. */
+  round: number;
+  maxRounds: number;
+}
+
 /** An image attachment already read off disk, ready to hand to a model. */
 export interface RuntimeImage {
   mediaType: string;
@@ -74,8 +91,15 @@ export interface RuntimeRequest {
   images?: RuntimeImage[];
   attachments?: MessageAttachment[];
   signal: AbortSignal;
+  /**
+   * Set only on review runs. Runtimes expose the submit_review tool exactly
+   * when this is present, so an Agent can never approve its own work.
+   */
+  reviewOf?: ReviewAssignment;
   emit(event: RuntimeEvent): Promise<void>;
   postMessage(input: PostAgentMessageInput): Promise<PostAgentMessageResult>;
+  /** Present only alongside reviewOf. */
+  submitReview?(input: SubmitReviewInput): Promise<SubmitReviewResult>;
 }
 
 export interface RuntimeResult {

@@ -34,7 +34,11 @@ import type {
   StoredPlatformEvent,
   ThinkingLevel,
 } from "./core/types.js";
-import { RunCallbackRegistry, type CallbackRequest } from "./runtime/callback-registry.js";
+import {
+  RunCallbackRegistry,
+  type CallbackRequest,
+  type ReviewCallbackRequest,
+} from "./runtime/callback-registry.js";
 import { PiSharedRuntime } from "./runtime/pi-shared.js";
 import { createAgentRuntimes, type RuntimeFactoryOptions } from "./runtime/runtime-factory.js";
 import { FileRuntimeSessionStore } from "./runtime/session-store.js";
@@ -74,6 +78,7 @@ const runtimeFactoryOptions: RuntimeFactoryOptions = {
   sessionStore,
   callbackRegistry,
   callbackUrl: `http://127.0.0.1:${port}/internal/agent-message`,
+  reviewCallbackUrl: `http://127.0.0.1:${port}/internal/agent-review`,
   mcpCommand: process.execPath,
   mcpArgs: isDev
     ? ["--import", "tsx", resolve(appRoot, "src", "mcp", "collaboration-server.ts")]
@@ -91,6 +96,8 @@ const platform = new MultiAgentPlatform({
   maxMentionTargets: 2,
   maxPingPongHops: 4,
   maxParallelReadRuns: Number(process.env.MAO_MAX_PARALLEL_READ_RUNS ?? 4),
+  reviewMode: (process.env.MAO_REVIEW_GATE ?? "on") === "off" ? "off" : "required",
+  maxReviewRounds: Number(process.env.MAO_MAX_REVIEW_ROUNDS ?? 2),
 });
 
 const vite = isDev
@@ -111,6 +118,24 @@ const server = createServer(async (request, response) => {
       }
       try {
         const result = await callbackRegistry.invoke(token, parseCallbackRequest(await readJson(request)));
+        sendJson(response, 200, result);
+      } catch (error) {
+        sendJson(response, 403, { error: errorMessage(error) });
+      }
+      return;
+    }
+
+    if (url.pathname === "/internal/agent-review" && request.method === "POST") {
+      const token = bearerToken(request);
+      if (!token) {
+        sendJson(response, 401, { error: "Missing callback token" });
+        return;
+      }
+      try {
+        const result = await callbackRegistry.invokeReview(
+          token,
+          parseReviewCallbackRequest(await readJson(request)),
+        );
         sendJson(response, 200, result);
       } catch (error) {
         sendJson(response, 403, { error: errorMessage(error) });
@@ -550,6 +575,26 @@ function parseCallbackRequest(body: Record<string, unknown>): CallbackRequest {
     content: body.content as string,
     idempotencyKey: body.idempotencyKey as string,
     ...(typeof body.intent === "string" && body.intent ? { intent: body.intent } : {}),
+  };
+}
+
+function parseReviewCallbackRequest(body: Record<string, unknown>): ReviewCallbackRequest {
+  for (const key of ["runId", "threadId", "agentId", "summary"] as const) {
+    if (typeof body[key] !== "string" || !body[key]) throw new Error(`Invalid review callback field: ${key}`);
+  }
+  if (body.verdict !== "approved" && body.verdict !== "changes-requested") {
+    throw new Error("Invalid review callback field: verdict");
+  }
+  const findings = Array.isArray(body.findings)
+    ? body.findings.filter((finding): finding is string => typeof finding === "string")
+    : undefined;
+  return {
+    runId: body.runId as string,
+    threadId: body.threadId as string,
+    agentId: body.agentId as string,
+    verdict: body.verdict,
+    summary: body.summary as string,
+    ...(findings && findings.length > 0 ? { findings } : {}),
   };
 }
 

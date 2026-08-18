@@ -6,7 +6,10 @@ import { join, resolve } from "node:path";
 import { test } from "node:test";
 import { RecentContextCompiler } from "../src/core/context-compiler.js";
 import { InMemoryEventStore, JsonlEventStore } from "../src/core/event-store.js";
-import { MultiAgentPlatform } from "../src/core/platform.js";
+import {
+  MultiAgentPlatform,
+  type MultiAgentPlatformOptions,
+} from "../src/core/platform.js";
 import type { AgentDefinition, StoredPlatformEvent } from "../src/core/types.js";
 import { DeterministicRuntime } from "../src/runtime/deterministic-runtime.js";
 
@@ -58,7 +61,11 @@ test("the existing event log replays without rewriting the source", async (conte
     assert.ok(lines.length > 0);
     for (const event of replayed) {
       if (event.type === "message.created") {
-        assert.ok(event.message.kind === "chat" || event.message.kind === "collaboration");
+        assert.ok(
+          ["chat", "collaboration", "review-request", "review-feedback"].includes(
+            event.message.kind,
+          ),
+        );
         assert.ok(Array.isArray(event.message.mentions));
       }
       if (event.type === "run.queued") {
@@ -87,7 +94,11 @@ test("restart resumes queued work but marks a previously running call interrupte
   assert.equal(runningEvents.filter((event) => event.type === "run.completed").length, 0);
 });
 
-function createPlatform(eventStore: InMemoryEventStore | JsonlEventStore, ids: string[]): MultiAgentPlatform {
+function createPlatform(
+  eventStore: InMemoryEventStore | JsonlEventStore,
+  ids: string[],
+  options: Partial<MultiAgentPlatformOptions> = {},
+): MultiAgentPlatform {
   const safeIds = ids.length > 0 ? ids : ["codex"];
   const agents = safeIds.map(agent);
   return new MultiAgentPlatform({
@@ -96,6 +107,8 @@ function createPlatform(eventStore: InMemoryEventStore | JsonlEventStore, ids: s
     runtimes: new Map(agents.map((definition) => [definition.id, new DeterministicRuntime({ id: definition.id, stepDelayMs: 0 })])),
     eventStore,
     contextCompiler: new RecentContextCompiler(),
+    reviewMode: "off",
+    ...options,
   });
 }
 

@@ -134,6 +134,19 @@ export function validateCatalog(value: unknown): AgentCatalogV1 {
     if (ids.has(normalized)) throw new Error(`Duplicate Agent handle: ${agent.id}`);
     ids.add(normalized);
   }
+  for (const agent of agents) {
+    const reviewer = agent.reviewerAgentId;
+    if (!reviewer) continue;
+    if (reviewer === agent.id) {
+      throw new Error(`Agent ${agent.id} cannot review its own work`);
+    }
+    // A disabled peer is allowed on purpose: disabling an Agent must not turn
+    // every later catalog save into a validation failure. The platform falls
+    // back to another routable Agent at review time.
+    if (!agents.some((candidateAgent) => candidateAgent.id === reviewer)) {
+      throw new Error(`Agent ${agent.id} names an unknown reviewer: ${reviewer}`);
+    }
+  }
   if (typeof candidate.defaultAgentId !== "string") {
     throw new Error("Agent catalog must define defaultAgentId");
   }
@@ -187,6 +200,13 @@ function validateAgent(value: unknown): AgentDefinition {
   if (!isAccessMode(candidate.accessMode)) {
     throw new Error(`Agent ${candidate.id} has invalid accessMode`);
   }
+  if (
+    candidate.reviewerAgentId !== undefined &&
+    (typeof candidate.reviewerAgentId !== "string" ||
+      !/^[a-z][a-z0-9-]{0,31}$/.test(candidate.reviewerAgentId))
+  ) {
+    throw new Error(`Agent ${candidate.id} has an invalid reviewerAgentId`);
+  }
   const runtime = validateRuntime(candidate.id, candidate.runtime);
   return {
     id: candidate.id,
@@ -197,6 +217,7 @@ function validateAgent(value: unknown): AgentDefinition {
     enabled: candidate.enabled,
     accessMode: candidate.accessMode,
     runtime,
+    ...(candidate.reviewerAgentId ? { reviewerAgentId: candidate.reviewerAgentId } : {}),
   };
 }
 
@@ -242,7 +263,8 @@ function validateRuntime(agentId: string, value: unknown): AgentDefinition["runt
 function peerPrompt(name: string): string {
   return [
     `You are ${name}, an autonomous peer in a multi-agent team.`,
-    "There is no boss agent and no fixed workflow.",
+    "There is no boss agent; you decide whether to accept work, refuse it, or hand it to a better-suited peer.",
+    "Work a human asks for is peer-reviewed before it is done — you may be the author or the reviewer.",
     "Use your own judgment to accept the work, ask the human, or hand it to a better-suited peer.",
     "When another peer should act, use the post_message tool and put their @handle at the start of a line.",
     "Do not manufacture agreement: state concrete disagreements and evidence.",

@@ -48,9 +48,12 @@ import type {
   AgentCatalogV1,
   AgentDefinition,
   AgentSummary,
+  ReviewEscalation,
+  RunPurpose,
   StoredPlatformEvent,
   Thread,
   ThinkingLevel,
+  ThreadMessageKind,
 } from "../core/types";
 import type { DesktopUpdateSnapshot } from "../desktop/update-contract";
 
@@ -90,6 +93,7 @@ type TranscriptItem =
       content: string;
       mentions: string[];
       createdAt: string;
+      kind: ThreadMessageKind;
     }
   | {
       id: string;
@@ -102,7 +106,20 @@ type TranscriptItem =
       tools: ToolActivity[];
       notices: string[];
       usage?: RunUsage;
+      purpose: RunPurpose;
+      reviewRound?: number;
+      review?: ReviewState;
     };
+
+interface ReviewState {
+  status: "pending" | "approved" | "changes-requested" | "escalated" | "cancelled";
+  reviewerAgentId?: string;
+  round: number;
+  summary?: string;
+  findings?: string[];
+  escalation?: ReviewEscalation;
+  detail?: string;
+}
 
 interface ToolActivity {
   key: string;
@@ -405,17 +422,18 @@ export function App() {
                 if (item.type === "human") return <article className="human-message" key={item.id}><div>{item.content}</div></article>;
                 if (item.type === "collaboration") return (
                   <article className="collaboration-message" key={item.id}>
-                    <div className="collaboration-meta"><ArrowRight size={13} /><span>{agentName(data.agents, item.agentId)}</span><strong>结构化协作消息</strong>{item.mentions.map((id) => <i key={id}>@{id}</i>)}</div>
+                    <div className="collaboration-meta"><ArrowRight size={13} /><span>{agentName(data.agents, item.agentId)}</span><strong>{collaborationLabel(item.kind)}</strong>{item.mentions.map((id) => <i key={id}>@{id}</i>)}</div>
                     <ReactMarkdown remarkPlugins={[remarkGfm]}>{item.content}</ReactMarkdown>
                   </article>
                 );
                 const agent = data.agents.find((candidate) => candidate.id === item.agentId);
                 return (
                   <article className="agent-message" key={item.id}>
-                    <div className="agent-message-meta"><AgentAvatar agentId={item.agentId} /><span>{agentName(data.agents, item.agentId)}</span><small>{runtimeLabel(agent)}</small><span className={`status-label status-label--${item.status}`}>{statusLabel(item.status, agent?.accessMode)}</span></div>
+                    <div className="agent-message-meta"><AgentAvatar agentId={item.agentId} variant={item.purpose === "review" ? "reviewer" : undefined} /><span>{agentName(data.agents, item.agentId)}</span><small>{runtimeLabel(agent)}</small>{item.purpose === "review" && <span className="status-label status-label--review">审核 · 第 {item.reviewRound ?? 1} 轮</span>}<span className={`status-label status-label--${item.status}`}>{statusLabel(item.status, agent?.accessMode)}</span></div>
                     <RunActivity item={item} />
                     <div className={`markdown-body ${item.status === "running" ? "markdown-body--streaming" : ""}`}>{item.content ? <ReactMarkdown remarkPlugins={[remarkGfm]}>{item.content}</ReactMarkdown> : <div className="thinking-line"><span /><span /><span /></div>}</div>
                     {item.usage && <RunUsageBar usage={item.usage} />}
+                    {item.review && <ReviewCard review={item.review} agents={data.agents} />}
                   </article>
                 );
               })}
@@ -789,6 +807,7 @@ function AgentCatalogEditor({ open, catalog, agents, onClose, onSave }: CatalogE
     <div className="form-grid"><label>Handle<input value={selected.id} onChange={(event) => renameNewAgent(event.target.value)} disabled={originalIds.has(selected.id)} /></label><label>显示名<input value={selected.displayName} onChange={(event) => update({ displayName: event.target.value })} /></label></div>
     <label>简介<input value={selected.description} onChange={(event) => update({ description: event.target.value })} /></label><label>能力（逗号分隔）<input value={selected.capabilities.join(", ")} onChange={(event) => update({ capabilities: event.target.value.split(/[,，]/).map((item) => item.trim()).filter(Boolean) })} /></label><label>System prompt<textarea value={selected.systemPrompt} onChange={(event) => update({ systemPrompt: event.target.value })} rows={5} /></label>
     <div className="form-grid"><label>Runtime<select value={selected.runtime.kind} onChange={(event) => update({ runtime: event.target.value === "pi" ? { kind: "pi", provider: "zai-coding-cn", model: "glm-5.2", thinkingLevel: "medium" } : { kind: "codex", command: "codex" } })}><option value="codex">Codex CLI</option><option value="pi">Pi SDK</option></select></label><label>访问级别<select value={selected.accessMode} onChange={(event) => update({ accessMode: event.target.value as AccessMode })}><option value="read-only">read-only</option><option value="workspace-write">workspace-write</option><option value="full">full</option></select></label></div>
+    <div className="form-grid"><label>默认审核者<select value={selected.reviewerAgentId ?? ""} onChange={(event) => update({ reviewerAgentId: event.target.value || undefined })}><option value="">自动选择在线队友</option>{draft.agents.filter((candidate) => candidate.id !== selected.id).map((candidate) => <option value={candidate.id} key={candidate.id}>@{candidate.id}</option>)}</select><small className="field-hint">该 Agent 完成用户任务后，交由谁审核。离线或未配置时自动回退到其他在线 Agent。</small></label></div>
     {selected.runtime.kind === "pi" ? <div className="form-grid form-grid--three"><label>Provider<input list="pi-provider-options" value={selected.runtime.provider} onChange={(event) => update({ runtime: { ...selected.runtime, provider: event.target.value } as AgentDefinition["runtime"] })} /><datalist id="pi-provider-options">{catalogModels.providers.map((provider) => <option value={provider.id} key={provider.id}>{provider.name}{provider.configured ? (provider.subscription ? "（订阅已登录）" : "（凭据已配置）") : "（未配置凭据）"}</option>)}</datalist></label><label>Model<input list="pi-model-options" value={selected.runtime.model} onChange={(event) => update({ runtime: { ...selected.runtime, model: event.target.value } as AgentDefinition["runtime"] })} /><datalist id="pi-model-options">{(catalogModels.providers.find((provider) => provider.id === (selected.runtime as { provider: string }).provider)?.models ?? []).map((model) => <option value={model.id} key={model.id}>{model.name}</option>)}</datalist></label><label>Thinking<select value={selected.runtime.thinkingLevel} onChange={(event) => update({ runtime: { ...selected.runtime, thinkingLevel: event.target.value as ThinkingLevel } as AgentDefinition["runtime"] })}>{["off", "minimal", "low", "medium", "high", "xhigh", "max"].map((level) => <option key={level}>{level}</option>)}</select></label></div> : <><div className="form-grid"><label>CLI 路径<input value={selected.runtime.command} onChange={(event) => update({ runtime: { ...selected.runtime, command: event.target.value } as AgentDefinition["runtime"] })} /></label><label>Model<input value={selected.runtime.model ?? ""} placeholder="使用 profile 默认值" onChange={(event) => update({ runtime: { ...selected.runtime, model: event.target.value || undefined } as AgentDefinition["runtime"] })} /></label></div><div className="form-grid"><label>Profile<input value={selected.runtime.profile ?? ""} onChange={(event) => update({ runtime: { ...selected.runtime, profile: event.target.value || undefined } as AgentDefinition["runtime"] })} /></label><label>Reasoning<select value={selected.runtime.reasoningEffort ?? ""} onChange={(event) => update({ runtime: { ...selected.runtime, reasoningEffort: (event.target.value || undefined) as "low" | "medium" | "high" | "xhigh" | undefined } as AgentDefinition["runtime"] })}><option value="">profile 默认值</option>{["low", "medium", "high", "xhigh"].map((level) => <option key={level}>{level}</option>)}</select></label></div></>}
     <div className="catalog-switches"><label><input type="checkbox" checked={selected.enabled} disabled={selected.id === draft.defaultAgentId} onChange={(event) => update({ enabled: event.target.checked })} />启用</label><label><input type="radio" name="default-agent" checked={selected.id === draft.defaultAgentId} onChange={() => setDraft((current) => ({ ...current, defaultAgentId: selected.id, agents: current.agents.map((agent) => agent.id === selected.id ? { ...agent, enabled: true } : agent) }))} />设为默认 Agent</label></div>
     {selected.runtime.kind === "pi" && selected.accessMode === "full" && <p className="risk-warning">Pi full 会开放 Bash/edit/write，缺少完整文件系统沙箱。只在信任的本地工作目录使用。</p>}{selected.runtime.kind === "codex" && selected.accessMode === "full" && <p className="risk-warning">Codex v1 会把 full 映射为 workspace-write，不启用 danger-full-access。</p>}
@@ -883,11 +902,58 @@ function describeEvent(event: StoredPlatformEvent, agents: AgentSummary[]) {
   if (event.type === "run.steered") return { title: `已向 ${agentName(agents, event.agentId)} 插话`, detail: shortId(event.messageId), icon: SendHorizontal, tone: "active" };
   if (event.type === "routing.accepted") return { title: `结构化转交给 ${agentName(agents, event.targetAgentId)}`, detail: "post_message 已接受", icon: ArrowRight, tone: "active" };
   if (event.type === "routing.rejected") return { title: "Agent 路由被拒绝", detail: event.reason, icon: XCircle, tone: "danger" };
+  if (event.type === "review.requested") return { title: `已送审 ${agentName(agents, event.reviewerAgentId)}`, detail: `${agentName(agents, event.authorAgentId)} 的交付 · 第 ${event.round} 轮`, icon: ArrowRight, tone: "active" };
+  if (event.type === "review.submitted") return { title: event.verdict === "approved" ? `${agentName(agents, event.reviewerAgentId)} 审核通过` : `${agentName(agents, event.reviewerAgentId)} 要求修改`, detail: event.summary, icon: event.verdict === "approved" ? Check : RefreshCw, tone: event.verdict === "approved" ? "success" : "danger" };
+  if (event.type === "review.rework") return { title: `已打回 ${agentName(agents, event.authorAgentId)} 返工`, detail: `第 ${event.round} 轮审核未通过`, icon: RefreshCw, tone: "active" };
+  if (event.type === "review.resolved") return { title: reviewOutcomeTitle(event.outcome), detail: event.detail ?? `共 ${event.rounds} 轮审核`, icon: event.outcome === "approved" ? Check : XCircle, tone: event.outcome === "approved" ? "success" : event.outcome === "cancelled" ? "neutral" : "danger" };
   if (event.type === "run.completed") return { title: `${agentName(agents, event.agentId)} 已完成`, detail: shortId(event.runId), icon: Check, tone: "success" };
   if (event.type === "run.failed") return { title: `${agentName(agents, event.agentId)} 运行失败`, detail: event.error, icon: XCircle, tone: "danger" };
   if (event.type === "run.cancelled") return { title: `${agentName(agents, event.agentId)} 已取消`, detail: event.reason, icon: Square, tone: "danger" };
   if (event.type === "run.interrupted") return { title: `${agentName(agents, event.agentId)} 上次运行中断`, detail: event.reason, icon: XCircle, tone: "danger" };
   return { title: "平台事件", detail: event.type, icon: Activity, tone: "neutral" };
+}
+
+function collaborationLabel(kind: ThreadMessageKind): string {
+  if (kind === "review-request") return "送审";
+  if (kind === "review-feedback") return "审核意见";
+  return "结构化协作消息";
+}
+
+function reviewOutcomeTitle(outcome: "approved" | "escalated" | "cancelled"): string {
+  if (outcome === "approved") return "审核通过，任务完成";
+  if (outcome === "cancelled") return "审核已随协作链取消";
+  return "审核未通过，需要人工介入";
+}
+
+const REVIEW_ESCALATION_LABELS: Record<ReviewEscalation, string> = {
+  "no-reviewer": "没有可用于审核的其他 Agent",
+  inconclusive: "审核 Agent 没有给出结论",
+  "review-failed": "审核未能完成",
+  "max-rounds": "返工轮数已用完，仍未通过",
+};
+
+function ReviewCard({ review, agents }: { review: ReviewState; agents: AgentSummary[] }) {
+  const reviewer = review.reviewerAgentId ? agentName(agents, review.reviewerAgentId) : "另一个 Agent";
+  const title =
+    review.status === "pending" ? `等待 ${reviewer} 审核（第 ${review.round} 轮）`
+    : review.status === "approved" ? `${reviewer} 审核通过`
+    : review.status === "changes-requested" ? `${reviewer} 要求修改（第 ${review.round} 轮）`
+    : review.status === "cancelled" ? "审核已随协作链取消"
+    : "需要人工介入";
+  return (
+    <div className={`review-card review-card--${review.status}`}>
+      <div className="review-card-title">
+        {review.status === "approved" ? <Check size={13} /> : review.status === "pending" ? <Clock3 size={13} /> : review.status === "changes-requested" ? <RefreshCw size={13} /> : <XCircle size={13} />}
+        <strong>{title}</strong>
+      </div>
+      {review.status === "escalated" && review.escalation && <p>{REVIEW_ESCALATION_LABELS[review.escalation]}</p>}
+      {review.detail && <p>{review.detail}</p>}
+      {review.summary && <p>{review.summary}</p>}
+      {review.findings && review.findings.length > 0 && (
+        <ul>{review.findings.map((finding, index) => <li key={`${index}-${finding}`}>{finding}</li>)}</ul>
+      )}
+    </div>
+  );
 }
 
 function RunActivity({ item }: { item: Extract<TranscriptItem, { type: "agent" }> }) {
@@ -940,7 +1006,7 @@ function RunUsageBar({ usage }: { usage: RunUsage }) {
 
 function formatTokens(value: number): string { return value >= 1_000 ? `${(value / 1_000).toFixed(1)}k` : String(value); }
 
-function AgentAvatar({ agentId }: { agentId: string }) { return <span className={`agent-avatar agent-avatar--${agentId}`}>{agentId.slice(0, 1).toUpperCase()}</span>; }
+function AgentAvatar({ agentId, variant }: { agentId: string; variant?: "reviewer" }) { return <span className={`agent-avatar agent-avatar--${variant ?? agentId}`}>{agentId.slice(0, 1).toUpperCase()}</span>; }
 
 function buildThreads(events: StoredPlatformEvent[]): ThreadSummary[] {
   const threads = new Map<string, ThreadSummary>(); const activeRuns = new Map<string, { threadId: string; active: boolean }>();
@@ -956,13 +1022,18 @@ function buildTranscript(events: StoredPlatformEvent[], threadId?: string): Tran
   for (const event of events) {
     if (event.type === "message.created" && event.message.threadId === threadId) {
       if (event.message.sender.type === "human") items.push({ id: event.message.id, type: "human", content: event.message.content, createdAt: event.message.createdAt });
-      else if (event.message.kind === "collaboration") items.push({ id: event.message.id, type: "collaboration", agentId: event.message.sender.id, content: event.message.content, mentions: event.message.mentions, createdAt: event.message.createdAt });
+      else if (event.message.kind === "collaboration" || event.message.kind === "review-request" || event.message.kind === "review-feedback") items.push({ id: event.message.id, type: "collaboration", agentId: event.message.sender.id, content: event.message.content, mentions: event.message.mentions, createdAt: event.message.createdAt, kind: event.message.kind });
       continue;
     }
     if (event.type === "run.queued" && event.run.threadId === threadId) {
-      const item: Extract<TranscriptItem, { type: "agent" }> = { id: event.run.id, type: "agent", agentId: event.run.agentId, content: "", createdAt: event.recordedAt, status: "queued", thinking: "", tools: [], notices: [] };
+      const item: Extract<TranscriptItem, { type: "agent" }> = { id: event.run.id, type: "agent", agentId: event.run.agentId, content: "", createdAt: event.recordedAt, status: "queued", thinking: "", tools: [], notices: [], purpose: event.run.purpose ?? "task", ...(event.run.reviewRound ? { reviewRound: event.run.reviewRound } : {}) };
       items.push(item);
       runs.set(event.run.id, item);
+      continue;
+    }
+    if (event.type === "review.requested" || event.type === "review.submitted" || event.type === "review.rework" || event.type === "review.resolved") {
+      if (event.threadId !== threadId) continue;
+      applyReviewEvent(runs.get(event.taskRunId), event);
       continue;
     }
     if (!("runId" in event) || event.threadId !== threadId) continue;
@@ -984,6 +1055,41 @@ function buildTranscript(events: StoredPlatformEvent[], threadId?: string): Tran
     else if (event.type === "run.interrupted") { run.content = event.reason; run.status = "interrupted"; }
   }
   return items.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+}
+
+type ReviewEvent = Extract<
+  StoredPlatformEvent,
+  { type: "review.requested" | "review.submitted" | "review.rework" | "review.resolved" }
+>;
+
+/** Review state lives on the originating task run, across every rework round. */
+function applyReviewEvent(run: Extract<TranscriptItem, { type: "agent" }> | undefined, event: ReviewEvent): void {
+  if (!run) return;
+  const current = run.review;
+  if (event.type === "review.requested") {
+    run.review = { status: "pending", reviewerAgentId: event.reviewerAgentId, round: event.round };
+    return;
+  }
+  if (event.type === "review.submitted") {
+    run.review = {
+      ...(current ?? { status: "pending", round: 1 }),
+      status: event.verdict === "approved" ? "approved" : "changes-requested",
+      summary: event.summary,
+      ...(event.findings ? { findings: event.findings } : {}),
+    };
+    return;
+  }
+  if (event.type === "review.rework") {
+    run.review = { ...(current ?? { status: "changes-requested", round: event.round }), status: "changes-requested", round: event.round };
+    return;
+  }
+  run.review = {
+    ...(current ?? { status: "pending", round: event.rounds }),
+    status: event.outcome === "approved" ? "approved" : event.outcome === "cancelled" ? "cancelled" : "escalated",
+    round: event.rounds,
+    ...(event.escalation ? { escalation: event.escalation } : {}),
+    ...(event.detail ? { detail: event.detail } : {}),
+  };
 }
 
 function applyToolEvent(run: Extract<TranscriptItem, { type: "agent" }>, event: Extract<StoredPlatformEvent, { type: "run.tool" }>): void {

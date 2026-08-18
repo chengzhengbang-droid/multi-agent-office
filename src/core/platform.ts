@@ -12,6 +12,9 @@ import type {
   Id,
   MessageAttachment,
   PlatformEventPayload,
+  ReviewEscalation,
+  ReviewOutcome,
+  ReviewSubmission,
   StoredPlatformEvent,
   Thread,
   ThreadMessage,
@@ -20,8 +23,11 @@ import type {
   AgentRuntime,
   PostAgentMessageInput,
   PostAgentMessageResult,
+  ReviewAssignment,
   RuntimeEvent,
   RuntimeImage,
+  SubmitReviewInput,
+  SubmitReviewResult,
 } from "../runtime/runtime.js";
 
 export interface MultiAgentPlatformOptions {
@@ -35,7 +41,15 @@ export interface MultiAgentPlatformOptions {
   maxMentionTargets?: number;
   maxPingPongHops?: number;
   maxParallelReadRuns?: number;
+  /**
+   * "required" gates every user task behind a peer review. "off" restores the
+   * pre-review behaviour where a completed run is the final deliverable.
+   */
+  reviewMode?: ReviewMode;
+  maxReviewRounds?: number;
 }
+
+export type ReviewMode = "required" | "off";
 
 export interface PostUserMessageInput {
   content: string;
@@ -94,11 +108,21 @@ export class MultiAgentPlatform {
   private readonly chainWaiters = new Map<Id, Set<ChainWaiter>>();
   private readonly deliveryCursors = new Map<string, Id>();
   private readonly latestSuccessfulAgentByThread = new Map<Id, Id>();
+  /** reviewRunId -> the verdict that run submitted, if any. */
+  private readonly reviewSubmissions = new Map<Id, ReviewSubmission>();
+  /** taskRunId -> review rounds requested so far. */
+  private readonly reviewRounds = new Map<Id, number>();
+  /** taskRunId values that already carry a terminal review.resolved. */
+  private readonly resolvedTaskRuns = new Set<Id>();
+  /** reviewRunId -> the Agent whose work that review judges. */
+  private readonly reviewAuthors = new Map<Id, Id>();
   private readonly maxA2ADepth: number;
   private readonly maxAgentRunsPerChain: number;
   private readonly maxMentionTargets: number;
   private readonly maxPingPongHops: number;
   private readonly maxParallelReadRuns: number;
+  private readonly reviewMode: ReviewMode;
+  private readonly maxReviewRounds: number;
   private defaultAgentId: Id;
   private hydrated = false;
   private hydratePromise: Promise<void> | undefined;
@@ -114,6 +138,8 @@ export class MultiAgentPlatform {
     this.maxMentionTargets = options.maxMentionTargets ?? 2;
     this.maxPingPongHops = options.maxPingPongHops ?? 4;
     this.maxParallelReadRuns = options.maxParallelReadRuns ?? 4;
+    this.reviewMode = options.reviewMode ?? "required";
+    this.maxReviewRounds = Math.max(1, options.maxReviewRounds ?? 2);
   }
 
   public async initialize(): Promise<void> {
@@ -264,6 +290,7 @@ export class MultiAgentPlatform {
         accessMode: agent.accessMode,
         causal,
         createdAt: now(),
+        purpose: "task",
       });
     }
     this.startScheduler();
@@ -386,10 +413,12 @@ export class MultiAgentPlatform {
       } else if (event.type === "run.queued") {
         this.runs.set(event.run.id, event.run);
         this.runStatuses.set(event.run.id, "queued");
-        this.groupRunCounts.set(
-          event.run.causal.chainId,
-          (this.groupRunCounts.get(event.run.causal.chainId) ?? 0) + 1,
-        );
+        if (countsTowardChainBudget(event.run)) {
+          this.groupRunCounts.set(
+            event.run.causal.chainId,
+            (this.groupRunCounts.get(event.run.causal.chainId) ?? 0) + 1,
+          );
+        }
       } else if (event.type === "run.started") {
         this.runStatuses.set(event.runId, "running");
       } else if (
@@ -399,13 +428,26 @@ export class MultiAgentPlatform {
         event.type === "run.interrupted"
       ) {
         this.runStatuses.set(event.runId, terminalStatus(event.type));
-        if (event.type === "run.completed") {
+        if (event.type === "run.completed" && this.runs.get(event.runId)?.purpose !== "review") {
           this.latestSuccessfulAgentByThread.set(event.threadId, event.agentId);
         }
       } else if (event.type === "routing.accepted") {
         this.acceptedIdempotencyKeys.add(event.idempotencyKey);
       } else if (event.type === "context.delivered") {
         this.deliveryCursors.set(cursorKey(event.threadId, event.agentId), event.messageId);
+      } else if (event.type === "review.requested") {
+        this.reviewRounds.set(event.taskRunId, event.round);
+        this.reviewAuthors.set(event.reviewRunId, event.authorAgentId);
+      } else if (event.type === "review.rework") {
+        this.reviewRounds.set(event.taskRunId, event.round);
+      } else if (event.type === "review.submitted") {
+        this.reviewSubmissions.set(event.reviewRunId, {
+          verdict: event.verdict,
+          summary: event.summary,
+          ...(event.findings ? { findings: event.findings } : {}),
+        });
+      } else if (event.type === "review.resolved") {
+        this.resolvedTaskRuns.add(event.taskRunId);
       }
     }
     this.hydrated = true;
@@ -505,6 +547,7 @@ export class MultiAgentPlatform {
         error: `Agent @${run.agentId} is unavailable`,
       });
       this.runStatuses.set(run.id, "failed");
+      await this.escalateReviewRun(run, `审核者 @${run.agentId} 已不可用`);
       return undefined;
     }
     if (this.cancelledChains.has(run.causal.chainId)) {
@@ -542,10 +585,12 @@ export class MultiAgentPlatform {
       agentId: run.agentId,
     });
 
+    let completedOutput: string | undefined;
     try {
       const workingDirectory = this.threads.get(run.threadId)?.workingDirectory;
       const attachments = incoming.attachments ?? [];
       const images = await loadAttachmentImages(attachments);
+      const assignment = this.reviewAssignmentFor(run);
       const result = await runtime.execute({
         runId: run.id,
         threadId: run.threadId,
@@ -557,6 +602,15 @@ export class MultiAgentPlatform {
         ...(attachments.length > 0 ? { attachments } : {}),
         ...(images.length > 0 ? { images } : {}),
         signal: controller.signal,
+        // submit_review exists only on review runs, so no Agent can approve
+        // work it produced itself.
+        ...(assignment
+          ? {
+              reviewOf: assignment,
+              submitReview: (input: SubmitReviewInput) =>
+                this.acceptReviewSubmission(run, input),
+            }
+          : {}),
         emit: (event) => this.recordRuntimeEvent(active, event),
         postMessage: (message) => this.acceptAgentMessage(run, message),
       });
@@ -582,8 +636,13 @@ export class MultiAgentPlatform {
         agentId: run.agentId,
         output: result.output,
       });
-      this.latestSuccessfulAgentByThread.set(run.threadId, run.agentId);
+      // A reviewer answering the gate is not "the Agent handling this thread";
+      // letting it win here would silently rewrite resolveFallbackAgent.
+      if (run.purpose !== "review") {
+        this.latestSuccessfulAgentByThread.set(run.threadId, run.agentId);
+      }
       this.runStatuses.set(run.id, "completed");
+      completedOutput = result.output;
     } catch (error) {
       if (controller.signal.aborted || isAbortError(error)) {
         await this.recordCancelled(run, abortReason(controller.signal));
@@ -596,7 +655,16 @@ export class MultiAgentPlatform {
           error: errorMessage(error),
         });
         this.runStatuses.set(run.id, "failed");
+        await this.escalateReviewRun(run, `审核运行失败：${errorMessage(error)}`);
       }
+    }
+
+    // Outside the try/catch on purpose: a throw in here must not be recorded as
+    // a failure of a run that already completed. Still inside executeRun, so
+    // enqueueRun's incrementPending lands before the scheduler's
+    // finishPendingRun — the chain cannot resolve while a review is owed.
+    if (completedOutput !== undefined) {
+      await this.advanceReview(run, completedOutput);
     }
   }
 
@@ -713,10 +781,326 @@ export class MultiAgentPlatform {
         accessMode: agent.accessMode,
         causal: message.causal as CausalMetadata,
         createdAt: now(),
+        purpose: "task",
       });
     }
     this.startScheduler();
     return { accepted: true, targets, messageId: message.id };
+  }
+
+  // ---------------------------------------------------------------------------
+  // Mandatory peer-review gate
+  //
+  // A user task is not delivered when its run completes; it is delivered when a
+  // different Agent approves it. Two invariants hold everywhere below: nothing
+  // silently passes (a missing reviewer, a missing verdict, or a failed review
+  // all escalate to the human), and nothing with side effects is auto-retried.
+  // ---------------------------------------------------------------------------
+
+  /** The stable id of the task a run serves, across every rework round. */
+  private taskRunIdOf(run: AgentRun): Id {
+    return run.taskRunId ?? run.id;
+  }
+
+  /** Only work a human directly asked for is gated; A2A collaboration is not. */
+  private isReviewGated(run: AgentRun): boolean {
+    if (this.reviewMode !== "required") return false;
+    if ((run.purpose ?? "task") !== "task") return false;
+    if (run.causal.depth !== 0) return false;
+    return this.messages.get(run.incomingMessageId)?.sender.type === "human" ||
+      (run.reviewRound ?? 0) > 0;
+  }
+
+  private reviewAssignmentFor(run: AgentRun): ReviewAssignment | undefined {
+    if (run.purpose !== "review" || !run.taskRunId) return undefined;
+    const authorAgentId = this.reviewAuthors.get(run.id);
+    if (!authorAgentId) return undefined;
+    return {
+      taskRunId: run.taskRunId,
+      authorAgentId,
+      round: run.reviewRound ?? 1,
+      maxRounds: this.maxReviewRounds,
+    };
+  }
+
+  /** Runs after every completed run: opens the gate, or settles it. */
+  private async advanceReview(run: AgentRun, output: string): Promise<void> {
+    if (run.purpose === "review") {
+      await this.settleReview(run);
+      return;
+    }
+    if (!this.isReviewGated(run)) return;
+    await this.requestReview(run, output);
+  }
+
+  private async requestReview(run: AgentRun, output: string): Promise<void> {
+    const taskRunId = this.taskRunIdOf(run);
+    if (this.resolvedTaskRuns.has(taskRunId)) return;
+    if (this.cancelledChains.has(run.causal.chainId)) return;
+    const round = (this.reviewRounds.get(taskRunId) ?? 0) + 1;
+
+    const reviewerAgentId = this.resolveReviewer(run.agentId);
+    const reviewer = reviewerAgentId ? this.agents.get(reviewerAgentId) : undefined;
+    if (!reviewerAgentId || !reviewer) {
+      await this.resolveReview(
+        run,
+        "escalated",
+        round - 1,
+        "no-reviewer",
+        `没有除 @${run.agentId} 以外可用的 Agent 来审核，任务需要人工确认`,
+      );
+      return;
+    }
+
+    const originRun = this.runs.get(taskRunId) ?? run;
+    const task = this.messages.get(originRun.incomingMessageId);
+    const message: ThreadMessage = {
+      id: createId("msg"),
+      threadId: run.threadId,
+      // Attributed to the author: the platform submits the work on its behalf.
+      // A third "system" sender would ripple through the context compiler and
+      // both prompt builders for no gain.
+      sender: { type: "agent", id: run.agentId },
+      kind: "review-request",
+      mentions: [reviewerAgentId],
+      content: buildReviewRequestContent({
+        reviewerAgentId,
+        authorAgentId: run.agentId,
+        task: task?.content ?? "(原始任务不可用)",
+        deliverable: output,
+        round,
+        maxRounds: this.maxReviewRounds,
+      }),
+      intent: "review-request",
+      createdAt: now(),
+      // Review runs keep the author's depth. Spending A2A depth on the gate
+      // would leave a reworking Agent unable to collaborate at all.
+      causal: {
+        chainId: run.causal.chainId,
+        parentRunId: run.id,
+        depth: run.causal.depth,
+      },
+    };
+    await this.addMessage(message);
+
+    const reviewRun: AgentRun = {
+      id: createId("run"),
+      threadId: run.threadId,
+      agentId: reviewerAgentId,
+      incomingMessageId: message.id,
+      status: "queued",
+      accessMode: reviewer.accessMode,
+      causal: message.causal as CausalMetadata,
+      createdAt: now(),
+      purpose: "review",
+      taskRunId,
+      reviewRound: round,
+    };
+    this.reviewRounds.set(taskRunId, round);
+    this.reviewAuthors.set(reviewRun.id, run.agentId);
+    await this.record({
+      type: "review.requested",
+      threadId: run.threadId,
+      taskRunId,
+      reviewRunId: reviewRun.id,
+      authorAgentId: run.agentId,
+      reviewerAgentId,
+      round,
+      messageId: message.id,
+    });
+    await this.enqueueRun(reviewRun);
+    this.startScheduler();
+  }
+
+  private resolveReviewer(authorAgentId: Id): Id | undefined {
+    const preferred = this.agents.get(authorAgentId)?.reviewerAgentId;
+    if (preferred && preferred !== authorAgentId && this.isRoutable(preferred)) {
+      return preferred;
+    }
+    // Roster order, so the fallback is deterministic and assertable.
+    return [...this.agents.keys()].find(
+      (id) => id !== authorAgentId && this.isRoutable(id),
+    );
+  }
+
+  private async settleReview(reviewRun: AgentRun): Promise<void> {
+    const taskRunId = reviewRun.taskRunId;
+    if (!taskRunId || this.resolvedTaskRuns.has(taskRunId)) return;
+    const round = reviewRun.reviewRound ?? 1;
+    const submission = this.reviewSubmissions.get(reviewRun.id);
+
+    if (!submission) {
+      await this.resolveReview(
+        reviewRun,
+        "escalated",
+        round,
+        "inconclusive",
+        `@${reviewRun.agentId} 结束了审核但没有调用 submit_review，不能视为通过`,
+      );
+      return;
+    }
+    if (submission.verdict === "approved") {
+      await this.resolveReview(reviewRun, "approved", round);
+      return;
+    }
+    if (this.cancelledChains.has(reviewRun.causal.chainId)) {
+      await this.resolveReview(reviewRun, "cancelled", round, undefined, "协作链已取消");
+      return;
+    }
+    if (round >= this.maxReviewRounds) {
+      await this.resolveReview(
+        reviewRun,
+        "escalated",
+        round,
+        "max-rounds",
+        `${round} 轮审核后仍未通过，需要人工判断`,
+      );
+      return;
+    }
+
+    const authorAgentId = this.reviewAuthors.get(reviewRun.id);
+    const author = authorAgentId ? this.agents.get(authorAgentId) : undefined;
+    if (!authorAgentId || !author || !this.isRoutable(authorAgentId)) {
+      await this.resolveReview(
+        reviewRun,
+        "escalated",
+        round,
+        "review-failed",
+        `执行者 @${authorAgentId ?? "unknown"} 已不可用，无法返工`,
+      );
+      return;
+    }
+
+    const originRun = this.runs.get(taskRunId);
+    const feedback: ThreadMessage = {
+      id: createId("msg"),
+      threadId: reviewRun.threadId,
+      sender: { type: "agent", id: reviewRun.agentId },
+      kind: "review-feedback",
+      mentions: [authorAgentId],
+      content: buildReviewFeedbackContent({
+        authorAgentId,
+        submission,
+        round,
+        maxRounds: this.maxReviewRounds,
+      }),
+      intent: "review-changes-requested",
+      createdAt: now(),
+      causal: {
+        chainId: reviewRun.causal.chainId,
+        parentRunId: reviewRun.id,
+        depth: originRun?.causal.depth ?? reviewRun.causal.depth,
+      },
+    };
+    await this.addMessage(feedback);
+
+    const reworkRun: AgentRun = {
+      id: createId("run"),
+      threadId: reviewRun.threadId,
+      agentId: authorAgentId,
+      incomingMessageId: feedback.id,
+      status: "queued",
+      accessMode: author.accessMode,
+      causal: feedback.causal as CausalMetadata,
+      createdAt: now(),
+      purpose: "task",
+      taskRunId,
+      reviewRound: round,
+    };
+    await this.record({
+      type: "review.rework",
+      threadId: reviewRun.threadId,
+      taskRunId,
+      reworkRunId: reworkRun.id,
+      authorAgentId,
+      round,
+      messageId: feedback.id,
+    });
+    await this.enqueueRun(reworkRun);
+    this.startScheduler();
+  }
+
+  /** The single terminal marker for a gated task. Fires at most once. */
+  private async resolveReview(
+    run: AgentRun,
+    outcome: ReviewOutcome,
+    rounds: number,
+    escalation?: ReviewEscalation,
+    detail?: string,
+  ): Promise<void> {
+    const taskRunId = this.taskRunIdOf(run);
+    if (this.resolvedTaskRuns.has(taskRunId)) return;
+    this.resolvedTaskRuns.add(taskRunId);
+    await this.record({
+      type: "review.resolved",
+      threadId: run.threadId,
+      taskRunId,
+      outcome,
+      rounds,
+      ...(escalation ? { escalation } : {}),
+      ...(detail ? { detail } : {}),
+    });
+  }
+
+  /** A review run that never reached a verdict leaves the task for a human. */
+  private async escalateReviewRun(run: AgentRun, detail: string): Promise<void> {
+    if (run.purpose !== "review" || !run.taskRunId) return;
+    const round = run.reviewRound ?? 1;
+    if (this.runStatuses.get(run.id) === "cancelled") {
+      await this.resolveReview(run, "cancelled", round, undefined, detail);
+      return;
+    }
+    await this.resolveReview(run, "escalated", round, "review-failed", detail);
+  }
+
+  /**
+   * Backs the submit_review tool. The tool is declared on every run so a
+   * resumed session keeps a stable tool surface; authority to accept a verdict
+   * lives here, which is what actually stops an Agent approving its own work.
+   */
+  private async acceptReviewSubmission(
+    run: AgentRun,
+    input: SubmitReviewInput,
+  ): Promise<SubmitReviewResult> {
+    if (run.purpose !== "review" || !run.taskRunId) {
+      return {
+        accepted: false,
+        reason: "submit_review is only available while reviewing another Agent's work",
+      };
+    }
+    if (input.verdict !== "approved" && input.verdict !== "changes-requested") {
+      return { accepted: false, reason: "verdict must be approved or changes-requested" };
+    }
+    const summary = input.summary?.trim() ?? "";
+    if (!summary) return { accepted: false, reason: "summary is required" };
+    if (summary.length > 20_000) {
+      return { accepted: false, reason: "summary must be at most 20,000 characters" };
+    }
+    const findings = (input.findings ?? [])
+      .map((finding) => finding.trim())
+      .filter(Boolean)
+      .slice(0, 20);
+    if (input.verdict === "changes-requested" && findings.length === 0) {
+      return {
+        accepted: false,
+        reason: "changes-requested must list at least one concrete finding",
+      };
+    }
+    const submission: ReviewSubmission = {
+      verdict: input.verdict,
+      summary,
+      ...(findings.length > 0 ? { findings } : {}),
+    };
+    this.reviewSubmissions.set(run.id, submission);
+    await this.record({
+      type: "review.submitted",
+      threadId: run.threadId,
+      taskRunId: run.taskRunId,
+      reviewRunId: run.id,
+      reviewerAgentId: run.agentId,
+      ...submission,
+    });
+    return { accepted: true };
   }
 
   private projectedPingPongHops(sourceRun: AgentRun, targetAgentId: Id): number {
@@ -726,6 +1110,10 @@ export class MultiAgentPlatform {
     while (current.causal.parentRunId) {
       const parent = this.runs.get(current.causal.parentRunId);
       if (!parent || unorderedPair(parent.agentId, current.agentId) !== pair) break;
+      // The review gate makes author -> reviewer -> author lineage routine, and
+      // it is platform-driven rather than two Agents talking past each other.
+      // Charging it here would spend the budget before the pair says anything.
+      if (parent.purpose === "review" || current.purpose === "review") break;
       count++;
       current = parent;
     }
@@ -759,10 +1147,12 @@ export class MultiAgentPlatform {
     this.queue.push(run);
     this.runs.set(run.id, run);
     this.runStatuses.set(run.id, "queued");
-    this.groupRunCounts.set(
-      run.causal.chainId,
-      (this.groupRunCounts.get(run.causal.chainId) ?? 0) + 1,
-    );
+    if (countsTowardChainBudget(run)) {
+      this.groupRunCounts.set(
+        run.causal.chainId,
+        (this.groupRunCounts.get(run.causal.chainId) ?? 0) + 1,
+      );
+    }
     this.incrementPending(run.causal.chainId);
     await this.record({ type: "run.queued", run });
     this.wakeScheduler();
@@ -903,6 +1293,7 @@ export class MultiAgentPlatform {
       reason,
     });
     this.runStatuses.set(run.id, "cancelled");
+    await this.escalateReviewRun(run, `审核被取消：${reason}`);
   }
 
   private async recordInterrupted(run: AgentRun, reason: string): Promise<void> {
@@ -914,6 +1305,7 @@ export class MultiAgentPlatform {
       reason,
     });
     this.runStatuses.set(run.id, "interrupted");
+    await this.escalateReviewRun(run, `审核被中断：${reason}`);
   }
 
   private async record(payload: PlatformEventPayload): Promise<void> {
@@ -1040,6 +1432,7 @@ function normalizeRun(run: LegacyRun, agents: Map<Id, AgentDefinition>): AgentRu
     ...run,
     status: run.status,
     accessMode: run.accessMode ?? agents.get(run.agentId)?.accessMode ?? "read-only",
+    purpose: run.purpose ?? "task",
     causal: normalizeCausal(run.causal, run.id),
   };
 }
@@ -1065,8 +1458,68 @@ function isTerminal(status: AgentRun["status"] | undefined): boolean {
   return status === "completed" || status === "failed" || status === "cancelled" || status === "interrupted";
 }
 
+const REVIEW_EXCERPT_LIMIT = 12_000;
+
+function excerpt(value: string): string {
+  return value.length <= REVIEW_EXCERPT_LIMIT
+    ? value
+    : `${value.slice(0, REVIEW_EXCERPT_LIMIT)}\n[... truncated for the review context budget]`;
+}
+
+function buildReviewRequestContent(input: {
+  reviewerAgentId: Id;
+  authorAgentId: Id;
+  task: string;
+  deliverable: string;
+  round: number;
+  maxRounds: number;
+}): string {
+  return [
+    `@${input.reviewerAgentId} Review @${input.authorAgentId}'s work — round ${input.round} of ${input.maxRounds}.`,
+    "",
+    "<original-task>",
+    excerpt(input.task),
+    "</original-task>",
+    "",
+    "<deliverable>",
+    excerpt(input.deliverable),
+    "</deliverable>",
+    "",
+    "Judge the deliverable against the original task. Do not redo the work yourself.",
+    "Finish by calling submit_review exactly once: approved, or changes-requested with concrete findings.",
+    "Ending without submit_review is not an approval — it escalates the task to the human.",
+  ].join("\n");
+}
+
+function buildReviewFeedbackContent(input: {
+  authorAgentId: Id;
+  submission: ReviewSubmission;
+  round: number;
+  maxRounds: number;
+}): string {
+  const findings = input.submission.findings ?? [];
+  return [
+    `@${input.authorAgentId} Review round ${input.round} of ${input.maxRounds}: changes requested.`,
+    "",
+    input.submission.summary,
+    ...(findings.length > 0 ? ["", "Findings:", ...findings.map((f) => `- ${f}`)] : []),
+    "",
+    `Address these and deliver again. Round ${input.round + 1} will review your update.`,
+  ].join("\n");
+}
+
 function cursorKey(threadId: Id, agentId: Id): string {
   return `${threadId}\u0000${agentId}`;
+}
+
+/**
+ * The per-chain run budget bounds Agent-initiated fan-out, which is unbounded
+ * and adversarial. Review and rework runs are platform-initiated and already
+ * bounded by maxReviewRounds, so counting them would let an Agent's A2A spend
+ * strand a task mid-gate.
+ */
+function countsTowardChainBudget(run: AgentRun): boolean {
+  return (run.purpose ?? "task") === "task" && (run.reviewRound ?? 0) === 0;
 }
 
 function unorderedPair(first: string, second: string): string {
