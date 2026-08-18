@@ -326,6 +326,62 @@ test("rejects configuration changes to an Agent with a live run", async () => {
   await chain.completion;
 });
 
+test("observability runtime events are projected onto the shared event log", async () => {
+  const platform = createPlatform([agent("pi")], new Map([["pi", runtime("pi", async (request) => {
+    await request.emit({ type: "thinking_delta", text: "weighing options" });
+    await request.emit({ type: "text_delta", text: "draft" });
+    await request.emit({ type: "output_reset", reason: "retry" });
+    await request.emit({ type: "lifecycle", phase: "retry_start", detail: "overloaded" });
+    await request.emit({ type: "tool_start", toolName: "bash", toolCallId: "call-1", args: '{"command":"ls"}' });
+    await request.emit({ type: "tool_end", toolName: "bash", toolCallId: "call-1", isError: false, resultSummary: "README.md" });
+    await request.emit({ type: "diagnostic", source: "extension", message: "hooks.ts failed" });
+    await request.emit({
+      type: "usage",
+      inputTokens: 120,
+      outputTokens: 40,
+      cacheReadTokens: 8,
+      cacheWriteTokens: 0,
+      totalTokens: 168,
+      costUsd: 0.0123,
+      contextTokens: 900,
+      contextWindow: 200_000,
+    });
+    return { output: "final" };
+  })]]), "pi");
+  await platform.postUserMessage({ content: "@pi go" });
+  const events = await platform.getEvents();
+
+  const thinking = events.find((event) => event.type === "run.thinking");
+  assert.equal(thinking?.type === "run.thinking" ? thinking.text : "", "weighing options");
+  assert.equal(countEvents(events, "run.reset"), 1);
+
+  const lifecycle = events.find((event) => event.type === "run.lifecycle");
+  assert.equal(lifecycle?.type === "run.lifecycle" ? lifecycle.phase : "", "retry_start");
+  assert.equal(lifecycle?.type === "run.lifecycle" ? lifecycle.detail : "", "overloaded");
+
+  // The existing phase/toolName/isError shape is preserved; the new call id,
+  // arguments, and result summary ride alongside as optional fields.
+  const toolStart = events.find((event) => event.type === "run.tool" && event.phase === "start");
+  assert.equal(toolStart?.type === "run.tool" ? toolStart.args : undefined, '{"command":"ls"}');
+  assert.equal(toolStart?.type === "run.tool" ? toolStart.toolCallId : undefined, "call-1");
+  const toolEnd = events.find((event) => event.type === "run.tool" && event.phase === "end");
+  assert.equal(toolEnd?.type === "run.tool" ? toolEnd.resultSummary : undefined, "README.md");
+  assert.equal(toolEnd?.type === "run.tool" ? toolEnd.isError : undefined, false);
+
+  const diagnostic = events.find((event) => event.type === "run.diagnostic");
+  assert.equal(diagnostic?.type === "run.diagnostic" ? diagnostic.source : "", "extension");
+
+  const usage = events.find((event) => event.type === "run.usage");
+  assert.equal(usage?.type === "run.usage" ? usage.totalTokens : 0, 168);
+  assert.equal(usage?.type === "run.usage" ? usage.contextWindow : 0, 200_000);
+  // The usage payload must not smuggle a second `type` field into the log.
+  assert.equal(usage?.type, "run.usage");
+
+  // Reset does not rewrite history; the completed output is authoritative.
+  const completed = events.find((event) => event.type === "run.completed");
+  assert.equal(completed?.type === "run.completed" ? completed.output : "", "final");
+});
+
 function createPlatform(
   agents: AgentDefinition[],
   runtimes: Map<string, AgentRuntime>,

@@ -97,7 +97,30 @@ type TranscriptItem =
       content: string;
       createdAt: string;
       status: ViewRunStatus;
+      thinking: string;
+      tools: ToolActivity[];
+      notices: string[];
+      usage?: RunUsage;
     };
+
+interface ToolActivity {
+  key: string;
+  toolName: string;
+  args?: string;
+  resultSummary?: string;
+  isError?: boolean;
+  done: boolean;
+}
+
+interface RunUsage {
+  totalTokens: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  costUsd: number;
+  contextTokens?: number;
+  contextWindow?: number;
+}
 
 export function App() {
   const [data, setData] = useState<BootstrapData>();
@@ -383,7 +406,9 @@ export function App() {
                 return (
                   <article className="agent-message" key={item.id}>
                     <div className="agent-message-meta"><AgentAvatar agentId={item.agentId} /><span>{agentName(data.agents, item.agentId)}</span><small>{runtimeLabel(agent)}</small><span className={`status-label status-label--${item.status}`}>{statusLabel(item.status, agent?.accessMode)}</span></div>
+                    <RunActivity item={item} />
                     <div className={`markdown-body ${item.status === "running" ? "markdown-body--streaming" : ""}`}>{item.content ? <ReactMarkdown remarkPlugins={[remarkGfm]}>{item.content}</ReactMarkdown> : <div className="thinking-line"><span /><span /><span /></div>}</div>
+                    {item.usage && <RunUsageBar usage={item.usage} />}
                   </article>
                 );
               })}
@@ -721,7 +746,7 @@ function WorkspacePicker({ open, current, recent, onClose, onSelect }: Workspace
 interface DetailsDrawerProps { open: boolean; onClose(): void; thread?: ThreadSummary; agents: AgentSummary[]; workspace?: WorkspaceSummary; events: StoredPlatformEvent[] }
 
 function DetailsDrawer({ open, onClose, thread, agents, workspace, events }: DetailsDrawerProps) {
-  const threadEvents = useMemo(() => selectThreadEvents(events, thread?.id), [events, thread?.id]); const runCount = threadEvents.filter((event) => event.type === "run.queued").length; const toolCount = threadEvents.filter((event) => event.type === "run.tool" && event.phase === "start").length; const messageCount = threadEvents.filter((event) => event.type === "message.created").length; const timeline = threadEvents.filter((event) => event.type !== "run.delta" && event.type !== "thread.created");
+  const threadEvents = useMemo(() => selectThreadEvents(events, thread?.id), [events, thread?.id]); const runCount = threadEvents.filter((event) => event.type === "run.queued").length; const toolCount = threadEvents.filter((event) => event.type === "run.tool" && event.phase === "start").length; const messageCount = threadEvents.filter((event) => event.type === "message.created").length; const timeline = threadEvents.filter((event) => event.type !== "run.delta" && event.type !== "run.thinking" && event.type !== "run.reset" && event.type !== "thread.created");
   return <>{open && <button className="drawer-scrim" type="button" onClick={onClose} aria-label="关闭运行详情" />}<aside className={`details-drawer ${open ? "details-drawer--open" : ""}`} aria-hidden={!open}><header className="drawer-header"><div><strong>运行详情</strong><span>{thread ? cleanTitle(thread.title) : "尚未创建任务"}</span></div><button className="icon-button" type="button" onClick={onClose} aria-label="关闭运行详情"><X size={18} /></button></header><div className="drawer-content"><section className="drawer-section workspace-card"><Folder size={16} /><div><span>工作目录与写锁作用域</span><code title={workspace?.path}>{workspace?.path ?? "正在读取"}</code></div></section><section className="drawer-section"><h2>概览</h2><div className="stat-grid"><div><strong>{runCount}</strong><span>运行</span></div><div><strong>{messageCount}</strong><span>消息</span></div><div><strong>{toolCount}</strong><span>工具</span></div></div></section><section className="drawer-section"><h2>团队运行时健康</h2><div className="agent-roster">{agents.map((agent) => <div className="roster-item" key={agent.id}><AgentAvatar agentId={agent.id} /><span><strong>{agent.displayName} · {runtimeLabel(agent)}</strong><small>@{agent.id} · {agent.accessMode} · {agent.availability.label}</small></span><i>{!agent.enabled ? "已停用" : threadEvents.some((event) => event.type === "run.started" && event.agentId === agent.id) ? "已参与" : agent.availability.available ? "待命" : "离线"}</i></div>)}</div></section><section className="drawer-section"><h2>A2A 与运行时间线</h2>{timeline.length > 0 ? <div className="event-timeline">{timeline.map((event) => <TimelineEvent event={event} agents={agents} key={event.eventId} />)}</div> : <p className="drawer-empty">发送任务后，这里会显示 session、排队、工具调用、结构化转交和运行状态。</p>}</section></div></aside></>;
 }
 
@@ -733,7 +758,11 @@ function describeEvent(event: StoredPlatformEvent, agents: AgentSummary[]) {
   if (event.type === "run.started") return { title: `${agentName(agents, event.agentId)} 开始运行`, detail: shortId(event.runId), icon: Activity, tone: "active" };
   if (event.type === "run.session") return { title: `${agentName(agents, event.agentId)} ${event.resumed ? "恢复" : "创建"} session`, detail: event.runtimeKind, icon: Bot, tone: "neutral" };
   if (event.type === "context.delivered") return { title: `上下文已交付给 ${agentName(agents, event.agentId)}`, detail: event.truncated ? "已按 24,000 字符截断" : shortId(event.messageId), icon: MessageSquare, tone: event.truncated ? "danger" : "neutral" };
-  if (event.type === "run.tool") return { title: event.phase === "start" ? `调用 ${event.toolName}` : `${event.toolName} ${event.isError ? "失败" : "完成"}`, detail: shortId(event.runId), icon: Wrench, tone: event.isError ? "danger" : "neutral" };
+  if (event.type === "run.tool") return { title: event.phase === "start" ? `调用 ${event.toolName}` : `${event.toolName} ${event.isError ? "失败" : "完成"}`, detail: (event.phase === "start" ? event.args : event.resultSummary)?.slice(0, 120) ?? shortId(event.runId), icon: Wrench, tone: event.isError ? "danger" : "neutral" };
+  if (event.type === "run.lifecycle") return { title: `${agentName(agents, event.agentId)} ${lifecycleLabel(event.phase)}`, detail: event.detail ?? shortId(event.runId), icon: RefreshCw, tone: event.phase === "retry_start" ? "danger" : "neutral" };
+  if (event.type === "run.diagnostic") return { title: event.source === "extension" ? "Pi 扩展报错" : "运行时诊断", detail: event.message, icon: XCircle, tone: "danger" };
+  if (event.type === "run.usage") return { title: `${agentName(agents, event.agentId)} 用量`, detail: `${formatTokens(event.totalTokens)} tokens · $${event.costUsd.toFixed(4)}`, icon: Activity, tone: "neutral" };
+  if (event.type === "run.steered") return { title: `已向 ${agentName(agents, event.agentId)} 插话`, detail: shortId(event.messageId), icon: SendHorizontal, tone: "active" };
   if (event.type === "routing.accepted") return { title: `结构化转交给 ${agentName(agents, event.targetAgentId)}`, detail: "post_message 已接受", icon: ArrowRight, tone: "active" };
   if (event.type === "routing.rejected") return { title: "Agent 路由被拒绝", detail: event.reason, icon: XCircle, tone: "danger" };
   if (event.type === "run.completed") return { title: `${agentName(agents, event.agentId)} 已完成`, detail: shortId(event.runId), icon: Check, tone: "success" };
@@ -742,6 +771,56 @@ function describeEvent(event: StoredPlatformEvent, agents: AgentSummary[]) {
   if (event.type === "run.interrupted") return { title: `${agentName(agents, event.agentId)} 上次运行中断`, detail: event.reason, icon: XCircle, tone: "danger" };
   return { title: "平台事件", detail: event.type, icon: Activity, tone: "neutral" };
 }
+
+function RunActivity({ item }: { item: Extract<TranscriptItem, { type: "agent" }> }) {
+  const [showThinking, setShowThinking] = useState(false);
+  const [expanded, setExpanded] = useState<string>();
+  if (!item.thinking && item.tools.length === 0 && item.notices.length === 0) return null;
+  return (
+    <div className="run-activity">
+      {item.notices.map((notice, index) => <p className="run-notice" key={`${index}-${notice}`}><RefreshCw size={12} />{notice}</p>)}
+      {item.thinking && (
+        <div className="run-thinking">
+          <button type="button" onClick={() => setShowThinking((current) => !current)} aria-expanded={showThinking}>
+            <Sparkles size={12} />思考过程<ChevronDown size={12} className={showThinking ? "rotated" : ""} />
+          </button>
+          {showThinking && <pre>{item.thinking}</pre>}
+        </div>
+      )}
+      {item.tools.length > 0 && (
+        <ul className="run-tools">
+          {item.tools.map((tool) => {
+            const detail = expanded === tool.key;
+            const hasDetail = Boolean(tool.args ?? tool.resultSummary);
+            return (
+              <li key={tool.key} className={tool.isError ? "run-tool--error" : tool.done ? "run-tool--done" : "run-tool--active"}>
+                <button type="button" disabled={!hasDetail} onClick={() => setExpanded(detail ? undefined : tool.key)} aria-expanded={detail}>
+                  <Wrench size={12} /><span>{tool.toolName}</span>
+                  <i>{tool.done ? (tool.isError ? "失败" : "完成") : "运行中"}</i>
+                  {hasDetail && <ChevronDown size={12} className={detail ? "rotated" : ""} />}
+                </button>
+                {detail && <div className="run-tool-detail">{tool.args && <pre><code>{tool.args}</code></pre>}{tool.resultSummary && <pre className="run-tool-result"><code>{tool.resultSummary}</code></pre>}</div>}
+              </li>
+            );
+          })}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+function RunUsageBar({ usage }: { usage: RunUsage }) {
+  const percent = usage.contextTokens !== undefined && usage.contextWindow ? Math.min(100, Math.round((usage.contextTokens / usage.contextWindow) * 100)) : undefined;
+  return (
+    <div className="run-usage">
+      <span title="输入 / 输出 / 缓存命中">{formatTokens(usage.inputTokens)} 入 · {formatTokens(usage.outputTokens)} 出{usage.cacheReadTokens > 0 ? ` · ${formatTokens(usage.cacheReadTokens)} 缓存` : ""}</span>
+      {usage.costUsd > 0 && <span>${usage.costUsd.toFixed(4)}</span>}
+      {percent !== undefined && <span className={percent >= 80 ? "run-usage--tight" : ""}>上下文 {percent}%</span>}
+    </div>
+  );
+}
+
+function formatTokens(value: number): string { return value >= 1_000 ? `${(value / 1_000).toFixed(1)}k` : String(value); }
 
 function AgentAvatar({ agentId }: { agentId: string }) { return <span className={`agent-avatar agent-avatar--${agentId}`}>{agentId.slice(0, 1).toUpperCase()}</span>; }
 
@@ -753,9 +832,65 @@ function buildThreads(events: StoredPlatformEvent[]): ThreadSummary[] {
 }
 
 function buildTranscript(events: StoredPlatformEvent[], threadId?: string): TranscriptItem[] {
-  if (!threadId) return []; const items: TranscriptItem[] = []; const runs = new Map<string, Extract<TranscriptItem, { type: "agent" }>>();
-  for (const event of events) { if (event.type === "message.created" && event.message.threadId === threadId) { if (event.message.sender.type === "human") items.push({ id: event.message.id, type: "human", content: event.message.content, createdAt: event.message.createdAt }); else if (event.message.kind === "collaboration") items.push({ id: event.message.id, type: "collaboration", agentId: event.message.sender.id, content: event.message.content, mentions: event.message.mentions, createdAt: event.message.createdAt }); } else if (event.type === "run.queued" && event.run.threadId === threadId) { const item: Extract<TranscriptItem, { type: "agent" }> = { id: event.run.id, type: "agent", agentId: event.run.agentId, content: "", createdAt: event.recordedAt, status: "queued" }; items.push(item); runs.set(event.run.id, item); } else if (event.type === "run.started" && event.threadId === threadId) { const run = runs.get(event.runId); if (run) run.status = "running"; } else if (event.type === "run.delta" && event.threadId === threadId) { const run = runs.get(event.runId); if (run) { run.content += event.text; run.status = "running"; } } else if (event.type === "run.completed" && event.threadId === threadId) { const run = runs.get(event.runId); if (run) { run.content = event.output; run.status = "completed"; } } else if (event.type === "run.failed" && event.threadId === threadId) { const run = runs.get(event.runId); if (run) { run.content = event.error; run.status = "failed"; } } else if (event.type === "run.cancelled" && event.threadId === threadId) { const run = runs.get(event.runId); if (run) { run.content = event.reason; run.status = "cancelled"; } } else if (event.type === "run.interrupted" && event.threadId === threadId) { const run = runs.get(event.runId); if (run) { run.content = event.reason; run.status = "interrupted"; } } }
+  if (!threadId) return [];
+  const items: TranscriptItem[] = [];
+  const runs = new Map<string, Extract<TranscriptItem, { type: "agent" }>>();
+  for (const event of events) {
+    if (event.type === "message.created" && event.message.threadId === threadId) {
+      if (event.message.sender.type === "human") items.push({ id: event.message.id, type: "human", content: event.message.content, createdAt: event.message.createdAt });
+      else if (event.message.kind === "collaboration") items.push({ id: event.message.id, type: "collaboration", agentId: event.message.sender.id, content: event.message.content, mentions: event.message.mentions, createdAt: event.message.createdAt });
+      continue;
+    }
+    if (event.type === "run.queued" && event.run.threadId === threadId) {
+      const item: Extract<TranscriptItem, { type: "agent" }> = { id: event.run.id, type: "agent", agentId: event.run.agentId, content: "", createdAt: event.recordedAt, status: "queued", thinking: "", tools: [], notices: [] };
+      items.push(item);
+      runs.set(event.run.id, item);
+      continue;
+    }
+    if (!("runId" in event) || event.threadId !== threadId) continue;
+    const run = runs.get(event.runId);
+    if (!run) continue;
+    if (event.type === "run.started") run.status = "running";
+    else if (event.type === "run.delta") { run.content += event.text; run.status = "running"; }
+    else if (event.type === "run.thinking") { run.thinking += event.text; run.status = "running"; }
+    // Auto-retry re-streams the turn, so everything shown so far is stale.
+    else if (event.type === "run.reset") { run.content = ""; run.thinking = ""; }
+    else if (event.type === "run.tool") applyToolEvent(run, event);
+    else if (event.type === "run.usage") { const { type: _type, runId: _runId, threadId: _threadId, agentId: _agentId, eventId: _eventId, recordedAt: _recordedAt, ...usage } = event; run.usage = usage; }
+    else if (event.type === "run.lifecycle") run.notices.push(lifecycleLabel(event.phase, event.detail));
+    else if (event.type === "run.diagnostic") run.notices.push(`${event.source === "extension" ? "扩展" : "运行时"}：${event.message}`);
+    else if (event.type === "run.steered") run.notices.push("已插入新的用户消息");
+    else if (event.type === "run.completed") { run.content = event.output; run.status = "completed"; }
+    else if (event.type === "run.failed") { run.content = event.error; run.status = "failed"; }
+    else if (event.type === "run.cancelled") { run.content = event.reason; run.status = "cancelled"; }
+    else if (event.type === "run.interrupted") { run.content = event.reason; run.status = "interrupted"; }
+  }
   return items.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+}
+
+function applyToolEvent(run: Extract<TranscriptItem, { type: "agent" }>, event: Extract<StoredPlatformEvent, { type: "run.tool" }>): void {
+  if (event.phase === "start") {
+    run.tools.push({ key: event.toolCallId ?? event.eventId, toolName: event.toolName, done: false, ...(event.args ? { args: event.args } : {}) });
+    return;
+  }
+  // Older runtimes report no call id, so fall back to the newest open call of
+  // the same tool.
+  const index = event.toolCallId
+    ? run.tools.findIndex((tool) => tool.key === event.toolCallId)
+    : run.tools.findLastIndex((tool) => tool.toolName === event.toolName && !tool.done);
+  const tool = index >= 0 ? run.tools[index] : undefined;
+  if (!tool) {
+    run.tools.push({ key: event.toolCallId ?? event.eventId, toolName: event.toolName, done: true, isError: event.isError ?? false, ...(event.resultSummary ? { resultSummary: event.resultSummary } : {}) });
+    return;
+  }
+  tool.done = true;
+  tool.isError = event.isError ?? false;
+  if (event.resultSummary) tool.resultSummary = event.resultSummary;
+}
+
+function lifecycleLabel(phase: Extract<StoredPlatformEvent, { type: "run.lifecycle" }>["phase"], detail?: string): string {
+  const label = { retry_start: "自动重试", retry_end: "重试结束", compaction_start: "正在压缩上下文", compaction_end: "上下文压缩结束" }[phase];
+  return detail ? `${label}：${detail}` : label;
 }
 
 function findActiveChain(events: StoredPlatformEvent[], threadId?: string): string | undefined { if (!threadId) return undefined; const runs = new Map<string, { chainId: string; active: boolean; order: number }>(); let order = 0; for (const event of events) { if (event.type === "run.queued" && event.run.threadId === threadId) runs.set(event.run.id, { chainId: event.run.causal.chainId, active: true, order: order++ }); else if (isTerminalEvent(event)) { const run = runs.get(event.runId); if (run) run.active = false; } } return [...runs.values()].filter((run) => run.active).sort((a, b) => b.order - a.order)[0]?.chainId; }
