@@ -22,6 +22,10 @@
 
 平台保留深度 4、每条协作链最多 8 次运行、幂等去重、同一对 Agent 连续 4 次乒乓限制和整链取消。
 
+Agent 正在运行时，用户可以直接插话：消息会送进当前这一轮（Pi 在本轮工具调用结束、下一次模型请求之前收到），而不是排队等下一轮。只有用户消息可以插话；`post_message` 的 A2A 仍然走完整的排队与限额，协作链语义不变。运行时不支持插话时自动回退为排队。
+
+消息可以附带图片。Pi 直接把图片交给模型；Codex CLI 不接受内联图片，因此改为在 prompt 里给出附件的绝对路径。图片保存在数据目录的 `attachments/`，事件日志里只记录引用。
+
 ## 会话、并发与恢复
 
 - 每个 `{threadId, agentId}` 都有独立的持久 session。
@@ -125,6 +129,8 @@ pnpm dev
 
 中国区 Z.AI/智谱 Coding Plan 使用 `ZAI_CODING_CN_API_KEY` 和 `zai-coding-cn`；全球版使用 `ZAI_API_KEY` 和 `zai`。Codex 可以使用本机 ChatGPT 登录或环境变量中的 `OPENAI_API_KEY`。运行时状态会显示在花名册和运行详情中。
 
+Pi 的凭据同时从环境变量和 `~/.pi/agent/auth.json` 读取，因此用 `pi` 登录过的 API Key 与 OAuth 订阅（Claude Pro/Max、ChatGPT、GitHub Copilot、xAI、OpenRouter 等）可以直接使用，不必再设一遍环境变量。花名册里的在线状态以这两者的并集为准。
+
 生产构建与启动：
 
 ```bash
@@ -142,9 +148,12 @@ pnpm demo -- "@pi @codex 请独立评估这个方案"
 
 - `GET /api/agents`：安全花名册、revision、运行时在线/认证状态。
 - `PUT /api/agents`：用 revision 乐观锁原子替换花名册；不接受或返回密钥。
-- `POST /api/messages`：接收 `content`、可选 `threadId` 和新 Thread 的 `workspacePath`。
+- `POST /api/messages`：接收 `content`、可选 `threadId`、新 Thread 的 `workspacePath`、`attachments`（PNG/JPEG/WebP/GIF，最多 4 张、每张 5 MB）和 `steer`。
 - `POST /api/chains/:chainId/cancel`：取消整条协作链。
 - `GET /api/events`：SSE 事件投影。
+- `GET /api/models`：Pi 可用的 provider 与模型目录，以及每个 provider 是否已配置凭据；不返回密钥。
+- `GET /api/agents/:agentId/session?threadId=`：该 Agent 在此 Thread 的 session 统计。
+- `POST /api/agents/:agentId/session?threadId=&action=compact|export&format=html|jsonl`：手动压缩上下文或导出 session。
 
 Codex 的 `post_message` 通过本机 MCP stdio server 回调内部端点。每次 run 使用独立随机 token，并校验 run、Thread 和 Agent 身份；token 在 run 结束后立即失效。
 
@@ -156,8 +165,16 @@ pnpm test
 pnpm build
 ```
 
-测试覆盖花名册、mention 解析、对等路由、A2A、幂等与乒乓限制、读写调度、整链取消、上下文游标、session 隔离、Codex JSONL 首次执行与 resume、MCP token，以及现有历史事件的完整兼容回放。
+测试覆盖花名册、mention 解析、对等路由、A2A、幂等与乒乓限制、读写调度、整链取消、上下文游标、session 隔离、Codex JSONL 首次执行与 resume、MCP token、Pi 凭据判定、可观测性事件投影、运行中插话与回退、图片附件，以及现有历史事件的完整兼容回放。
 
 ## 安全边界
 
 Pi 的 `full` 模式会开放 Bash/edit/write，但 Pi SDK 本身不提供完整文件系统沙箱。只应在可信的本地工作目录或额外隔离环境中使用。Codex v1 即使配置 `full` 也只映射为 `workspace-write`，不会启用 `danger-full-access`。
+
+工作目录里的 `.pi/extensions`、`.pi/skills`、`.pi/settings.json` 等项目级资源属于可执行代码，默认**不**加载。这与 pi 非交互模式的默认行为一致。已经用 `pi` 保存过信任决定的目录按该决定处理；其余目录需要显式开启：
+
+```dotenv
+MAO_PI_PROJECT_TRUST=always
+```
+
+只在你信任该仓库时才打开。用户级的 `~/.pi/agent/extensions` 与 `~/.agents/skills` 始终加载，它们属于你自己的配置。

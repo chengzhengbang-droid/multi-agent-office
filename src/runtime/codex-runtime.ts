@@ -123,6 +123,18 @@ export class CodexRuntimeAdapter implements AgentRuntime {
         "</agent-system-instructions>",
         "",
         buildUserPrompt(request),
+        // Codex exec takes no inline images, so attachments are handed over as
+        // paths; the sandbox already grants read access to the workspace.
+        ...(request.attachments && request.attachments.length > 0
+          ? [
+              "",
+              "<attachments>",
+              ...request.attachments.map(
+                (attachment) => `${attachment.mediaType} ${attachment.path}`,
+              ),
+              "</attachments>",
+            ]
+          : []),
       ].join("\n");
       child.stdin.end(prompt, "utf8");
       await request.emit({ type: "session", runtimeKind: "codex", resumed: Boolean(resumeSessionId) });
