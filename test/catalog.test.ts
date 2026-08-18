@@ -22,7 +22,16 @@ test("first catalog load atomically seeds equal @codex and @pi peers", async () 
     assert.deepEqual(catalog.agents.map((agent) => agent.id), ["codex", "pi"]);
     assert.equal(catalog.agents.find((agent) => agent.id === "codex")?.accessMode, "workspace-write");
     assert.equal(catalog.agents.find((agent) => agent.id === "pi")?.accessMode, "full");
-    assert.doesNotMatch(catalog.agents.map((agent) => agent.systemPrompt).join("\n"), /architect|reviewer/i);
+    // The review gate is a platform rule, not a seeded role. No default Agent is
+    // named or described as a dedicated architect/reviewer, and none pins a
+    // reviewer of its own: the reviewer is chosen per run, from the peers that
+    // happen to be online. This is stricter than the identity-only check it
+    // replaces, which only looked at systemPrompt.
+    const identity = catalog.agents
+      .map((agent) => `${agent.id} ${agent.displayName} ${agent.description} ${agent.capabilities.join(" ")}`)
+      .join("\n");
+    assert.doesNotMatch(identity, /architect|reviewer/i);
+    assert.ok(catalog.agents.every((agent) => agent.reviewerAgentId === undefined));
     assert.deepEqual(JSON.parse(await readFile(path, "utf8")), catalog);
   } finally {
     await rm(directory, { recursive: true, force: true });
@@ -72,6 +81,72 @@ test("runtime fingerprint rotates for prompt, model, access, and capabilities", 
     assert.notEqual(runtimeFingerprint(changed), fingerprint);
   }
   assert.equal(runtimeFingerprint({ ...original, displayName: "Renamed" }), fingerprint);
+  // Reviewer choice is routing configuration, not Agent identity. Folding it in
+  // would discard every saved session whenever someone edits the dropdown.
+  assert.equal(runtimeFingerprint({ ...original, reviewerAgentId: "pi" }), fingerprint);
+});
+
+test("reviewerAgentId must name another existing Agent", () => {
+  const base = seed();
+  assert.throws(
+    () => validateCatalog({
+      ...base,
+      agents: [{ ...base.agents[0], reviewerAgentId: "ghost" }, base.agents[1]],
+    }),
+    /unknown reviewer/i,
+  );
+  assert.throws(
+    () => validateCatalog({
+      ...base,
+      agents: [{ ...base.agents[0], reviewerAgentId: base.agents[0]!.id }, base.agents[1]],
+    }),
+    /cannot review its own/i,
+  );
+  assert.throws(
+    () => validateCatalog({
+      ...base,
+      agents: [{ ...base.agents[0], reviewerAgentId: "Not A Handle" }, base.agents[1]],
+    }),
+    /invalid reviewerAgentId/i,
+  );
+  // A disabled peer is allowed: disabling an Agent must not turn every later
+  // catalog save into a validation failure. The platform falls back at run time.
+  const disabledPeer = validateCatalog({
+    ...base,
+    agents: [
+      { ...base.agents[0], reviewerAgentId: "pi" },
+      { ...base.agents[1], enabled: false },
+    ],
+  });
+  assert.equal(disabledPeer.agents[0]?.reviewerAgentId, "pi");
+});
+
+test("reviewerAgentId survives a catalog round-trip", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "mao-catalog-"));
+  try {
+    const path = join(directory, "agents.json");
+    const store = createStore(path);
+    const catalog = await store.load();
+    await store.replace(
+      {
+        ...catalog,
+        agents: catalog.agents.map((agent) => ({
+          ...agent,
+          reviewerAgentId: agent.id === "codex" ? "pi" : "codex",
+        })),
+      },
+      catalog.revision,
+    );
+    const reloaded = await new FileAgentCatalogStore(path, {
+      piProvider: "test-provider",
+      piModel: "test-model",
+      piThinkingLevel: "medium",
+    }).load();
+    assert.equal(reloaded.agents.find((agent) => agent.id === "codex")?.reviewerAgentId, "pi");
+    assert.equal(reloaded.agents.find((agent) => agent.id === "pi")?.reviewerAgentId, "codex");
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
 });
 
 function createStore(path: string): FileAgentCatalogStore {

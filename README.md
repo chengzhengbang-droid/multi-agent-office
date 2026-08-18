@@ -1,6 +1,8 @@
 # Multi-Agent Office
 
-一个参考 Cat Café / Clowder AI 协作方式的本地对等多 Agent 工作台。平台没有 Boss Agent，也没有固定的 Architect → Reviewer 流程；每个 Agent 都能独立接单、拒绝、向用户提问，或通过结构化 `post_message` 把任务交给队友。
+一个参考 Cat Café / Clowder AI 协作方式的本地对等多 Agent 工作台。平台没有 Boss Agent，也没有固定角色；每个 Agent 都能独立接单、拒绝、向用户提问，或通过结构化 `post_message` 把任务交给队友。
+
+用户发起的每个任务都必须由**另一个** Agent 审核通过后才算完成。审核者是同侪而不是上级：由谁审核在运行时动态决定，不是花名册里写死的角色。
 
 ## 默认团队
 
@@ -22,6 +24,21 @@
 
 平台保留深度 4、每条协作链最多 8 次运行、幂等去重、同一对 Agent 连续 4 次乒乓限制和整链取消。
 
+## 强制审核
+
+- 用户发起的任务，执行 Agent 完成后由另一个 Agent 审核。审核结束前任务不算完成，`POST /api/messages` 的协作链也不会结束。
+- 审核者优先取花名册中该 Agent 的 `reviewerAgentId`；未配置、指向自己或对方离线时，按花名册顺序回退到任意其他在线 Agent。审核者永远不等于执行者。
+- 审核 Agent 只能通过结构化 `submit_review({ verdict, summary, findings? })` 给出结论。`changes-requested` 必须至少给出一条具体意见，否则被拒绝。
+- `changes-requested` 会把审核意见作为可见消息回送给执行者返工，最多 `MAO_MAX_REVIEW_ROUNDS`（默认 2）轮；用满后升级给用户，不再自动循环。
+- 以下四种情况一律记为"需要人工介入"，**绝不当作通过**：没有其他可用 Agent 可以审核；审核 run 结束却没有调用 `submit_review`；审核 run 失败或审核者中途不可用；返工轮数用尽仍未通过。
+- 整链取消会一并取消进行中的审核，标记为"已取消"而不是升级——那是人工动作，不是质量信号。
+- 审核与返工 run 由平台发起，不占用每链 8 次运行的额度，也不增加 A2A 深度或乒乓计数；它们只受审核轮数约束。用户消息可指定两个 Agent，沿用 A2A 额度会随机撞限。
+- A2A 协作产生的 run（depth ≥ 1）不进入审核门，只有用户直接发起的任务会。
+- 用户插话不会新建 run，因此沿用当前这一轮所属任务的审核状态。
+- `MAO_REVIEW_GATE=off` 只用于演示和离线测试。
+
+审核过程在 Thread 里完全可见：送审和审核意见都是普通消息，审核结论以 `review.requested` / `review.submitted` / `review.rework` / `review.resolved` 事件记录。
+
 Agent 正在运行时，用户可以直接插话：消息会送进当前这一轮（Pi 在本轮工具调用结束、下一次模型请求之前收到），而不是排队等下一轮。只有用户消息可以插话；`post_message` 的 A2A 仍然走完整的排队与限额，协作链语义不变。运行时不支持插话时自动回退为排队。
 
 消息可以附带图片。Pi 直接把图片交给模型；Codex CLI 不接受内联图片，因此改为在 prompt 里给出附件的绝对路径。图片保存在数据目录的 `attachments/`，事件日志里只记录引用。
@@ -33,7 +50,8 @@ Agent 正在运行时，用户可以直接插话：消息会送进当前这一�
 - 新 Agent 首次进入 Thread 时注入最近 20 条、最多 24,000 字符的共享上下文；后续只交付尚未看到的消息。
 - 同一个 Agent 同时只运行一个 session。
 - `read-only` Agent 最多四个并行；可写 Agent 按规范化工作目录互斥。同目录写入串行，不同目录可并行。
-- 重启后恢复尚未开始的 queued run；上次进程里已 running 的 run 标记为 `interrupted`，不会自动重试可能产生副作用的调用。
+- 重启后恢复尚未开始的 queued run；上次进程里已 running 的 run 标记为 `interrupted`，不会自动重试可能产生副作用的调用。排队中的审核会照常继续；上次进程里正在运行的审核标记为中断并升级给用户，不会重跑。
+- 旧事件日志里没有审核事件，回放时不会给历史任务补发审核。
 
 JSONL EventStore 使用串行 append。旧日志中的 `recipientAgentId`、`rootRunId` 和旧 Agent 名称会在读取时规范化，源事件不会被覆盖。
 
@@ -155,7 +173,7 @@ pnpm demo -- "@pi @codex 请独立评估这个方案"
 - `GET /api/agents/:agentId/session?threadId=`：该 Agent 在此 Thread 的 session 统计。
 - `POST /api/agents/:agentId/session?threadId=&action=compact|export&format=html|jsonl`：手动压缩上下文或导出 session。
 
-Codex 的 `post_message` 通过本机 MCP stdio server 回调内部端点。每次 run 使用独立随机 token，并校验 run、Thread 和 Agent 身份；token 在 run 结束后立即失效。
+Codex 的 `post_message` 与 `submit_review` 通过本机 MCP stdio server 回调内部端点 `/internal/agent-message` 与 `/internal/agent-review`。每次 run 使用独立随机 token，并校验 run、Thread 和 Agent 身份；token 在 run 结束后立即失效。
 
 ## 验证
 
@@ -166,6 +184,8 @@ pnpm build
 ```
 
 测试覆盖花名册、mention 解析、对等路由、A2A、幂等与乒乓限制、读写调度、整链取消、上下文游标、session 隔离、Codex JSONL 首次执行与 resume、MCP token、Pi 凭据判定、可观测性事件投影、运行中插话与回退、图片附件，以及现有历史事件的完整兼容回放。
+
+审核相关覆盖：强制送审与审核者选取（配置优先、离线回退）、通过后终结、不通过返工并复审、轮数上限升级、无结论/无审核者/审核失败一律不通过、审核中取消、重启后中断的审核升级、审核 run 不占用链额度与深度、审核者不会变成 Thread 的默认应答者，以及旧日志回放不补发审核。
 
 ## 安全边界
 

@@ -38,6 +38,19 @@ export class DeterministicRuntime implements AgentRuntime {
       await abortableDelay(this.stepDelayMs, controller.signal);
       const output = `${request.agent.displayName} received: ${request.incoming.content}`;
       await request.emit({ type: "text_delta", text: output });
+      if (request.submitReview && request.reviewOf) {
+        await request.emit({ type: "tool_start", toolName: "submit_review" });
+        const review = await request.submitReview({
+          verdict: "approved",
+          summary: `Deterministic review of @${request.reviewOf.authorAgentId}'s work.`,
+        });
+        await request.emit({
+          type: "tool_end",
+          toolName: "submit_review",
+          isError: !review.accepted,
+        });
+        return { output };
+      }
       if (this.handoffTo && request.incoming.sender.type === "human") {
         await request.emit({ type: "tool_start", toolName: "post_message" });
         const result = await request.postMessage({

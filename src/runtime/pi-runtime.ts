@@ -14,6 +14,7 @@ import { PiSharedRuntime, RequestResourceLoader } from "./pi-shared.js";
 import type {
   AgentRuntime,
   PostAgentMessageInput,
+  ReviewAssignment,
   RuntimeRequest,
   RuntimeResult,
   RuntimeSessionStats,
@@ -79,6 +80,57 @@ export class PiRuntimeAdapter implements AgentRuntime {
       },
     });
 
+    // Declared on every run so a resumed session keeps a stable tool surface.
+    // Authority to accept a verdict lives in the platform, which refuses any
+    // submission from a run that is not reviewing someone else's work.
+    const submitReviewTool = defineTool({
+      name: "submit_review",
+      label: "Submit a peer-review verdict",
+      description:
+        "Record your verdict on the work you were asked to review. Only available while reviewing another Agent's deliverable. Call it exactly once.",
+      parameters: Type.Object({
+        verdict: Type.Union([Type.Literal("approved"), Type.Literal("changes-requested")], {
+          description: "approved when the work can ship as is",
+        }),
+        summary: Type.String({ description: "Justification handed back to the author verbatim" }),
+        findings: Type.Optional(
+          Type.Array(Type.String(), {
+            description: "Concrete, actionable changes. Required for changes-requested.",
+          }),
+        ),
+      }),
+      execute: async (_toolCallId, params) => {
+        const submit = request.submitReview;
+        if (!submit) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: "submit_review is only available while reviewing another Agent's work.",
+              },
+            ],
+            details: { accepted: false },
+          };
+        }
+        const result = await submit({
+          verdict: params.verdict,
+          summary: params.summary,
+          ...(params.findings ? { findings: params.findings } : {}),
+        });
+        return {
+          content: [
+            {
+              type: "text",
+              text: result.accepted
+                ? `Verdict recorded: ${params.verdict}.`
+                : `Verdict rejected: ${result.reason ?? "unknown reason"}`,
+            },
+          ],
+          details: result,
+        };
+      },
+    });
+
     const { loader: sharedLoader, settingsManager } =
       await this.options.shared.resourcesFor(cwd);
     const loader = new RequestResourceLoader(sharedLoader, buildSystemPrompt(request));
@@ -116,7 +168,7 @@ export class PiRuntimeAdapter implements AgentRuntime {
       sessionManager: manager,
       settingsManager,
       modelRuntime,
-      customTools: [postMessageTool],
+      customTools: [postMessageTool, submitReviewTool],
       excludeTools: piExcludedTools(request.agent.accessMode),
       ...(selectedModel.model ? { model: selectedModel.model } : {}),
       ...(selectedModel.thinkingLevel
@@ -506,17 +558,35 @@ export function buildSystemPrompt(request: RuntimeRequest): string {
     request.agent.systemPrompt,
     "",
     "Peer collaboration protocol:",
-    "- You are a peer. There is no boss Agent and no mandatory handoff pipeline.",
+    "- You are a peer. There is no boss Agent and no fixed handoff pipeline.",
+    "- Work a human asks for is reviewed by a different peer before it counts as delivered. The reviewer is a peer, not a supervisor.",
     "- Accept work you can own; challenge weak assumptions with evidence.",
     "- If a teammate should act, call post_message and put their @handle at the start of a line.",
     "- A post_message without a recognized teammate mention is visible to the human but wakes nobody.",
     "- Ordinary assistant output, including @handles, never routes to another Agent.",
     "- Do not retry a rejected post_message with a new idempotency key.",
     "- Ask the human directly when a value judgment or irreversible decision is required.",
+    ...(request.reviewOf ? reviewBrief(request.reviewOf) : []),
     "",
     "Available peers:",
     roster || "(none)",
   ].join("\n");
+}
+
+function reviewBrief(assignment: ReviewAssignment): string[] {
+  return [
+    "",
+    `Review assignment — you are reviewing @${assignment.authorAgentId}'s work, round ${assignment.round} of ${assignment.maxRounds}:`,
+    "- Judge the deliverable in the incoming message against the human's original task.",
+    "- Do not redo the work yourself. Say concretely what must change.",
+    "- Finish by calling submit_review exactly once, approved or changes-requested.",
+    "- changes-requested requires at least one concrete finding.",
+    "- Ending without submit_review is not an approval: the task is escalated to the human.",
+    "- Do not manufacture agreement to close the loop.",
+    ...(assignment.round >= assignment.maxRounds
+      ? ["- This is the final round. Rejecting now escalates to the human instead of another rework."]
+      : []),
+  ];
 }
 
 export function buildUserPrompt(request: RuntimeRequest): string {

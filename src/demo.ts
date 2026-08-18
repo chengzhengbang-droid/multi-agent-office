@@ -19,6 +19,8 @@ const platform = new MultiAgentPlatform({
   runtimes,
   eventStore: new JsonlEventStore(resolve(process.cwd(), ".data", "events.jsonl")),
   contextCompiler: new RecentContextCompiler(),
+  reviewMode: (process.env.MAO_REVIEW_GATE ?? "on") === "off" ? "off" : "required",
+  maxReviewRounds: Number(process.env.MAO_MAX_REVIEW_ROUNDS ?? 2),
 });
 
 platform.subscribe(renderEvent);
@@ -60,6 +62,18 @@ function renderEvent(event: StoredPlatformEvent): void {
       break;
     case "run.cancelled":
       process.stdout.write(`\n■ cancelled: ${event.reason}\n`);
+      break;
+    case "review.requested":
+      process.stdout.write(`\n  review round ${event.round} → @${event.reviewerAgentId}\n`);
+      break;
+    case "review.submitted":
+      process.stdout.write(`\n  verdict from @${event.reviewerAgentId}: ${event.verdict}\n`);
+      break;
+    case "review.rework":
+      process.stdout.write(`\n  sent back to @${event.authorAgentId} for rework\n`);
+      break;
+    case "review.resolved":
+      process.stdout.write(`\n★ review ${event.outcome}${event.escalation ? ` (${event.escalation})` : ""} after ${event.rounds} round(s)\n`);
       break;
     default:
       break;

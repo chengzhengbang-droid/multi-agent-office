@@ -5,10 +5,14 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { RecentContextCompiler } from "../src/core/context-compiler.js";
 import { InMemoryEventStore } from "../src/core/event-store.js";
-import { MultiAgentPlatform } from "../src/core/platform.js";
+import {
+  MultiAgentPlatform,
+  type MultiAgentPlatformOptions,
+} from "../src/core/platform.js";
 import type {
   AccessMode,
   AgentDefinition,
+  ReviewVerdict,
   RuntimeAvailability,
   StoredPlatformEvent,
 } from "../src/core/types.js";
@@ -305,6 +309,7 @@ test("rejects a fifth consecutive ping-pong between the same Agent pair", async 
     contextCompiler: new RecentContextCompiler(),
     maxA2ADepth: 10,
     maxPingPongHops: 4,
+    reviewMode: "off",
   });
   await platform.postUserMessage({ content: "@pi start" });
   assert.deepEqual(results, [true, true, true, true, false]);
@@ -498,6 +503,7 @@ function createPlatform(
   agents: AgentDefinition[],
   runtimes: Map<string, AgentRuntime>,
   defaultAgentId = agents[0]?.id ?? "codex",
+  options: Partial<MultiAgentPlatformOptions> = {},
 ): MultiAgentPlatform {
   return new MultiAgentPlatform({
     agents,
@@ -505,6 +511,10 @@ function createPlatform(
     runtimes,
     eventStore: new InMemoryEventStore(),
     contextCompiler: new RecentContextCompiler(),
+    // These tests exercise peer routing, which is orthogonal to the review
+    // gate. Review behaviour has its own tests, which opt back in.
+    reviewMode: "off",
+    ...options,
   });
 }
 
@@ -589,4 +599,491 @@ function abortError(reason: unknown): Error {
   const error = new Error(String(reason ?? "Aborted"));
   error.name = "AbortError";
   return error;
+}
+
+// ---------------------------------------------------------------------------
+// Mandatory peer-review gate
+// ---------------------------------------------------------------------------
+
+test("a user task is not delivered until a different Agent reviews it", async () => {
+  const order: string[] = [];
+  const platform = createReviewPlatform([agent("pi"), agent("codex")], {
+    pi: async (request) => {
+      order.push("pi");
+      return emitOutput(request, "实现完成");
+    },
+    codex: approving(order),
+  });
+
+  const result = await platform.postUserMessage({ content: "@pi 请实现一个功能" });
+  const events = await platform.getEvents();
+
+  // The chain must not resolve before the reviewer has run.
+  assert.deepEqual(order, ["pi", "codex"]);
+  const requested = single(events, "review.requested");
+  assert.equal(requested.authorAgentId, "pi");
+  assert.equal(requested.reviewerAgentId, "codex");
+  assert.equal(requested.round, 1);
+  assert.equal(single(events, "review.submitted").verdict, "approved");
+  const resolved = single(events, "review.resolved");
+  assert.equal(resolved.outcome, "approved");
+  assert.equal(resolved.rounds, 1);
+  assert.equal(resolved.taskRunId, requested.taskRunId);
+
+  const messages = await platform.getThreadMessages(result.threadId);
+  const submitted = messages.find((message) => message.kind === "review-request");
+  assert.equal(submitted?.sender.type === "agent" && submitted.sender.id, "pi");
+  assert.deepEqual(submitted?.mentions, ["codex"]);
+  assert.match(submitted?.content ?? "", /实现完成/);
+});
+
+test("the configured reviewerAgentId wins over roster order", async () => {
+  const seen: string[] = [];
+  const author = { ...agent("pi"), reviewerAgentId: "research" };
+  const platform = createReviewPlatform([author, agent("codex"), agent("research")], {
+    pi: async (request) => emitOutput(request, "草稿"),
+    codex: approving(seen),
+    research: approving(seen),
+  });
+
+  await platform.postUserMessage({ content: "@pi 起草" });
+  const events = await platform.getEvents();
+
+  assert.equal(single(events, "review.requested").reviewerAgentId, "research");
+  assert.deepEqual(seen, ["research"]);
+});
+
+test("an offline configured reviewer falls back to another routable peer", async () => {
+  const author = { ...agent("pi"), reviewerAgentId: "research" };
+  const platform = createReviewPlatform([author, agent("codex"), agent("research")], {
+    pi: async (request) => emitOutput(request, "草稿"),
+    codex: approving([]),
+    research: approving([]),
+  }, { offline: ["research"] });
+
+  await platform.postUserMessage({ content: "@pi 起草" });
+  const events = await platform.getEvents();
+
+  assert.equal(single(events, "review.requested").reviewerAgentId, "codex");
+});
+
+test("a task with no eligible reviewer escalates instead of passing", async () => {
+  const platform = createReviewPlatform([agent("pi")], {
+    pi: async (request) => emitOutput(request, "只有我一个人"),
+  });
+
+  await platform.postUserMessage({ content: "@pi 干活" });
+  const events = await platform.getEvents();
+
+  assert.equal(countEvents(events, "review.requested"), 0);
+  assert.equal(countEvents(events, "review.submitted"), 0);
+  assert.equal(countEvents(events, "run.queued"), 1);
+  const resolved = single(events, "review.resolved");
+  assert.equal(resolved.outcome, "escalated");
+  assert.equal(resolved.escalation, "no-reviewer");
+});
+
+test("changes-requested hands feedback back to the author and re-reviews the rework", async () => {
+  const order: string[] = [];
+  const verdicts: ReviewVerdict[] = ["changes-requested", "approved"];
+  const platform = createReviewPlatform([agent("pi"), agent("codex")], {
+    pi: async (request) => {
+      order.push("pi");
+      return emitOutput(request, `第 ${order.filter((id) => id === "pi").length} 版`);
+    },
+    codex: async (request) => {
+      order.push("codex");
+      await request.submitReview?.({
+        verdict: verdicts.shift() ?? "approved",
+        summary: "缺少错误处理",
+        findings: ["为解析失败补一个分支"],
+      });
+      return emitOutput(request, "审毕");
+    },
+  });
+
+  const result = await platform.postUserMessage({ content: "@pi 实现" });
+  const events = await platform.getEvents();
+
+  assert.deepEqual(order, ["pi", "codex", "pi", "codex"]);
+  assert.equal(countEvents(events, "review.requested"), 2);
+  const rework = single(events, "review.rework");
+  assert.equal(rework.authorAgentId, "pi");
+  assert.equal(rework.round, 1);
+
+  const messages = await platform.getThreadMessages(result.threadId);
+  const feedback = messages.find((message) => message.kind === "review-feedback");
+  assert.equal(feedback?.sender.type === "agent" && feedback.sender.id, "codex");
+  assert.deepEqual(feedback?.mentions, ["pi"]);
+  assert.match(feedback?.content ?? "", /缺少错误处理/);
+  assert.match(feedback?.content ?? "", /为解析失败补一个分支/);
+
+  // Exactly one terminal marker, and it is the approval of round 2.
+  const resolved = single(events, "review.resolved");
+  assert.equal(resolved.outcome, "approved");
+  assert.equal(resolved.rounds, 2);
+});
+
+test("escalates to the human instead of looping past maxReviewRounds", async () => {
+  const order: string[] = [];
+  const platform = createReviewPlatform([agent("pi"), agent("codex")], {
+    pi: async (request) => {
+      order.push("pi");
+      return emitOutput(request, "又一版");
+    },
+    codex: async (request) => {
+      order.push("codex");
+      await request.submitReview?.({
+        verdict: "changes-requested",
+        summary: "还是不行",
+        findings: ["同上"],
+      });
+      return emitOutput(request, "审毕");
+    },
+  }, { maxReviewRounds: 2 });
+
+  await platform.postUserMessage({ content: "@pi 实现" });
+  const events = await platform.getEvents();
+
+  assert.deepEqual(order, ["pi", "codex", "pi", "codex"]);
+  assert.equal(countEvents(events, "review.rework"), 1);
+  const resolved = single(events, "review.resolved");
+  assert.equal(resolved.outcome, "escalated");
+  assert.equal(resolved.escalation, "max-rounds");
+  assert.equal(resolved.rounds, 2);
+});
+
+test("a review run that ends without submit_review is escalated, never approved", async () => {
+  const platform = createReviewPlatform([agent("pi"), agent("codex")], {
+    pi: async (request) => emitOutput(request, "交付"),
+    codex: async (request) => emitOutput(request, "看起来不错"),
+  });
+
+  await platform.postUserMessage({ content: "@pi 实现" });
+  const events = await platform.getEvents();
+
+  assert.equal(countEvents(events, "review.submitted"), 0);
+  const resolved = single(events, "review.resolved");
+  assert.equal(resolved.outcome, "escalated");
+  assert.equal(resolved.escalation, "inconclusive");
+});
+
+test("a failed reviewer run escalates instead of approving", async () => {
+  const platform = createReviewPlatform([agent("pi"), agent("codex")], {
+    pi: async (request) => emitOutput(request, "交付"),
+    codex: async () => {
+      throw new Error("reviewer exploded");
+    },
+  });
+
+  await platform.postUserMessage({ content: "@pi 实现" });
+  const events = await platform.getEvents();
+
+  assert.equal(countEvents(events, "run.failed"), 1);
+  const resolved = single(events, "review.resolved");
+  assert.equal(resolved.outcome, "escalated");
+  assert.equal(resolved.escalation, "review-failed");
+});
+
+test("a failed author run is never reviewed", async () => {
+  const platform = createReviewPlatform([agent("pi"), agent("codex")], {
+    pi: async () => {
+      throw new Error("author exploded");
+    },
+    codex: approving([]),
+  });
+
+  await platform.postUserMessage({ content: "@pi 实现" });
+  const events = await platform.getEvents();
+
+  assert.equal(countEvents(events, "review.requested"), 0);
+  assert.equal(countEvents(events, "review.resolved"), 0);
+  assert.equal(countEvents(events, "run.failed"), 1);
+});
+
+test("submit_review is refused outside a review run", async () => {
+  let taskResult: { accepted: boolean; reason?: string } | undefined;
+  const platform = createReviewPlatform([agent("pi"), agent("codex")], {
+    pi: async (request) => {
+      taskResult = await request.submitReview?.({ verdict: "approved", summary: "自我批准" });
+      return emitOutput(request, "交付");
+    },
+    codex: approving([]),
+  });
+
+  await platform.postUserMessage({ content: "@pi 实现" });
+  const events = await platform.getEvents();
+
+  // The task run gets no assignment at all, so the tool has nothing to call.
+  assert.equal(taskResult, undefined);
+  assert.equal(countEvents(events, "review.submitted"), 1);
+  assert.equal(single(events, "review.submitted").reviewerAgentId, "codex");
+});
+
+test("changes-requested without concrete findings is rejected", async () => {
+  const attempts: Array<{ accepted: boolean; reason?: string }> = [];
+  const platform = createReviewPlatform([agent("pi"), agent("codex")], {
+    pi: async (request) => emitOutput(request, "交付"),
+    codex: async (request) => {
+      attempts.push(await request.submitReview!({ verdict: "changes-requested", summary: "不行" }));
+      attempts.push(await request.submitReview!({ verdict: "changes-requested", summary: "", findings: ["x"] }));
+      attempts.push(
+        await request.submitReview!({
+          verdict: "changes-requested",
+          summary: "不行",
+          findings: ["把边界条件补上"],
+        }),
+      );
+      return emitOutput(request, "审毕");
+    },
+  });
+
+  await platform.postUserMessage({ content: "@pi 实现" });
+
+  // Round 2 re-runs the same handler after the rework, so only judge round 1.
+  assert.deepEqual(attempts.slice(0, 3).map((attempt) => attempt.accepted), [false, false, true]);
+  assert.match(attempts[0]?.reason ?? "", /finding/i);
+  assert.match(attempts[1]?.reason ?? "", /summary/i);
+});
+
+test("cancelling a chain mid-review cancels the review and requests no rework", async () => {
+  let releaseReviewer: (() => void) | undefined;
+  const reviewerStarted = new Promise<void>((resolve) => {
+    releaseReviewer = resolve;
+  });
+  const platform = createReviewPlatform([agent("pi"), agent("codex")], {
+    pi: async (request) => emitOutput(request, "交付"),
+    codex: async (request) => {
+      releaseReviewer?.();
+      await new Promise<void>((resolve, reject) => {
+        request.signal.addEventListener("abort", () => reject(abortError("cancelled")), { once: true });
+      });
+      return emitOutput(request, "unreachable");
+    },
+  });
+
+  const started = await platform.startUserMessage({ content: "@pi 实现" });
+  await reviewerStarted;
+  await platform.cancelGroup(started.chainId, "operator");
+  await started.completion;
+  const events = await platform.getEvents();
+
+  assert.equal(countEvents(events, "run.cancelled"), 1);
+  assert.equal(countEvents(events, "review.rework"), 0);
+  const resolved = single(events, "review.resolved");
+  // An operator cancel is not a quality signal, so it must not read as an escalation.
+  assert.equal(resolved.outcome, "cancelled");
+  assert.equal(resolved.escalation, undefined);
+});
+
+test("review and rework runs do not consume the per-chain run budget", async () => {
+  const verdicts: ReviewVerdict[] = ["changes-requested", "approved"];
+  const platform = createReviewPlatform([agent("pi"), agent("codex")], {
+    pi: async (request) => emitOutput(request, "交付"),
+    codex: async (request) => {
+      await request.submitReview?.({
+        verdict: verdicts.shift() ?? "approved",
+        summary: "补一下",
+        findings: ["补一下"],
+      });
+      return emitOutput(request, "审毕");
+    },
+  }, { maxAgentRunsPerChain: 1 });
+
+  await platform.postUserMessage({ content: "@pi 实现" });
+  const events = await platform.getEvents();
+
+  // 1 task + 2 reviews + 1 rework, none of them blocked by a budget meant for
+  // Agent-initiated fan-out.
+  assert.equal(countEvents(events, "run.queued"), 4);
+  assert.equal(countEvents(events, "routing.rejected"), 0);
+  assert.equal(single(events, "review.resolved").outcome, "approved");
+});
+
+test("review and rework runs keep the author's causal depth", async () => {
+  const verdicts: ReviewVerdict[] = ["changes-requested", "approved"];
+  const platform = createReviewPlatform([agent("pi"), agent("codex")], {
+    pi: async (request) => emitOutput(request, "交付"),
+    codex: async (request) => {
+      await request.submitReview?.({
+        verdict: verdicts.shift() ?? "approved",
+        summary: "补一下",
+        findings: ["补一下"],
+      });
+      return emitOutput(request, "审毕");
+    },
+  });
+
+  await platform.postUserMessage({ content: "@pi 实现" });
+  const queued = (await platform.getEvents()).filter(
+    (event): event is Extract<StoredPlatformEvent, { type: "run.queued" }> =>
+      event.type === "run.queued",
+  );
+
+  // Spending A2A depth on the gate would leave a reworking Agent unable to
+  // collaborate at all.
+  assert.deepEqual(queued.map((event) => event.run.causal.depth), [0, 0, 0, 0]);
+  assert.deepEqual(queued.map((event) => event.run.purpose), ["task", "review", "task", "review"]);
+  const taskRunId = queued[0]!.run.id;
+  assert.deepEqual(
+    queued.slice(1).map((event) => event.run.taskRunId),
+    [taskRunId, taskRunId, taskRunId],
+  );
+});
+
+test("a completed review run does not become the thread's fallback responder", async () => {
+  const order: string[] = [];
+  const platform = createReviewPlatform([agent("pi"), agent("codex")], {
+    pi: async (request) => {
+      order.push("pi");
+      return emitOutput(request, "交付");
+    },
+    codex: approving(order),
+  }, { defaultAgentId: "codex" });
+
+  const first = await platform.postUserMessage({ content: "@pi 实现" });
+  order.length = 0;
+  await platform.postUserMessage({ content: "继续", threadId: first.threadId });
+
+  // Without the guard the reviewer would silently inherit the thread.
+  assert.equal(order[0], "pi");
+});
+
+test("an interrupted review escalates on restart instead of being retried", async () => {
+  const store = new InMemoryEventStore();
+  let holdReviewer = true;
+  const peers = [agent("pi"), agent("codex")];
+  const runtimes = new Map([
+    ["pi", runtime("pi", async (request) => emitOutput(request, "交付"))],
+    [
+      "codex",
+      runtime("codex", async (request) => {
+        if (holdReviewer) {
+          await new Promise<void>(() => {});
+        }
+        return emitOutput(request, "审毕");
+      }),
+    ],
+  ]);
+  const first = new MultiAgentPlatform({
+    agents: peers,
+    defaultAgentId: "pi",
+    runtimes,
+    eventStore: store,
+    contextCompiler: new RecentContextCompiler(),
+    reviewMode: "required",
+  });
+  const started = await first.startUserMessage({ content: "@pi 实现" });
+  await waitFor(async () =>
+    (await first.getEvents()).some(
+      (event) => event.type === "run.started" && event.agentId === "codex",
+    ),
+  );
+
+  // A fresh process replays the same log.
+  holdReviewer = false;
+  const restarted = new MultiAgentPlatform({
+    agents: peers,
+    defaultAgentId: "pi",
+    runtimes,
+    eventStore: store,
+    contextCompiler: new RecentContextCompiler(),
+    reviewMode: "required",
+  });
+  await restarted.initialize();
+  const events = await restarted.getEvents();
+
+  assert.equal(countEvents(events, "run.interrupted"), 1);
+  const resolved = single(events, "review.resolved");
+  assert.equal(resolved.outcome, "escalated");
+  assert.equal(resolved.escalation, "review-failed");
+  assert.equal(countEvents(events, "review.submitted"), 0);
+  void started;
+});
+
+test("a pre-review event log replays without retro-requesting reviews", async () => {
+  const store = new InMemoryEventStore();
+  const platform = createReviewPlatform([agent("pi"), agent("codex")], {
+    pi: async (request) => emitOutput(request, "交付"),
+    codex: approving([]),
+  }, { eventStore: store, reviewMode: "off" });
+  await platform.postUserMessage({ content: "@pi 老任务" });
+
+  // Same log, now with the gate on: historical completed runs must stay closed.
+  const upgraded = createReviewPlatform([agent("pi"), agent("codex")], {
+    pi: async (request) => emitOutput(request, "交付"),
+    codex: approving([]),
+  }, { eventStore: store });
+  await upgraded.initialize();
+  const events = await upgraded.getEvents();
+
+  assert.equal(events.filter((event) => event.type.startsWith("review.")).length, 0);
+  const queued = events.filter(
+    (event): event is Extract<StoredPlatformEvent, { type: "run.queued" }> =>
+      event.type === "run.queued",
+  );
+  assert.equal(queued.length, 1);
+  assert.equal(queued[0]?.run.purpose, "task");
+});
+
+interface ReviewPlatformOptions extends Partial<MultiAgentPlatformOptions> {
+  offline?: string[];
+  defaultAgentId?: string;
+}
+
+/** A platform with the review gate on and one handler per Agent. */
+function createReviewPlatform(
+  agents: AgentDefinition[],
+  handlers: Record<string, (request: RuntimeRequest) => Promise<RuntimeResult>>,
+  options: ReviewPlatformOptions = {},
+): MultiAgentPlatform {
+  const { offline = [], defaultAgentId, ...platformOptions } = options;
+  const runtimes = new Map(
+    agents.map((definition) => {
+      const base = runtime(definition.id, handlers[definition.id] ?? echo);
+      return [
+        definition.id,
+        offline.includes(definition.id)
+          ? { ...base, availability: { available: false, label: "offline" } }
+          : base,
+      ] as const;
+    }),
+  );
+  return new MultiAgentPlatform({
+    agents,
+    defaultAgentId: defaultAgentId ?? agents[0]!.id,
+    runtimes: new Map(runtimes),
+    eventStore: new InMemoryEventStore(),
+    contextCompiler: new RecentContextCompiler(),
+    reviewMode: "required",
+    ...platformOptions,
+  });
+}
+
+/** A reviewer that always approves, recording the order it ran in. */
+function approving(order: string[]): (request: RuntimeRequest) => Promise<RuntimeResult> {
+  return async (request) => {
+    order.push(request.agent.id);
+    await request.submitReview?.({ verdict: "approved", summary: "看过了，可以交付" });
+    return emitOutput(request, "审毕");
+  };
+}
+
+function single<T extends StoredPlatformEvent["type"]>(
+  events: StoredPlatformEvent[],
+  type: T,
+): Extract<StoredPlatformEvent, { type: T }> {
+  const matches = events.filter(
+    (event): event is Extract<StoredPlatformEvent, { type: T }> => event.type === type,
+  );
+  assert.equal(matches.length, 1, `expected exactly one ${type} event, got ${matches.length}`);
+  return matches[0]!;
+}
+
+async function waitFor(predicate: () => Promise<boolean>): Promise<void> {
+  for (let attempt = 0; attempt < 500; attempt++) {
+    if (await predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  throw new Error("condition was not met in time");
 }

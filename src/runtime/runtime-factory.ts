@@ -14,6 +14,7 @@ export interface RuntimeFactoryOptions {
   sessionStore: RuntimeSessionStore;
   callbackRegistry: RunCallbackRegistry;
   callbackUrl: string;
+  reviewCallbackUrl: string;
   mcpCommand: string;
   mcpArgs: string[];
   /** Shared Pi state; created on demand so each caller may supply its own. */
@@ -61,6 +62,7 @@ export async function createAgentRuntimes(
           sessionStore: options.sessionStore,
           callbackRegistry: options.callbackRegistry,
           callbackUrl: options.callbackUrl,
+          reviewCallbackUrl: options.reviewCallbackUrl,
           mcpCommand: options.mcpCommand,
           mcpArgs: options.mcpArgs,
         }),
