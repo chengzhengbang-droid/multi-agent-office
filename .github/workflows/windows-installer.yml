@@ -211,11 +211,11 @@ jobs:
             echo "enabled=true" >> "$GITHUB_OUTPUT"
           else
             echo "enabled=false" >> "$GITHUB_OUTPUT"
-            echo "::warning::Apple signing/notarization secrets are not configured. The macOS build will be uploaded only as an unsigned test artifact and no GitHub Release will be published."
+            echo "::warning::Apple signing/notarization secrets are not configured. The macOS installer will be published unsigned, so macOS may show security warnings and automatic updates may not work."
             {
-              echo "## macOS release was not published"
+              echo "## macOS release will be unsigned"
               echo
-              echo "Configure MAC_CSC_LINK, MAC_CSC_KEY_PASSWORD, APPLE_ID, APPLE_APP_SPECIFIC_PASSWORD, and APPLE_TEAM_ID to produce an auto-updatable macOS release."
+              echo "The unsigned installer will still be attached to the GitHub Release. Configure MAC_CSC_LINK, MAC_CSC_KEY_PASSWORD, APPLE_ID, APPLE_APP_SPECIFIC_PASSWORD, and APPLE_TEAM_ID later to restore signed, auto-updatable macOS releases."
             } >> "$GITHUB_STEP_SUMMARY"
           fi
 
@@ -281,22 +281,22 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-      - name: Upload unsigned macOS test artifact
+      - name: Upload unsigned macOS release artifact
         if: steps.notarization.outputs.enabled != 'true'
         uses: actions/upload-artifact@v7
         with:
-          name: multi-agent-office-macos-unsigned-test-${{ github.run_number }}
+          name: multi-agent-office-macos-universal-${{ github.run_number }}
           path: |
             release/*.dmg
             release/*.zip
+            release/*.blockmap
+            release/latest-mac.yml
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 30
 
   publish-release:
     name: Publish desktop installers
-    if: >-
-      (github.ref_type == 'tag' || github.ref == 'refs/heads/main') &&
-      needs.build-macos-installer.outputs.signed-release-ready == 'true'
+    if: github.ref_type == 'tag' || github.ref == 'refs/heads/main'
     needs:
       - prepare-release
       - build-windows-installer
