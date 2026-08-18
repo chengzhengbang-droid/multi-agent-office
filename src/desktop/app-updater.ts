@@ -14,6 +14,18 @@ export interface AppUpdateState {
   error?: string;
 }
 
+export type AppUpdateSupportReason =
+  | "supported"
+  | "development"
+  | "unsupported-platform"
+  | "unsigned-macos";
+
+export interface AppUpdateSupport {
+  supported: boolean;
+  reason: AppUpdateSupportReason;
+  manualDownloadAvailable: boolean;
+}
+
 interface UpdateInfoLike {
   version: string;
 }
@@ -64,11 +76,50 @@ export interface UpdateMenuPresentation {
   enabled: boolean;
 }
 
+export function appUpdateSupport(
+  platform: string,
+  packaged: boolean,
+  macDeveloperIdSigned = true,
+): AppUpdateSupport {
+  if (!packaged) {
+    return {
+      supported: false,
+      reason: "development",
+      manualDownloadAvailable: false,
+    };
+  }
+  if (platform === "darwin" && !macDeveloperIdSigned) {
+    return {
+      supported: false,
+      reason: "unsigned-macos",
+      manualDownloadAvailable: true,
+    };
+  }
+  if (platform !== "darwin" && platform !== "win32") {
+    return {
+      supported: false,
+      reason: "unsupported-platform",
+      manualDownloadAvailable: true,
+    };
+  }
+  return {
+    supported: true,
+    reason: "supported",
+    manualDownloadAvailable: false,
+  };
+}
+
 export function updateMenuPresentation(
   state: AppUpdateState | undefined,
   supported: boolean,
+  manualDownloadAvailable = false,
 ): UpdateMenuPresentation {
-  if (!supported || !state) return { label: "检查更新…", enabled: true };
+  if (!supported) {
+    return manualDownloadAvailable
+      ? { label: "手动下载更新…", enabled: true }
+      : { label: "检查更新…", enabled: true };
+  }
+  if (!state) return { label: "检查更新…", enabled: true };
   switch (state.phase) {
     case "checking":
       return { label: "正在检查更新…", enabled: false };

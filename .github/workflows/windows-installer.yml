@@ -162,6 +162,8 @@ jobs:
     needs: prepare-release
     runs-on: macos-latest
     timeout-minutes: 45
+    outputs:
+      signed-release-ready: ${{ steps.notarization.outputs.enabled }}
 
     steps:
       - name: Check out source
@@ -209,7 +211,12 @@ jobs:
             echo "enabled=true" >> "$GITHUB_OUTPUT"
           else
             echo "enabled=false" >> "$GITHUB_OUTPUT"
-            echo "Apple notarization secrets are not configured; producing an unsigned test installer."
+            echo "::warning::Apple signing/notarization secrets are not configured. The macOS build will be uploaded only as an unsigned test artifact and no GitHub Release will be published."
+            {
+              echo "## macOS release was not published"
+              echo
+              echo "Configure MAC_CSC_LINK, MAC_CSC_KEY_PASSWORD, APPLE_ID, APPLE_APP_SPECIFIC_PASSWORD, and APPLE_TEAM_ID to produce an auto-updatable macOS release."
+            } >> "$GITHUB_STEP_SUMMARY"
           fi
 
       - name: Build signed macOS DMG and update ZIP
@@ -226,7 +233,7 @@ jobs:
         if: steps.notarization.outputs.enabled != 'true'
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
-        run: pnpm exec electron-builder --mac --publish never -c.mac.notarize=false
+        run: pnpm exec electron-builder --mac --publish never -c.mac.notarize=false -c.mac.hardenedRuntime=false
 
       - name: Smoke-test packaged application
         run: |
@@ -243,7 +250,26 @@ jobs:
             exit 1
           fi
 
-      - name: Upload workflow artifact
+      - name: Verify Developer ID signature and notarization
+        if: steps.notarization.outputs.enabled == 'true'
+        run: |
+          app_path="release/mac-universal/Multi-Agent Office.app"
+          codesign --verify --deep --strict --verbose=2 "$app_path"
+          signature_details=$(codesign --display --verbose=4 "$app_path" 2>&1)
+          echo "$signature_details"
+          if ! grep -q '^Authority=Developer ID Application:' <<< "$signature_details"; then
+            echo "Packaged application is not signed with a Developer ID Application certificate" >&2
+            exit 1
+          fi
+          if grep -q '^TeamIdentifier=not set$' <<< "$signature_details"; then
+            echo "Packaged application has no signing TeamIdentifier" >&2
+            exit 1
+          fi
+          spctl --assess --type execute --verbose=2 "$app_path"
+          xcrun stapler validate "$app_path"
+
+      - name: Upload signed macOS release artifact
+        if: steps.notarization.outputs.enabled == 'true'
         uses: actions/upload-artifact@v7
         with:
           name: multi-agent-office-macos-universal-${{ github.run_number }}
@@ -255,9 +281,22 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+      - name: Upload unsigned macOS test artifact
+        if: steps.notarization.outputs.enabled != 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: multi-agent-office-macos-unsigned-test-${{ github.run_number }}
+          path: |
+            release/*.dmg
+            release/*.zip
+          if-no-files-found: error
+          retention-days: 7
+
   publish-release:
     name: Publish desktop installers
-    if: github.ref_type == 'tag' || github.ref == 'refs/heads/main'
+    if: >-
+      (github.ref_type == 'tag' || github.ref == 'refs/heads/main') &&
+      needs.build-macos-installer.outputs.signed-release-ready == 'true'
     needs:
       - prepare-release
       - build-windows-installer

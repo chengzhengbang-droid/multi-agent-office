@@ -49,6 +49,8 @@ button { color: inherit; }
 :root[data-theme="dark"] .setup-logo { background: #ecece7; color: #252621; }
 .setup-header > span { font-size: 14px; font-weight: 680; letter-spacing: -.015em; }
 .setup-header > p { margin-left: auto; color: var(--faint); font-size: 10.5px; }
+.setup-update-button { height: 30px; display: inline-flex; align-items: center; gap: 5px; border: 1px solid var(--border); border-radius: 8px; padding: 0 9px; background: var(--surface-soft); color: var(--muted); cursor: pointer; font-size: 10px; }
+.setup-update-button:hover { background: var(--surface-hover); color: var(--text); }
 .setup-copy { padding: 28px 30px 21px; text-align: center; }
 .setup-step { display: inline-flex; padding: 4px 8px; border-radius: 999px; background: var(--accent-soft); color: var(--accent); font-size: 9px; font-weight: 700; letter-spacing: .07em; }
 .setup-copy h1 { margin: 13px 0 8px; font-size: 27px; line-height: 1.2; letter-spacing: -.04em; }
@@ -121,9 +123,10 @@ button { color: inherit; }
 .runtime-dot--ready { background: #3e9a7c; }
 .icon-button { width: 32px; height: 32px; display: grid; place-items: center; border: 0; border-radius: 8px; background: transparent; cursor: pointer; color: var(--muted); }
 .icon-button:hover { background: var(--surface-hover); color: var(--text); }
-.update-button { position: relative; }
-.update-button > span { display: none; position: absolute; top: 5px; right: 5px; width: 6px; height: 6px; border: 1px solid var(--sidebar); border-radius: 50%; background: #3e9a7c; }
-.update-button--available > span, .update-button--downloaded > span { display: block; }
+.update-button { position: relative; width: auto; min-width: 55px; display: inline-flex; grid-template: none; gap: 5px; padding: 0 8px; }
+.update-button-label { font-size: 10.5px; }
+.update-button > .update-button-indicator { display: none; position: absolute; top: 4px; right: 4px; width: 6px; height: 6px; border: 1px solid var(--sidebar); border-radius: 50%; background: #3e9a7c; }
+.update-button--available > .update-button-indicator, .update-button--downloaded > .update-button-indicator { display: block; }
 .update-button--checking svg, .update-button--downloading svg { animation: spin .9s linear infinite; }
 .workspace { flex: 1; min-width: 0; display: flex; flex-direction: column; background: var(--bg); }
 .topbar { height: 55px; flex: 0 0 55px; display: flex; align-items: center; padding: 0 18px 0 23px; border-bottom: 1px solid var(--border-soft); background: color-mix(in srgb, var(--bg) 90%, transparent); }
@@ -398,6 +401,8 @@ button { color: inherit; }
   .setup-screen { padding: 0; place-items: stretch; }
   .setup-card { min-height: 100%; border: 0; border-radius: 0; }
   .setup-header { padding: 0 17px; }
+  .setup-header > p { display: none; }
+  .setup-update-button { margin-left: auto; }
   .setup-copy { padding: 25px 18px 20px; }
   .setup-form { padding: 0 17px 24px; }
   .provider-grid { grid-template-columns: 1fr 1fr; }

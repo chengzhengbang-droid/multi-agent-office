@@ -312,7 +312,14 @@ export function App() {
   };
 
   if (data?.setup.required) {
-    return <FirstRunSetup onComplete={finishSetup} />;
+    return <>
+      <FirstRunSetup
+        onComplete={finishSetup}
+        onUpdate={() => { setUpdateActionError(""); setUpdateOpen(true); }}
+        updateTitle={updateButtonTitle(desktopUpdate)}
+      />
+      <UpdateDialog open={updateOpen} snapshot={desktopUpdate} actionRunning={updateActionRunning} error={updateActionError} onClose={() => setUpdateOpen(false)} onAction={() => void performUpdateAction()} />
+    </>;
   }
 
   return (
@@ -342,7 +349,7 @@ export function App() {
             <span className={`runtime-dot ${onlineCount > 0 && connectionState === "connected" ? "runtime-dot--ready" : ""}`} />
             <span><strong>{onlineCount}/{data?.catalog.agents.length ?? 0} Agent 在线</strong><small>{connectionLabel(configured, connectionState)}</small></span>
           </button>
-          <button className={`icon-button update-button update-button--${desktopUpdate?.state.phase ?? "browser"}`} type="button" onClick={() => { setUpdateActionError(""); setUpdateOpen(true); }} aria-label="检查应用更新" title={updateButtonTitle(desktopUpdate)}><RefreshCw size={17} /><span /></button>
+          <button className={`icon-button update-button update-button--${desktopUpdate?.state.phase ?? "browser"}`} type="button" onClick={() => { setUpdateActionError(""); setUpdateOpen(true); }} aria-label="检查应用更新" title={updateButtonTitle(desktopUpdate)}><RefreshCw size={16} /><span className="update-button-label">更新</span><i className="update-button-indicator" /></button>
           <button className="icon-button" type="button" onClick={() => setCatalogOpen(true)} aria-label="管理 Agent"><Settings2 size={17} /></button>
           <button className="icon-button" type="button" onClick={() => setTheme(theme === "dark" ? "light" : "dark")} aria-label="切换主题">{theme === "dark" ? <Sun size={17} /> : <Moon size={17} />}</button>
         </div>
@@ -397,7 +404,7 @@ export function App() {
   );
 }
 
-function FirstRunSetup({ onComplete }: { onComplete(data: BootstrapData): void }) {
+function FirstRunSetup({ onComplete, onUpdate, updateTitle }: { onComplete(data: BootstrapData): void; onUpdate(): void; updateTitle: string }) {
   const [provider, setProvider] = useState<ApiProviderId>("zai-coding-cn");
   const [apiKey, setApiKey] = useState("");
   const [useCodex, setUseCodex] = useState(false);
@@ -436,6 +443,7 @@ function FirstRunSetup({ onComplete }: { onComplete(data: BootstrapData): void }
           <div className="setup-logo"><Sparkles size={24} /></div>
           <span>Multi-Agent Office</span>
           <p>首次启动设置</p>
+          <button className="setup-update-button" type="button" onClick={onUpdate} title={updateTitle}><RefreshCw size={14} />检查更新</button>
         </header>
 
         <div className="setup-copy">
@@ -527,6 +535,7 @@ function UpdateDialog({ open, snapshot, actionRunning, error, onClose, onAction 
   if (!open) return null;
   const phase = snapshot?.state.phase ?? "browser";
   const supported = snapshot?.supported ?? false;
+  const actionAvailable = supported || Boolean(snapshot?.manualDownloadUrl);
   const busy = actionRunning || phase === "checking" || phase === "downloading";
   const status = updateStatusCopy(snapshot);
   return <div className="update-dialog-scrim" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><section className="update-dialog" role="dialog" aria-modal="true" aria-labelledby="update-dialog-title">
@@ -536,17 +545,25 @@ function UpdateDialog({ open, snapshot, actionRunning, error, onClose, onAction 
       {snapshot && <div className="update-version-grid"><div><span>当前版本</span><strong>v{snapshot.state.currentVersion}</strong></div><div><span>最新版本</span><strong>{snapshot.state.latestVersion ? `v${snapshot.state.latestVersion}` : "检查后显示"}</strong></div></div>}
       {phase === "downloading" && <div className="update-progress" aria-label={`下载进度 ${Math.round(snapshot?.state.percent ?? 0)}%`}><span style={{ width: `${Math.round(snapshot?.state.percent ?? 0)}%` }} /></div>}
       {(error || snapshot?.state.error) && <div className="update-inline-error"><XCircle size={14} />{error || snapshot?.state.error}</div>}
-      <p className="update-note">桌面安装版会在启动 30 秒后自动检查，此后每 6 小时检查一次。更新不会覆盖本地配置、Agent 或任务记录。</p>
+      <p className="update-note">{updateNote(snapshot)}</p>
     </div>
-    <footer><button className="update-secondary" type="button" onClick={onClose}>{phase === "downloaded" ? "稍后安装" : "关闭"}</button><button className="update-primary" type="button" onClick={onAction} disabled={!supported || busy}>{updateActionLabel(snapshot, actionRunning)}</button></footer>
+    <footer><button className="update-secondary" type="button" onClick={onClose}>{phase === "downloaded" ? "稍后安装" : "关闭"}</button><button className="update-primary" type="button" onClick={onAction} disabled={!actionAvailable || busy}>{updateActionLabel(snapshot, actionRunning)}</button></footer>
   </section></div>;
 }
 
 function updateStatusCopy(snapshot?: DesktopUpdateSnapshot): { title: string; detail: string } {
   if (!snapshot) return { title: "浏览器界面无需单独更新", detail: "此页面与桌面安装版使用同一套界面；桌面程序的版本更新请在安装版中执行。" };
-  if (!snapshot.supported) return snapshot.packaged
-    ? { title: "当前安装包未启用更新通道", detail: "请使用 GitHub Release 中的 Windows 或 macOS 正式安装包。" }
-    : { title: "桌面开发模式", detail: "界面与正式安装版一致，但源码模式不会连接发布更新服务。" };
+  if (!snapshot.supported) {
+    if (snapshot.supportReason === "unsigned-macos") {
+      return { title: "此 macOS 版本需要手动更新", detail: "当前安装包没有有效的 Developer ID 签名。请手动安装下一版已签名安装包，之后即可使用应用内自动更新。" };
+    }
+    if (snapshot.supportReason === "unsupported-platform") {
+      return { title: "当前系统需要手动更新", detail: "请从 GitHub Releases 下载适合当前系统的最新安装包。" };
+    }
+    return snapshot.packaged
+      ? { title: "当前安装包未启用更新通道", detail: "请使用 GitHub Release 中的 Windows 或 macOS 正式安装包。" }
+      : { title: "桌面开发模式", detail: "界面与正式安装版一致，但源码模式不会连接发布更新服务。" };
+  }
   switch (snapshot.state.phase) {
     case "checking": return { title: "正在检查更新", detail: "正在连接 GitHub Release 更新通道…" };
     case "available": return { title: `发现新版本 v${snapshot.state.latestVersion ?? ""}`, detail: "可以直接在应用内下载，无需前往浏览器下载安装包。" };
@@ -559,7 +576,7 @@ function updateStatusCopy(snapshot?: DesktopUpdateSnapshot): { title: string; de
 
 function updateActionLabel(snapshot: DesktopUpdateSnapshot | undefined, running: boolean): string {
   if (running) return "正在处理…";
-  if (!snapshot?.supported) return "当前无需操作";
+  if (!snapshot?.supported) return snapshot?.manualDownloadUrl ? "打开下载页" : "当前无需操作";
   switch (snapshot.state.phase) {
     case "checking": return "正在检查…";
     case "available": return "下载更新";
@@ -571,10 +588,21 @@ function updateActionLabel(snapshot: DesktopUpdateSnapshot | undefined, running:
 }
 
 function updateButtonTitle(snapshot?: DesktopUpdateSnapshot): string {
+  if (snapshot?.supportReason === "unsigned-macos") return "此版本需要手动更新";
   if (snapshot?.state.phase === "available") return `发现新版本 v${snapshot.state.latestVersion ?? ""}`;
   if (snapshot?.state.phase === "downloading") return `正在下载更新 ${Math.round(snapshot.state.percent ?? 0)}%`;
   if (snapshot?.state.phase === "downloaded") return `v${snapshot.state.latestVersion ?? ""} 等待安装`;
   return "检查应用更新";
+}
+
+function updateNote(snapshot?: DesktopUpdateSnapshot): string {
+  if (snapshot?.supportReason === "unsigned-macos") {
+    return "从未签名版本迁移到正式签名更新通道需要手动安装一次。此操作不会覆盖本地配置、Agent 或任务记录。";
+  }
+  if (snapshot?.supported) {
+    return "桌面安装版会在启动 30 秒后自动检查，此后每 6 小时检查一次。更新不会覆盖本地配置、Agent 或任务记录。";
+  }
+  return "下载并安装新版本不会覆盖用户目录中的配置、Agent 或任务记录。";
 }
 
 function desktopPlatformLabel(platform: string): string {
