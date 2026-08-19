@@ -15,9 +15,12 @@ import {
 } from "./config/agent-catalog.js";
 import {
   applyFirstRunEnvironment,
+  applyProviderCredential,
   isFirstRunSetupRequired,
   parseFirstRunInput,
+  parseProviderCredentialInput,
   saveFirstRunConfig,
+  saveProviderCredential,
 } from "./config/first-run.js";
 import { findApiProvider } from "./config/provider-presets.js";
 import {
@@ -338,6 +341,42 @@ const server = createServer(async (request, response) => {
       return;
     }
 
+    // Adding a Pi Agent on a second provider needs that provider's key, and the
+    // first-run page is gone once setup completed. This adds a credential
+    // without repointing any Agent that already works.
+    if (url.pathname === "/api/providers/credential" && request.method === "POST") {
+      if (!isTrustedLocalOrigin(request)) {
+        sendJson(response, 403, { error: "拒绝来自其他网页的配置请求" });
+        return;
+      }
+      if (setupRequired) {
+        sendJson(response, 409, { error: "请先完成首次启动配置" });
+        return;
+      }
+      try {
+        const input = parseProviderCredentialInput(await readJson(request));
+        // Reloading credentials rebuilds every runtime adapter, which disposes
+        // the outgoing ones, so a live run would be aborted mid-turn.
+        const busy = catalog.agents.find((agent) => platform.hasLiveAgentRun(agent.id));
+        if (busy) {
+          sendJson(response, 409, {
+            error: `@${busy.id} 正在运行或排队，请等待本轮结束后再保存凭据`,
+          });
+          return;
+        }
+        await saveProviderCredential(configPath, input);
+        applyProviderCredential(input);
+        await reloadProviderCredentials();
+        sendJson(response, 200, {
+          agents: buildAgentViews(catalog, runtimes),
+          models: await buildModelCatalog(),
+        });
+      } catch (error) {
+        sendJson(response, 400, { error: errorMessage(error) });
+      }
+      return;
+    }
+
     const sessionMatch = url.pathname.match(/^\/api\/agents\/([^/]+)\/session$/);
     if (sessionMatch) {
       const agentId = decodeURIComponent(sessionMatch[1] ?? "");
@@ -440,6 +479,25 @@ const shutdown = (): void => {
 };
 process.once("SIGINT", shutdown);
 process.once("SIGTERM", shutdown);
+
+/**
+ * Pi caches the credential store inside the shared `ModelRuntime`, and each
+ * adapter resolves availability once at construction, so a key added while the
+ * app runs stays invisible until both are rebuilt. The roster itself is
+ * unchanged, which `assertRosterChangeAllowed` accepts.
+ */
+async function reloadProviderCredentials(): Promise<void> {
+  piShared.dispose();
+  platform.beginRosterUpdate(catalog.agents);
+  try {
+    const nextRuntimes = await createAgentRuntimes(catalog.agents, runtimeFactoryOptions);
+    await platform.replaceRoster(catalog.agents, nextRuntimes, catalog.defaultAgentId);
+    runtimes = nextRuntimes;
+  } catch (error) {
+    platform.abortRosterUpdate();
+    throw error;
+  }
+}
 
 function buildAgentViews(
   source: AgentCatalogV1,
