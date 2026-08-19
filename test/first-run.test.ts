@@ -5,9 +5,12 @@ import { join } from "node:path";
 import { test } from "node:test";
 import {
   applyFirstRunEnvironment,
+  applyProviderCredential,
   isFirstRunSetupRequired,
   parseFirstRunInput,
+  parseProviderCredentialInput,
   saveFirstRunConfig,
+  saveProviderCredential,
   updateEnvText,
 } from "../src/config/first-run.js";
 
@@ -93,4 +96,44 @@ test("first-run config is atomically persisted with a completion marker", async 
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
+});
+
+test("a second provider credential is added without disturbing the first", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "mao-provider-credential-"));
+  const path = join(directory, "config.env");
+  try {
+    await saveFirstRunConfig(
+      path,
+      { provider: "zai-coding-cn", apiKey: "zai-example-key", useCodex: false },
+      true,
+    );
+    await saveProviderCredential(path, { provider: "deepseek", apiKey: "sk-deepseek-example" });
+    const saved = await readFile(path, "utf8");
+    assert.match(saved, /^ZAI_CODING_CN_API_KEY="zai-example-key"$/m);
+    assert.match(saved, /^DEEPSEEK_API_KEY="sk-deepseek-example"$/m);
+    // Adding a credential must not repoint the Agents that already work.
+    assert.match(saved, /^MAO_PI_PROVIDER="zai-coding-cn"$/m);
+    assert.match(saved, /^MAO_SETUP_COMPLETED="1"$/m);
+    if (process.platform !== "win32") {
+      assert.equal((await stat(path)).mode & 0o777, 0o600);
+    }
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("provider credential input validates the provider and the key alone", () => {
+  assert.deepEqual(
+    parseProviderCredentialInput({ provider: "deepseek", apiKey: "  sk-deepseek-example  " }),
+    { provider: "deepseek", apiKey: "sk-deepseek-example" },
+  );
+  assert.throws(
+    () => parseProviderCredentialInput({ provider: "unknown", apiKey: "long-enough" }),
+    /API 提供商/,
+  );
+  assert.throws(() => parseProviderCredentialInput({ provider: "zai", apiKey: "short" }), /API Key/);
+  const environment: NodeJS.ProcessEnv = { MAO_PI_PROVIDER: "zai-coding-cn" };
+  applyProviderCredential({ provider: "deepseek", apiKey: "sk-deepseek-example" }, environment);
+  assert.equal(environment.DEEPSEEK_API_KEY, "sk-deepseek-example");
+  assert.equal(environment.MAO_PI_PROVIDER, "zai-coding-cn");
 });

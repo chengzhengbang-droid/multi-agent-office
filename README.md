@@ -11,7 +11,16 @@ Agent 交付的成果要由**另一个** Agent 把关后才算完成：自称做
 - `@codex`：使用本机 Codex CLI 和 `workspace-write` 沙箱。
 - `@pi`：使用 `MAO_PI_*` 模型配置，默认 `full`，开放 Bash/edit/write。
 
-两者是对等协作者。桌面安装版首次使用 `@pi` 作为默认 Agent，并允许在首次启动页停用 `@codex`；源码启动可通过 `MAO_DEFAULT_AGENT=pi|codex` 选择。Web 的 Agent 花名册可以新增任意数量的 Pi/Codex Agent，编辑模型、身份、system prompt、能力和访问级别，停用 Agent，并切换默认 Agent。handle 保存后不可改；密钥只从首次启动页写入本地 `config.env`，或直接从环境变量读取，不写入花名册或 API 响应。
+两者是对等协作者。桌面安装版首次使用 `@pi` 作为默认 Agent，并允许在首次启动页停用 `@codex`；源码启动可通过 `MAO_DEFAULT_AGENT=pi|codex` 选择。Web 的 Agent 花名册可以新增任意数量的 Pi/Codex Agent，编辑模型、身份、system prompt、能力和访问级别，停用 Agent，并切换默认 Agent。handle 保存后不可改；密钥不写入花名册或 API 响应，只写入本地 `config.env`，或直接从环境变量读取。
+
+## 多个 Pi Agent
+
+不接入 Codex 时，团队可以完全由 Pi Agent 组成，每个 Agent 用不同的 provider——例如一个走 DeepSeek、一个走 GLM。每个 Pi Agent 各自解析自己的 provider/model、各自判定凭据是否就绪、各自持有 session 绑定和 session 目录，互不干扰；审核时平台会自动挑选另一个在线 Agent，两个 Pi Agent 可以互审。
+
+- **配置凭据**：花名册里选中一个 Pi Agent，在 provider 下方直接填写该 provider 的 API Key。密钥按 provider 分别保存，不会覆盖其他 provider，也不会改变已有 Agent 指向的 provider。保存后立即生效，无需重启；有 Agent 正在运行或排队时会拒绝保存，以免中断本轮对话。
+- **前端区分**：头像颜色由 handle 哈希得出，首字母取每个连字符段的首字符（`pi-deepseek` → `PD`，`pi-glm` → `PG`），消息头的运行时标签为 `Pi · provider · model`，因此同模型不同 provider 的两个 Agent 也能分辨。
+- **并发**：只读 Agent 可并行（上限 `MAO_MAX_PARALLEL_READ_RUNS`），同一工作目录内的写运行仍然串行，与 provider 无关。
+- 自定义 provider（写在 pi 的 `models.json` 里）不在内置列表中，凭据请用 `pi` 登录写入 `auth.json`。
 
 ## 路由语义
 
@@ -174,6 +183,7 @@ pnpm demo -- "@pi @codex 请独立评估这个方案"
 - `POST /api/chains/:chainId/cancel`：取消整条协作链。
 - `GET /api/events`：SSE 事件投影。
 - `GET /api/models`：Pi 可用的 provider 与模型目录，以及每个 provider 是否已配置凭据；不返回密钥。
+- `POST /api/providers/credential`：为单个内置 provider 写入 API Key 并热更新 Pi 的凭据缓存；只接受本机同源请求，不返回密钥，有 Agent 在跑时返回 409。
 - `GET /api/agents/:agentId/session?threadId=`：该 Agent 在此 Thread 的 session 统计。
 - `POST /api/agents/:agentId/session?threadId=&action=compact|export&format=html|jsonl`：手动压缩上下文或导出 session。
 
@@ -187,7 +197,7 @@ pnpm test
 pnpm build
 ```
 
-测试覆盖花名册、mention 解析、对等路由、A2A、幂等与乒乓限制、读写调度、整链取消、上下文游标、session 隔离、Codex JSONL 首次执行与 resume、MCP token、Pi 凭据判定、可观测性事件投影、运行中插话与回退、图片附件，以及现有历史事件的完整兼容回放。
+测试覆盖花名册、mention 解析、对等路由、A2A、幂等与乒乓限制、读写调度、整链取消、上下文游标、session 隔离、Codex JSONL 首次执行与 resume、MCP token、Pi 凭据判定、多 provider 凭据互不覆盖、Agent 头像标识去重、可观测性事件投影、运行中插话与回退、图片附件，以及现有历史事件的完整兼容回放。
 
 审核相关覆盖：强制送审与审核者选取（配置优先、离线回退）、通过后终结、不通过返工并复审、轮数上限升级、无结论/无审核者/审核失败一律不通过、审核中取消、重启后中断的审核升级、审核 run 不占用链额度与深度、审核者不会变成 Thread 的默认应答者，以及旧日志回放不补发审核。smart 门另有覆盖：闲聊不送审、声明完成走 verify 且证据进入审核简报、提交方案走 critique 且返工仍是 critique、改文件不声明也送审、只读运行与 shell 读命令不触发、审核者不能自我声明、声明不能改口径、`required` 模式语义不变，以及带声明的日志回放。
 
