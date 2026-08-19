@@ -41,8 +41,10 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
   API_PROVIDER_PRESETS,
+  findApiProvider,
   type ApiProviderId,
 } from "../config/provider-presets";
+import { agentAvatarTone, agentInitials } from "./agent-identity";
 import type {
   AccessMode,
   AgentCatalogV1,
@@ -325,6 +327,12 @@ export function App() {
     }
   };
 
+  // Availability only; the catalog object stays identical so an open roster
+  // editor does not reset the draft the user is still editing.
+  const refreshAgents = (next: AgentSummary[]) => {
+    setData((current) => current ? { ...current, agents: mergeHistoricalAgents(next, current.agents) } : current);
+  };
+
   const saveCatalog = async (next: AgentCatalogV1) => {
     const response = await fetch("/api/agents", {
       method: "PUT",
@@ -450,7 +458,7 @@ export function App() {
 
       <DetailsDrawer open={drawerOpen} onClose={() => setDrawerOpen(false)} thread={selectedThread} agents={data?.agents ?? []} workspace={activeWorkspace} events={data?.events ?? []} />
       <WorkspacePicker open={workspacePickerOpen} current={activeWorkspace} recent={recentWorkspaces} onClose={() => setWorkspacePickerOpen(false)} onSelect={(workspace) => { setSelectedWorkspace(workspace); setSelectedThreadId(undefined); setDrawerOpen(false); setSidebarOpen(false); setWorkspacePickerOpen(false); }} />
-      {data && <AgentCatalogEditor open={catalogOpen} catalog={data.catalog} agents={data.agents} onClose={() => setCatalogOpen(false)} onSave={saveCatalog} />}
+      {data && <AgentCatalogEditor open={catalogOpen} catalog={data.catalog} agents={data.agents} onClose={() => setCatalogOpen(false)} onSave={saveCatalog} onAgentsRefreshed={refreshAgents} />}
       <UpdateDialog open={updateOpen} snapshot={desktopUpdate} actionRunning={updateActionRunning} error={updateActionError} onClose={() => setUpdateOpen(false)} onAction={() => void performUpdateAction()} />
     </div>
   );
@@ -769,9 +777,58 @@ interface ModelCatalog {
   error?: string;
 }
 
-interface CatalogEditorProps { open: boolean; catalog: AgentCatalogV1; agents: AgentSummary[]; onClose(): void; onSave(catalog: AgentCatalogV1): Promise<void> }
+interface CredentialResponse { agents: AgentSummary[]; models: ModelCatalog; error?: string }
 
-function AgentCatalogEditor({ open, catalog, agents, onClose, onSave }: CatalogEditorProps) {
+/**
+ * Per-provider credential entry inside the roster editor.
+ *
+ * First-run setup writes exactly one provider key and then locks itself, so a
+ * roster with a Pi Agent per provider previously meant hand-editing the config
+ * file and restarting. Keys stay out of the catalog payload — they go to their
+ * own endpoint, which reloads Pi's credential cache in place.
+ */
+function ProviderCredentialField({ provider, models, onSaved }: { provider: string; models: ModelCatalog; onSaved(agents: AgentSummary[], models: ModelCatalog): void }) {
+  const [apiKey, setApiKey] = useState("");
+  const [showKey, setShowKey] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [notice, setNotice] = useState("");
+  const [error, setError] = useState("");
+  useEffect(() => { setApiKey(""); setNotice(""); setError(""); setShowKey(false); }, [provider]);
+  const preset = findApiProvider(provider);
+  const status = models.providers.find((item) => item.id === provider);
+  const configured = Boolean(status?.configured);
+  const save = async () => {
+    if (saving || apiKey.trim().length < 8) return;
+    setSaving(true); setError(""); setNotice("");
+    try {
+      const response = await fetch("/api/providers/credential", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ provider, apiKey: apiKey.trim() }) });
+      const result = (await response.json()) as CredentialResponse;
+      if (!response.ok || !result.agents) throw new Error(result.error ?? "凭据保存失败");
+      setApiKey("");
+      setNotice("凭据已保存并生效，无需重启。");
+      onSaved(result.agents, result.models);
+    } catch (saveError) {
+      setError(errorMessage(saveError));
+    } finally {
+      setSaving(false);
+    }
+  };
+  return <div className="provider-credential">
+    <div className="provider-credential-head"><KeyRound size={13} /><span>{preset?.label ?? provider} 凭据</span><i className={configured ? "provider-credential-ready" : undefined}>{status?.subscription ? "订阅已登录" : configured ? "已配置" : "未配置"}</i></div>
+    {preset ? <>
+      <div className="provider-credential-row">
+        <input type={showKey ? "text" : "password"} value={apiKey} onChange={(event) => setApiKey(event.target.value)} placeholder={configured ? "输入新的 Key 可覆盖现有凭据" : preset.keyPlaceholder} autoComplete="off" spellCheck={false} />
+        <button type="button" onClick={() => setShowKey((current) => !current)} aria-label={showKey ? "隐藏 API Key" : "显示 API Key"}>{showKey ? <EyeOff size={14} /> : <Eye size={14} />}</button>
+        <button type="button" onClick={() => void save()} disabled={saving || apiKey.trim().length < 8}>{saving ? <span className="button-spinner" /> : <Save size={13} />}{saving ? "保存中" : "保存密钥"}</button>
+      </div>
+      <p className={`provider-credential-note${error ? " provider-credential-note--error" : notice ? " provider-credential-note--ok" : ""}`}>{error || notice || "密钥写入本机配置文件，不会进入花名册或任何 API 响应。每个提供商各存一份，互不覆盖。"}</p>
+    </> : <p className="provider-credential-note">{configured ? `${provider} 的凭据来自 pi 的 auth.json，在这里无需重复填写。` : `${provider} 不是内置提供商，请先用 pi 登录写入 auth.json。`}</p>}
+  </div>;
+}
+
+interface CatalogEditorProps { open: boolean; catalog: AgentCatalogV1; agents: AgentSummary[]; onClose(): void; onSave(catalog: AgentCatalogV1): Promise<void>; onAgentsRefreshed(agents: AgentSummary[]): void }
+
+function AgentCatalogEditor({ open, catalog, agents, onClose, onSave, onAgentsRefreshed }: CatalogEditorProps) {
   const [draft, setDraft] = useState<AgentCatalogV1>(() => structuredClone(catalog));
   const [selectedId, setSelectedId] = useState(catalog.defaultAgentId);
   const [saving, setSaving] = useState(false);
@@ -811,6 +868,7 @@ function AgentCatalogEditor({ open, catalog, agents, onClose, onSave }: CatalogE
     <div className="form-grid"><label>Runtime<select value={selected.runtime.kind} onChange={(event) => update({ runtime: event.target.value === "pi" ? { kind: "pi", provider: "zai-coding-cn", model: "glm-5.2", thinkingLevel: "medium" } : { kind: "codex", command: "codex" } })}><option value="codex">Codex CLI</option><option value="pi">Pi SDK</option></select></label><label>访问级别<select value={selected.accessMode} onChange={(event) => update({ accessMode: event.target.value as AccessMode })}><option value="read-only">read-only</option><option value="workspace-write">workspace-write</option><option value="full">full</option></select></label></div>
     <div className="form-grid"><label>默认审核者<select value={selected.reviewerAgentId ?? ""} onChange={(event) => update({ reviewerAgentId: event.target.value || undefined })}><option value="">自动选择在线队友</option>{draft.agents.filter((candidate) => candidate.id !== selected.id).map((candidate) => <option value={candidate.id} key={candidate.id}>@{candidate.id}</option>)}</select><small className="field-hint">该 Agent 完成用户任务后，交由谁审核。离线或未配置时自动回退到其他在线 Agent。</small></label></div>
     {selected.runtime.kind === "pi" ? <div className="form-grid form-grid--three"><label>Provider<input list="pi-provider-options" value={selected.runtime.provider} onChange={(event) => update({ runtime: { ...selected.runtime, provider: event.target.value } as AgentDefinition["runtime"] })} /><datalist id="pi-provider-options">{catalogModels.providers.map((provider) => <option value={provider.id} key={provider.id}>{provider.name}{provider.configured ? (provider.subscription ? "（订阅已登录）" : "（凭据已配置）") : "（未配置凭据）"}</option>)}</datalist></label><label>Model<input list="pi-model-options" value={selected.runtime.model} onChange={(event) => update({ runtime: { ...selected.runtime, model: event.target.value } as AgentDefinition["runtime"] })} /><datalist id="pi-model-options">{(catalogModels.providers.find((provider) => provider.id === (selected.runtime as { provider: string }).provider)?.models ?? []).map((model) => <option value={model.id} key={model.id}>{model.name}</option>)}</datalist></label><label>Thinking<select value={selected.runtime.thinkingLevel} onChange={(event) => update({ runtime: { ...selected.runtime, thinkingLevel: event.target.value as ThinkingLevel } as AgentDefinition["runtime"] })}>{["off", "minimal", "low", "medium", "high", "xhigh", "max"].map((level) => <option key={level}>{level}</option>)}</select></label></div> : <><div className="form-grid"><label>CLI 路径<input value={selected.runtime.command} onChange={(event) => update({ runtime: { ...selected.runtime, command: event.target.value } as AgentDefinition["runtime"] })} /></label><label>Model<input value={selected.runtime.model ?? ""} placeholder="使用 profile 默认值" onChange={(event) => update({ runtime: { ...selected.runtime, model: event.target.value || undefined } as AgentDefinition["runtime"] })} /></label></div><div className="form-grid"><label>Profile<input value={selected.runtime.profile ?? ""} onChange={(event) => update({ runtime: { ...selected.runtime, profile: event.target.value || undefined } as AgentDefinition["runtime"] })} /></label><label>Reasoning<select value={selected.runtime.reasoningEffort ?? ""} onChange={(event) => update({ runtime: { ...selected.runtime, reasoningEffort: (event.target.value || undefined) as "low" | "medium" | "high" | "xhigh" | undefined } as AgentDefinition["runtime"] })}><option value="">profile 默认值</option>{["low", "medium", "high", "xhigh"].map((level) => <option key={level}>{level}</option>)}</select></label></div></>}
+    {selected.runtime.kind === "pi" && <ProviderCredentialField provider={selected.runtime.provider} models={catalogModels} onSaved={(nextAgents, nextModels) => { onAgentsRefreshed(nextAgents); setCatalogModels(nextModels); }} />}
     <div className="catalog-switches"><label><input type="checkbox" checked={selected.enabled} disabled={selected.id === draft.defaultAgentId} onChange={(event) => update({ enabled: event.target.checked })} />启用</label><label><input type="radio" name="default-agent" checked={selected.id === draft.defaultAgentId} onChange={() => setDraft((current) => ({ ...current, defaultAgentId: selected.id, agents: current.agents.map((agent) => agent.id === selected.id ? { ...agent, enabled: true } : agent) }))} />设为默认 Agent</label></div>
     {selected.runtime.kind === "pi" && selected.accessMode === "full" && <p className="risk-warning">Pi full 会开放 Bash/edit/write，缺少完整文件系统沙箱。只在信任的本地工作目录使用。</p>}{selected.runtime.kind === "codex" && selected.accessMode === "full" && <p className="risk-warning">Codex v1 会把 full 映射为 workspace-write，不启用 danger-full-access。</p>}
   </div>}</div><footer>{error && <span className="catalog-error"><XCircle size={13} />{error}</span>}<button type="button" className="catalog-cancel" onClick={onClose}>取消</button><button type="button" className="catalog-save" onClick={() => void submit()} disabled={saving}><Save size={14} />{saving ? "保存中…" : "原子保存花名册"}</button></footer></section></div>;
@@ -830,7 +888,7 @@ interface DetailsDrawerProps { open: boolean; onClose(): void; thread?: ThreadSu
 
 function DetailsDrawer({ open, onClose, thread, agents, workspace, events }: DetailsDrawerProps) {
   const threadEvents = useMemo(() => selectThreadEvents(events, thread?.id), [events, thread?.id]); const runCount = threadEvents.filter((event) => event.type === "run.queued").length; const toolCount = threadEvents.filter((event) => event.type === "run.tool" && event.phase === "start").length; const messageCount = threadEvents.filter((event) => event.type === "message.created").length; const timeline = threadEvents.filter((event) => event.type !== "run.delta" && event.type !== "run.thinking" && event.type !== "run.reset" && event.type !== "thread.created");
-  return <>{open && <button className="drawer-scrim" type="button" onClick={onClose} aria-label="关闭运行详情" />}<aside className={`details-drawer ${open ? "details-drawer--open" : ""}`} aria-hidden={!open}><header className="drawer-header"><div><strong>运行详情</strong><span>{thread ? cleanTitle(thread.title) : "尚未创建任务"}</span></div><button className="icon-button" type="button" onClick={onClose} aria-label="关闭运行详情"><X size={18} /></button></header><div className="drawer-content"><section className="drawer-section workspace-card"><Folder size={16} /><div><span>工作目录与写锁作用域</span><code title={workspace?.path}>{workspace?.path ?? "正在读取"}</code></div></section><section className="drawer-section"><h2>概览</h2><div className="stat-grid"><div><strong>{runCount}</strong><span>运行</span></div><div><strong>{messageCount}</strong><span>消息</span></div><div><strong>{toolCount}</strong><span>工具</span></div></div></section><section className="drawer-section"><h2>团队运行时健康</h2><div className="agent-roster">{agents.map((agent) => <div className="roster-item" key={agent.id}><AgentAvatar agentId={agent.id} /><span><strong>{agent.displayName} · {runtimeLabel(agent)}</strong><small>@{agent.id} · {agent.accessMode} · {agent.availability.label}</small></span><i>{!agent.enabled ? "已停用" : threadEvents.some((event) => event.type === "run.started" && event.agentId === agent.id) ? "已参与" : agent.availability.available ? "待命" : "离线"}</i></div>)}</div></section><section className="drawer-section"><h2>Agent Session</h2><SessionPanel thread={thread} agents={agents} /></section><section className="drawer-section"><h2>A2A 与运行时间线</h2>{timeline.length > 0 ? <div className="event-timeline">{timeline.map((event) => <TimelineEvent event={event} agents={agents} key={event.eventId} />)}</div> : <p className="drawer-empty">发送任务后，这里会显示 session、排队、工具调用、结构化转交和运行状态。</p>}</section></div></aside></>;
+  return <>{open && <button className="drawer-scrim" type="button" onClick={onClose} aria-label="关闭运行详情" />}<aside className={`details-drawer ${open ? "details-drawer--open" : ""}`} aria-hidden={!open}><header className="drawer-header"><div><strong>运行详情</strong><span>{thread ? cleanTitle(thread.title) : "尚未创建任务"}</span></div><button className="icon-button" type="button" onClick={onClose} aria-label="关闭运行详情"><X size={18} /></button></header><div className="drawer-content"><section className="drawer-section workspace-card"><Folder size={16} /><div><span>工作目录与写锁作用域</span><code title={workspace?.path}>{workspace?.path ?? "正在读取"}</code></div></section><section className="drawer-section"><h2>概览</h2><div className="stat-grid"><div><strong>{runCount}</strong><span>运行</span></div><div><strong>{messageCount}</strong><span>消息</span></div><div><strong>{toolCount}</strong><span>工具</span></div></div></section><section className="drawer-section"><h2>团队运行时健康</h2><div className="agent-roster">{agents.map((agent) => <div className="roster-item" key={agent.id}><AgentAvatar agentId={agent.id} /><span><strong>{agent.displayName}</strong><small>@{agent.id} · {runtimeLabel(agent)} · {agent.accessMode}</small></span><i>{!agent.enabled ? "已停用" : threadEvents.some((event) => event.type === "run.started" && event.agentId === agent.id) ? "已参与" : agent.availability.available ? "待命" : "离线"}</i></div>)}</div></section><section className="drawer-section"><h2>Agent Session</h2><SessionPanel thread={thread} agents={agents} /></section><section className="drawer-section"><h2>A2A 与运行时间线</h2>{timeline.length > 0 ? <div className="event-timeline">{timeline.map((event) => <TimelineEvent event={event} agents={agents} key={event.eventId} />)}</div> : <p className="drawer-empty">发送任务后，这里会显示 session、排队、工具调用、结构化转交和运行状态。</p>}</section></div></aside></>;
 }
 
 function SessionPanel({ thread, agents }: { thread?: ThreadSummary; agents: AgentSummary[] }) {
@@ -1015,7 +1073,12 @@ function RunUsageBar({ usage }: { usage: RunUsage }) {
 
 function formatTokens(value: number): string { return value >= 1_000 ? `${(value / 1_000).toFixed(1)}k` : String(value); }
 
-function AgentAvatar({ agentId, variant }: { agentId: string; variant?: "reviewer" }) { return <span className={`agent-avatar agent-avatar--${variant ?? agentId}`}>{agentId.slice(0, 1).toUpperCase()}</span>; }
+function AgentAvatar({ agentId, variant }: { agentId: string; variant?: "reviewer" }) {
+  // A reviewer tile reads as "review", not as its handle, so it keeps the one
+  // colour that means that and skips the per-handle tone.
+  const tone = variant ? "agent-avatar--reviewer" : `agent-avatar--tone-${agentAvatarTone(agentId)}`;
+  return <span className={`agent-avatar ${tone}`} title={`@${agentId}`}>{agentInitials(agentId)}</span>;
+}
 
 function buildThreads(events: StoredPlatformEvent[]): ThreadSummary[] {
   const threads = new Map<string, ThreadSummary>(); const activeRuns = new Map<string, { threadId: string; active: boolean }>();
@@ -1141,7 +1204,7 @@ function mergeHistoricalAgents(current: AgentSummary[], previous: AgentSummary[]
 function workspaceName(path: string): string { const parts = path.split(/[\\/]/).filter(Boolean); return (parts.at(-1) ?? path) || "工作目录"; }
 function cleanTitle(title: string): string { return title.replace(/^(?:@[a-z][a-z0-9-]*\s*){1,2}/i, "") || title; }
 function agentName(agents: AgentSummary[], id: string): string { return agents.find((agent) => agent.id === id)?.displayName ?? id; }
-function runtimeLabel(agent?: AgentSummary): string { if (!agent || agent.availability.label === "Historical Agent") return "历史 Agent"; return agent.runtime.kind === "pi" ? `Pi · ${agent.runtime.model}` : `Codex${agent.runtime.model ? ` · ${agent.runtime.model}` : ""}`; }
+function runtimeLabel(agent?: AgentSummary): string { if (!agent || agent.availability.label === "Historical Agent") return "历史 Agent"; return agent.runtime.kind === "pi" ? `Pi · ${agent.runtime.provider} · ${agent.runtime.model}` : `Codex${agent.runtime.model ? ` · ${agent.runtime.model}` : ""}`; }
 function statusLabel(status: ViewRunStatus, access?: AccessMode): string { if (status === "queued") return access === "read-only" ? "并行队列" : "等待会话/写锁"; return { running: "运行中", completed: "已完成", failed: "失败", cancelled: "已取消", interrupted: "已中断" }[status]; }
 function connectionLabel(configured: boolean, connection: string): string { if (!configured) return "等待运行时配置"; if (connection === "connected") return "团队服务已连接"; return connection === "reconnecting" ? "正在重新连接" : "正在连接"; }
 function shortId(id: string): string { return id.split("_")[1]?.slice(0, 8) ?? id.slice(0, 8); }
