@@ -49,6 +49,7 @@ import type {
   AgentDefinition,
   AgentSummary,
   ReviewEscalation,
+  ReviewType,
   RunPurpose,
   StoredPlatformEvent,
   Thread,
@@ -114,6 +115,7 @@ type TranscriptItem =
 interface ReviewState {
   status: "pending" | "approved" | "changes-requested" | "escalated" | "cancelled";
   reviewerAgentId?: string;
+  reviewType?: ReviewType;
   round: number;
   summary?: string;
   findings?: string[];
@@ -902,7 +904,8 @@ function describeEvent(event: StoredPlatformEvent, agents: AgentSummary[]) {
   if (event.type === "run.steered") return { title: `已向 ${agentName(agents, event.agentId)} 插话`, detail: shortId(event.messageId), icon: SendHorizontal, tone: "active" };
   if (event.type === "routing.accepted") return { title: `结构化转交给 ${agentName(agents, event.targetAgentId)}`, detail: "post_message 已接受", icon: ArrowRight, tone: "active" };
   if (event.type === "routing.rejected") return { title: "Agent 路由被拒绝", detail: event.reason, icon: XCircle, tone: "danger" };
-  if (event.type === "review.requested") return { title: `已送审 ${agentName(agents, event.reviewerAgentId)}`, detail: `${agentName(agents, event.authorAgentId)} 的交付 · 第 ${event.round} 轮`, icon: ArrowRight, tone: "active" };
+  if (event.type === "deliverable.declared") return { title: event.kind === "plan" ? `${agentName(agents, event.agentId)} 提交了方案` : `${agentName(agents, event.agentId)} 声明任务完成`, detail: event.summary.slice(0, 120), icon: SendHorizontal, tone: "active" };
+  if (event.type === "review.requested") return { title: `已送${reviewTypeLabel(event.reviewType)} ${agentName(agents, event.reviewerAgentId)}`, detail: `${agentName(agents, event.authorAgentId)} 的交付 · 第 ${event.round} 轮`, icon: ArrowRight, tone: "active" };
   if (event.type === "review.submitted") return { title: event.verdict === "approved" ? `${agentName(agents, event.reviewerAgentId)} 审核通过` : `${agentName(agents, event.reviewerAgentId)} 要求修改`, detail: event.summary, icon: event.verdict === "approved" ? Check : RefreshCw, tone: event.verdict === "approved" ? "success" : "danger" };
   if (event.type === "review.rework") return { title: `已打回 ${agentName(agents, event.authorAgentId)} 返工`, detail: `第 ${event.round} 轮审核未通过`, icon: RefreshCw, tone: "active" };
   if (event.type === "review.resolved") return { title: reviewOutcomeTitle(event.outcome), detail: event.detail ?? `共 ${event.rounds} 轮审核`, icon: event.outcome === "approved" ? Check : XCircle, tone: event.outcome === "approved" ? "success" : event.outcome === "cancelled" ? "neutral" : "danger" };
@@ -925,6 +928,11 @@ function reviewOutcomeTitle(outcome: "approved" | "escalated" | "cancelled"): st
   return "审核未通过，需要人工介入";
 }
 
+/** Verifying a completion claim reads differently from critiquing a plan. */
+function reviewTypeLabel(reviewType: ReviewType | undefined): string {
+  return reviewType === "critique" ? "评审" : "核对";
+}
+
 const REVIEW_ESCALATION_LABELS: Record<ReviewEscalation, string> = {
   "no-reviewer": "没有可用于审核的其他 Agent",
   inconclusive: "审核 Agent 没有给出结论",
@@ -934,11 +942,12 @@ const REVIEW_ESCALATION_LABELS: Record<ReviewEscalation, string> = {
 
 function ReviewCard({ review, agents }: { review: ReviewState; agents: AgentSummary[] }) {
   const reviewer = review.reviewerAgentId ? agentName(agents, review.reviewerAgentId) : "另一个 Agent";
+  const kind = reviewTypeLabel(review.reviewType);
   const title =
-    review.status === "pending" ? `等待 ${reviewer} 审核（第 ${review.round} 轮）`
-    : review.status === "approved" ? `${reviewer} 审核通过`
+    review.status === "pending" ? `等待 ${reviewer} ${kind}（第 ${review.round} 轮）`
+    : review.status === "approved" ? (review.reviewType === "critique" ? `${reviewer} 认可该方案` : `${reviewer} 核对通过`)
     : review.status === "changes-requested" ? `${reviewer} 要求修改（第 ${review.round} 轮）`
-    : review.status === "cancelled" ? "审核已随协作链取消"
+    : review.status === "cancelled" ? `${kind}已随协作链取消`
     : "需要人工介入";
   return (
     <div className={`review-card review-card--${review.status}`}>
@@ -1067,7 +1076,12 @@ function applyReviewEvent(run: Extract<TranscriptItem, { type: "agent" }> | unde
   if (!run) return;
   const current = run.review;
   if (event.type === "review.requested") {
-    run.review = { status: "pending", reviewerAgentId: event.reviewerAgentId, round: event.round };
+    run.review = {
+      status: "pending",
+      reviewerAgentId: event.reviewerAgentId,
+      round: event.round,
+      reviewType: event.reviewType ?? "verify",
+    };
     return;
   }
   if (event.type === "review.submitted") {

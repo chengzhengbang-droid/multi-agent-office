@@ -121,6 +121,7 @@ test("run callback tokens are scoped to one run identity and expire", async () =
       seen.push(input.content);
       return { accepted: true, targets: ["pi"], messageId: "message-1" };
     },
+    declareDeliverable: async () => ({ accepted: true }),
   });
   const request = {
     runId: "run-1",
@@ -168,6 +169,7 @@ console.log(JSON.stringify({ type: "item.completed", item: { id: resumed ? "m2" 
       callbackRegistry: callbacks,
       callbackUrl: "http://127.0.0.1:9/internal/agent-message",
       reviewCallbackUrl: "http://127.0.0.1:9/internal/agent-review",
+      deliverableCallbackUrl: "http://127.0.0.1:9/internal/agent-deliverable",
       mcpCommand: process.execPath,
       mcpArgs: ["fake-mcp.js"],
       availability: { available: true, label: "fixture" },
@@ -217,6 +219,7 @@ setInterval(() => {}, 1000);
       callbackRegistry: new RunCallbackRegistry(),
       callbackUrl: "http://127.0.0.1:9/internal/agent-message",
       reviewCallbackUrl: "http://127.0.0.1:9/internal/agent-review",
+      deliverableCallbackUrl: "http://127.0.0.1:9/internal/agent-deliverable",
       mcpCommand: process.execPath,
       mcpArgs: ["fake-mcp.js"],
       availability: { available: true, label: "fixture" },
@@ -307,5 +310,6 @@ function request(runId: string, events: RuntimeEvent[], signal = new AbortContro
     signal,
     emit: async (event) => { events.push(event); },
     postMessage: async () => ({ accepted: true, targets: [] }),
+    declareDeliverable: async () => ({ accepted: true }),
   };
 }

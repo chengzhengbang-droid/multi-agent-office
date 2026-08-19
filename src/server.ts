@@ -26,7 +26,7 @@ import {
 } from "./core/attachments.js";
 import { RecentContextCompiler } from "./core/context-compiler.js";
 import { JsonlEventStore } from "./core/event-store.js";
-import { MultiAgentPlatform } from "./core/platform.js";
+import { MultiAgentPlatform, type ReviewMode } from "./core/platform.js";
 import type {
   AgentCatalogV1,
   AgentDefinition,
@@ -37,6 +37,7 @@ import type {
 import {
   RunCallbackRegistry,
   type CallbackRequest,
+  type DeliverableCallbackRequest,
   type ReviewCallbackRequest,
 } from "./runtime/callback-registry.js";
 import { PiSharedRuntime } from "./runtime/pi-shared.js";
@@ -79,6 +80,7 @@ const runtimeFactoryOptions: RuntimeFactoryOptions = {
   callbackRegistry,
   callbackUrl: `http://127.0.0.1:${port}/internal/agent-message`,
   reviewCallbackUrl: `http://127.0.0.1:${port}/internal/agent-review`,
+  deliverableCallbackUrl: `http://127.0.0.1:${port}/internal/agent-deliverable`,
   mcpCommand: process.execPath,
   mcpArgs: isDev
     ? ["--import", "tsx", resolve(appRoot, "src", "mcp", "collaboration-server.ts")]
@@ -96,7 +98,7 @@ const platform = new MultiAgentPlatform({
   maxMentionTargets: 2,
   maxPingPongHops: 4,
   maxParallelReadRuns: Number(process.env.MAO_MAX_PARALLEL_READ_RUNS ?? 4),
-  reviewMode: (process.env.MAO_REVIEW_GATE ?? "on") === "off" ? "off" : "required",
+  reviewMode: parseReviewMode(process.env.MAO_REVIEW_GATE),
   maxReviewRounds: Number(process.env.MAO_MAX_REVIEW_ROUNDS ?? 2),
 });
 
@@ -135,6 +137,24 @@ const server = createServer(async (request, response) => {
         const result = await callbackRegistry.invokeReview(
           token,
           parseReviewCallbackRequest(await readJson(request)),
+        );
+        sendJson(response, 200, result);
+      } catch (error) {
+        sendJson(response, 403, { error: errorMessage(error) });
+      }
+      return;
+    }
+
+    if (url.pathname === "/internal/agent-deliverable" && request.method === "POST") {
+      const token = bearerToken(request);
+      if (!token) {
+        sendJson(response, 401, { error: "Missing callback token" });
+        return;
+      }
+      try {
+        const result = await callbackRegistry.invokeDeliverable(
+          token,
+          parseDeliverableCallbackRequest(await readJson(request)),
         );
         sendJson(response, 200, result);
       } catch (error) {
@@ -596,6 +616,41 @@ function parseReviewCallbackRequest(body: Record<string, unknown>): ReviewCallba
     summary: body.summary as string,
     ...(findings && findings.length > 0 ? { findings } : {}),
   };
+}
+
+function parseDeliverableCallbackRequest(
+  body: Record<string, unknown>,
+): DeliverableCallbackRequest {
+  for (const key of ["runId", "threadId", "agentId", "summary"] as const) {
+    if (typeof body[key] !== "string" || !body[key]) {
+      throw new Error(`Invalid deliverable callback field: ${key}`);
+    }
+  }
+  if (body.kind !== "completion" && body.kind !== "plan") {
+    throw new Error("Invalid deliverable callback field: kind");
+  }
+  const evidence = Array.isArray(body.evidence)
+    ? body.evidence.filter((item): item is string => typeof item === "string")
+    : undefined;
+  return {
+    runId: body.runId as string,
+    threadId: body.threadId as string,
+    agentId: body.agentId as string,
+    kind: body.kind,
+    summary: body.summary as string,
+    ...(evidence && evidence.length > 0 ? { evidence } : {}),
+  };
+}
+
+/**
+ * "smart" is the default: an Agent's own judgment about whether it produced a
+ * deliverable opens the gate, so conversation is not reviewed. "on"/"required"
+ * keeps the older behaviour of gating every user task.
+ */
+function parseReviewMode(value: string | undefined): ReviewMode {
+  if (value === "off") return "off";
+  if (value === "on" || value === "required") return "required";
+  return "smart";
 }
 
 function bearerToken(request: IncomingMessage): string | undefined {

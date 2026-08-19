@@ -75,7 +75,7 @@ export interface CausalMetadata {
 export type ThreadMessageKind =
   | "chat"
   | "collaboration"
-  /** A completed deliverable submitted to a peer for the mandatory review gate. */
+  /** A declared deliverable submitted to a peer for verification or critique. */
   | "review-request"
   /** A reviewer's verdict handed back to the Agent that produced the work. */
   | "review-feedback";
@@ -113,6 +113,28 @@ export interface Thread {
 
 /** Why a run exists: original/rework work, or the review of such work. */
 export type RunPurpose = "task" | "review";
+
+/**
+ * What a review round is for. "verify" checks a completion claim against the
+ * artifacts it claims to have produced; "critique" pressure-tests a plan before
+ * anyone executes it. Absent in pre-smart-gate event logs, where every review
+ * was a completion check — replay treats a missing value as "verify".
+ */
+export type ReviewType = "verify" | "critique";
+
+/** What an Agent declared it produced, which is what arms the review gate. */
+export type DeliverableKind = "completion" | "plan";
+
+/**
+ * An Agent's own claim that its run produced something worth reviewing. The
+ * claim is not trusted on its own: it opens the gate, and a peer checks it.
+ */
+export interface DeliverableDeclaration {
+  kind: DeliverableKind;
+  summary: string;
+  /** How a reviewer can check the claim: files touched, commands to run. */
+  evidence?: string[];
+}
 
 export type ReviewVerdict = "approved" | "changes-requested";
 
@@ -163,6 +185,8 @@ export interface AgentRun {
   taskRunId?: Id;
   /** Review runs: this round (1-based). Task runs: rework rounds done (0 = first attempt). */
   reviewRound?: number;
+  /** What this review round judges. Set on review runs and on rework runs. */
+  reviewType?: ReviewType;
 }
 
 export type PlatformEventPayload =
@@ -281,6 +305,16 @@ export type PlatformEventPayload =
       messageId: Id;
     }
   | {
+      /** An Agent declared its run produced a deliverable. Arms the review gate. */
+      type: "deliverable.declared";
+      runId: Id;
+      threadId: Id;
+      agentId: Id;
+      kind: DeliverableKind;
+      summary: string;
+      evidence?: string[];
+    }
+  | {
       type: "review.requested";
       threadId: Id;
       taskRunId: Id;
@@ -289,6 +323,8 @@ export type PlatformEventPayload =
       reviewerAgentId: Id;
       round: number;
       messageId: Id;
+      /** Absent in pre-smart-gate logs; replay treats that as "verify". */
+      reviewType?: ReviewType;
     }
   | {
       type: "review.submitted";
@@ -318,6 +354,7 @@ export type PlatformEventPayload =
       rounds: number;
       escalation?: ReviewEscalation;
       detail?: string;
+      reviewType?: ReviewType;
     }
   | {
       type: "routing.accepted";

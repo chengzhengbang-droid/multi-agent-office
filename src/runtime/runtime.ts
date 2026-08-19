@@ -1,9 +1,11 @@
 import type {
   AgentDefinition,
   CompiledContext,
+  DeliverableDeclaration,
   Id,
   MessageAttachment,
   ReviewSubmission,
+  ReviewType,
   RuntimeAvailability,
   ThreadMessage,
 } from "../core/types.js";
@@ -63,6 +65,13 @@ export interface SubmitReviewResult {
   reason?: string;
 }
 
+export type DeclareDeliverableInput = DeliverableDeclaration;
+
+export interface DeclareDeliverableResult {
+  accepted: boolean;
+  reason?: string;
+}
+
 /** What a review run is reviewing. Present only on review runs. */
 export interface ReviewAssignment {
   taskRunId: Id;
@@ -70,6 +79,10 @@ export interface ReviewAssignment {
   /** This review round, 1-based. */
   round: number;
   maxRounds: number;
+  /** Verifying a completion claim, or critiquing a plan. */
+  reviewType: ReviewType;
+  /** The author's own claim, for a reviewer to check rather than trust. */
+  declaration?: DeliverableDeclaration;
 }
 
 /** An image attachment already read off disk, ready to hand to a model. */
@@ -100,6 +113,12 @@ export interface RuntimeRequest {
   postMessage(input: PostAgentMessageInput): Promise<PostAgentMessageResult>;
   /** Present only alongside reviewOf. */
   submitReview?(input: SubmitReviewInput): Promise<SubmitReviewResult>;
+  /**
+   * The Agent's own judgment that this run produced something reviewable. What
+   * opens the review gate in "smart" mode — casual conversation declares
+   * nothing and is reviewed by nobody.
+   */
+  declareDeliverable(input: DeclareDeliverableInput): Promise<DeclareDeliverableResult>;
 }
 
 export interface RuntimeResult {

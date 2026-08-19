@@ -3,12 +3,14 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import * as z from "zod/v4";
 import type {
+  DeclareDeliverableResult,
   PostAgentMessageResult,
   SubmitReviewResult,
 } from "../runtime/runtime.js";
 
 const callbackUrl = requiredEnv("MAO_CALLBACK_URL");
 const reviewCallbackUrl = requiredEnv("MAO_REVIEW_CALLBACK_URL");
+const deliverableCallbackUrl = requiredEnv("MAO_DELIVERABLE_CALLBACK_URL");
 const callbackToken = requiredEnv("MAO_CALLBACK_TOKEN");
 const runId = requiredEnv("MAO_CALLBACK_RUN_ID");
 const threadId = requiredEnv("MAO_CALLBACK_THREAD_ID");
@@ -126,6 +128,78 @@ server.registerTool(
     };
   },
 );
+
+// An Agent decides for itself whether its output is a deliverable. Declaring
+// one is what opens the review gate; the platform rejects declarations that do
+// not belong to a live task run, so this cannot be used to self-approve.
+for (const tool of [
+  {
+    name: "complete_task",
+    kind: "completion" as const,
+    description:
+      "Call when you have FINISHED work a human asked for and produced a real deliverable. Include evidence a reviewer can check: files you changed, commands you ran, how to verify it. This submits your work to a peer for verification — your own word that it is done is not enough. Do not call it for conversation, questions, or explanations.",
+    summaryHint: "What you delivered, in your own words",
+    evidenceHint:
+      "How a reviewer can check the claim: files changed, commands run, tests to execute.",
+    accepted: "Completed work submitted for peer verification.",
+  },
+  {
+    name: "submit_plan",
+    kind: "plan" as const,
+    description:
+      "Call when your output is a plan, design, or proposal that should be pressure-tested by a peer before anyone executes it. A teammate will critique it and you get one revision round. Do not call it for conversation or for work already finished — use complete_task for that.",
+    summaryHint: "The plan you are proposing, in your own words",
+    evidenceHint: "Assumptions, constraints, or open questions a reviewer should weigh.",
+    accepted: "Plan submitted for peer critique.",
+  },
+]) {
+  server.registerTool(
+    tool.name,
+    {
+      description: tool.description,
+      inputSchema: {
+        summary: z.string().min(1).max(20_000).describe(tool.summaryHint),
+        evidence: z.array(z.string()).optional().describe(tool.evidenceHint),
+      },
+    },
+    async ({ summary, evidence }) => {
+      const response = await fetch(deliverableCallbackUrl, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${callbackToken}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          runId,
+          threadId,
+          agentId,
+          kind: tool.kind,
+          summary,
+          ...(evidence ? { evidence } : {}),
+        }),
+      });
+      const result = (await response.json()) as DeclareDeliverableResult & { error?: string };
+      if (!response.ok) {
+        return {
+          isError: true,
+          content: [{ type: "text", text: result.error ?? "Deliverable callback failed" }],
+        };
+      }
+      return {
+        isError: !result.accepted,
+        content: [
+          {
+            type: "text",
+            text: result.accepted
+              ? tool.accepted
+              : `Declaration rejected: ${result.reason ?? "unknown reason"}`,
+          },
+        ],
+        structuredContent: { ...result },
+      };
+    },
+  );
+}
 
 await server.connect(new StdioServerTransport());
 

@@ -1,5 +1,7 @@
 import { randomBytes } from "node:crypto";
 import type {
+  DeclareDeliverableInput,
+  DeclareDeliverableResult,
   PostAgentMessageInput,
   PostAgentMessageResult,
   SubmitReviewInput,
@@ -13,6 +15,7 @@ interface CallbackBinding {
   postMessage(input: PostAgentMessageInput): Promise<PostAgentMessageResult>;
   /** Present only when the bound run is reviewing another Agent's work. */
   submitReview?(input: SubmitReviewInput): Promise<SubmitReviewResult>;
+  declareDeliverable(input: DeclareDeliverableInput): Promise<DeclareDeliverableResult>;
 }
 
 export interface CallbackRequest extends PostAgentMessageInput {
@@ -22,6 +25,12 @@ export interface CallbackRequest extends PostAgentMessageInput {
 }
 
 export interface ReviewCallbackRequest extends SubmitReviewInput {
+  runId: string;
+  threadId: string;
+  agentId: string;
+}
+
+export interface DeliverableCallbackRequest extends DeclareDeliverableInput {
   runId: string;
   threadId: string;
   agentId: string;
@@ -67,6 +76,18 @@ export class RunCallbackRegistry {
       verdict: request.verdict,
       summary: request.summary,
       ...(request.findings ? { findings: request.findings } : {}),
+    });
+  }
+
+  public async invokeDeliverable(
+    token: string,
+    request: DeliverableCallbackRequest,
+  ): Promise<DeclareDeliverableResult> {
+    const binding = this.resolve(token, request);
+    return binding.declareDeliverable({
+      kind: request.kind,
+      summary: request.summary,
+      ...(request.evidence ? { evidence: request.evidence } : {}),
     });
   }
 
