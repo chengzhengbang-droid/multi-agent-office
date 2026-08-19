@@ -19,7 +19,12 @@ const platform = new MultiAgentPlatform({
   runtimes,
   eventStore: new JsonlEventStore(resolve(process.cwd(), ".data", "events.jsonl")),
   contextCompiler: new RecentContextCompiler(),
-  reviewMode: (process.env.MAO_REVIEW_GATE ?? "on") === "off" ? "off" : "required",
+  reviewMode:
+    process.env.MAO_REVIEW_GATE === "off"
+      ? "off"
+      : process.env.MAO_REVIEW_GATE === "on" || process.env.MAO_REVIEW_GATE === "required"
+        ? "required"
+        : "smart",
   maxReviewRounds: Number(process.env.MAO_MAX_REVIEW_ROUNDS ?? 2),
 });
 

@@ -24,6 +24,7 @@ export interface CodexRuntimeAdapterOptions {
   callbackRegistry: RunCallbackRegistry;
   callbackUrl: string;
   reviewCallbackUrl: string;
+  deliverableCallbackUrl: string;
   mcpCommand: string;
   mcpArgs: string[];
   availability?: RuntimeAvailability;
@@ -51,12 +52,14 @@ export class CodexRuntimeAdapter implements AgentRuntime {
       threadId: request.threadId,
       agentId: request.agent.id,
       postMessage: request.postMessage,
+      declareDeliverable: request.declareDeliverable,
       ...(request.submitReview ? { submitReview: request.submitReview } : {}),
     });
     const args = this.buildArgs(cwd, resumeSessionId);
     const environment = codexEnvironment({
       callbackUrl: this.options.callbackUrl,
       reviewCallbackUrl: this.options.reviewCallbackUrl,
+      deliverableCallbackUrl: this.options.deliverableCallbackUrl,
       callbackToken,
       runId: request.runId,
       threadId: request.threadId,
@@ -301,6 +304,7 @@ function accessSandbox(accessMode: AccessMode): "read-only" | "workspace-write" 
 function codexEnvironment(input: {
   callbackUrl: string;
   reviewCallbackUrl: string;
+  deliverableCallbackUrl: string;
   callbackToken: string;
   runId: string;
   threadId: string;
@@ -313,6 +317,7 @@ function codexEnvironment(input: {
     ...(process.versions.electron ? { ELECTRON_RUN_AS_NODE: "1" } : {}),
     MAO_CALLBACK_URL: input.callbackUrl,
     MAO_REVIEW_CALLBACK_URL: input.reviewCallbackUrl,
+    MAO_DELIVERABLE_CALLBACK_URL: input.deliverableCallbackUrl,
     MAO_CALLBACK_TOKEN: input.callbackToken,
     MAO_CALLBACK_RUN_ID: input.runId,
     MAO_CALLBACK_THREAD_ID: input.threadId,
