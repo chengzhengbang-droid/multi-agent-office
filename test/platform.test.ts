@@ -499,6 +499,273 @@ test("a missing attachment file is skipped instead of failing the run", async ()
   assert.equal(countEvents(events, "run.completed"), 1);
 });
 
+// ---------------------------------------------------------------------------
+// The smart gate. "required" reviews every user task, which made a greeting
+// cost a full review round-trip. "smart" reviews what a run actually produced:
+// what its Agent declared, or what it quietly wrote to the workspace.
+// ---------------------------------------------------------------------------
+
+test("smart gate leaves plain conversation unreviewed", async () => {
+  const platform = createSmartPlatform([agent("codex"), agent("pi")], {
+    codex: async (request) => emitOutput(request, "你好，有什么可以帮你的？"),
+  });
+
+  await platform.postUserMessage({ content: "@codex 你好" });
+  const events = await platform.getEvents();
+
+  assert.equal(countEvents(events, "review.requested"), 0);
+  assert.equal(countEvents(events, "review.resolved"), 0);
+  assert.equal(countEvents(events, "run.queued"), 1);
+  assert.equal(single(events, "run.completed").output, "你好，有什么可以帮你的？");
+});
+
+test("declaring a completion opens a verify review carrying the evidence", async () => {
+  const order: string[] = [];
+  const platform = createSmartPlatform([agent("codex"), agent("pi")], {
+    codex: async (request) => {
+      order.push("codex");
+      await request.declareDeliverable({
+        kind: "completion",
+        summary: "修好了解析器",
+        evidence: ["src/parser.ts", "pnpm test"],
+      });
+      return emitOutput(request, "已修复");
+    },
+    pi: approving(order),
+  });
+
+  await platform.postUserMessage({ content: "@codex 修一下解析器" });
+  const events = await platform.getEvents();
+
+  assert.deepEqual(order, ["codex", "pi"]);
+  const declared = single(events, "deliverable.declared");
+  assert.equal(declared.kind, "completion");
+  assert.deepEqual(declared.evidence, ["src/parser.ts", "pnpm test"]);
+  const requested = single(events, "review.requested");
+  assert.equal(requested.reviewType, "verify");
+  assert.equal(requested.reviewerAgentId, "pi");
+  // The reviewer is handed the claim and the evidence, not just the output.
+  const brief = (await platform.getThreadMessages(requested.threadId)).find(
+    (message) => message.id === requested.messageId,
+  );
+  assert.match(brief?.content ?? "", /修好了解析器/);
+  assert.match(brief?.content ?? "", /src\/parser\.ts/);
+  assert.match(brief?.content ?? "", /not evidence that it is true/);
+  assert.equal(single(events, "review.resolved").outcome, "approved");
+});
+
+test("declaring a plan opens a critique review instead of a verification", async () => {
+  const platform = createSmartPlatform([agent("codex"), agent("pi")], {
+    codex: async (request) => {
+      await request.declareDeliverable({ kind: "plan", summary: "分三步重构" });
+      return emitOutput(request, "方案如上");
+    },
+    pi: approving([]),
+  });
+
+  await platform.postUserMessage({ content: "@codex 给个重构方案" });
+  const events = await platform.getEvents();
+
+  const requested = single(events, "review.requested");
+  assert.equal(requested.reviewType, "critique");
+  const brief = (await platform.getThreadMessages(requested.threadId)).find(
+    (message) => message.id === requested.messageId,
+  );
+  assert.match(brief?.content ?? "", /This is a plan, not finished work/);
+  assert.equal(single(events, "review.resolved").reviewType, "critique");
+});
+
+test("a critique that requests changes reworks the plan as a critique round", async () => {
+  const verdicts: ReviewVerdict[] = ["changes-requested", "approved"];
+  const platform = createSmartPlatform([agent("codex"), agent("pi")], {
+    codex: async (request) => {
+      await request.declareDeliverable({ kind: "plan", summary: "分三步重构" });
+      return emitOutput(request, "方案");
+    },
+    pi: async (request) => {
+      await request.submitReview?.({
+        verdict: verdicts.shift() ?? "approved",
+        summary: "第二步风险没交代",
+        findings: ["补上回滚方案"],
+      });
+      return emitOutput(request, "审毕");
+    },
+  });
+
+  await platform.postUserMessage({ content: "@codex 给个重构方案" });
+  const events = await platform.getEvents();
+
+  const requests = events.filter((event) => event.type === "review.requested");
+  assert.equal(requests.length, 2);
+  // The rework round keeps critiquing a plan rather than switching to verify.
+  assert.deepEqual(
+    requests.map((event) => (event.type === "review.requested" ? event.reviewType : undefined)),
+    ["critique", "critique"],
+  );
+  const feedback = (await platform.getThreadMessages(requests[0]!.threadId)).find(
+    (message) => message.kind === "review-feedback",
+  );
+  assert.match(feedback?.content ?? "", /Revise your plan/);
+  assert.equal(single(events, "review.resolved").outcome, "approved");
+});
+
+test("writing files without declaring anything is still reviewed", async () => {
+  const platform = createSmartPlatform([agent("codex", "workspace-write"), agent("pi")], {
+    codex: async (request) => {
+      await request.emit({ type: "tool_start", toolName: "edit", toolCallId: "call-1" });
+      await request.emit({ type: "tool_end", toolName: "edit", toolCallId: "call-1", isError: false });
+      return emitOutput(request, "顺手改了两行");
+    },
+    pi: approving([]),
+  });
+
+  await platform.postUserMessage({ content: "@codex 看一下这个文件" });
+  const events = await platform.getEvents();
+
+  assert.equal(countEvents(events, "deliverable.declared"), 0);
+  assert.equal(single(events, "review.requested").reviewType, "verify");
+  assert.equal(single(events, "review.resolved").outcome, "approved");
+});
+
+test("reading with shell tools does not arm the gate", async () => {
+  const platform = createSmartPlatform([agent("codex", "workspace-write"), agent("pi")], {
+    codex: async (request) => {
+      await request.emit({ type: "tool_start", toolName: "bash", toolCallId: "call-1", args: "ls" });
+      await request.emit({ type: "tool_end", toolName: "bash", toolCallId: "call-1", isError: false });
+      return emitOutput(request, "目录里有三个文件");
+    },
+  });
+
+  await platform.postUserMessage({ content: "@codex 这个目录里有什么" });
+  const events = await platform.getEvents();
+
+  assert.equal(countEvents(events, "review.requested"), 0);
+});
+
+test("a read-only run cannot arm the write-effect backstop", async () => {
+  const platform = createSmartPlatform([agent("codex", "read-only"), agent("pi")], {
+    codex: async (request) => {
+      await request.emit({ type: "tool_start", toolName: "edit", toolCallId: "call-1" });
+      return emitOutput(request, "我没有写权限");
+    },
+  });
+
+  await platform.postUserMessage({ content: "@codex 看看代码" });
+  const events = await platform.getEvents();
+
+  assert.equal(countEvents(events, "review.requested"), 0);
+});
+
+test("a reviewer cannot declare a deliverable of its own", async () => {
+  const results: Array<{ accepted: boolean; reason?: string }> = [];
+  const platform = createSmartPlatform([agent("codex"), agent("pi")], {
+    codex: async (request) => {
+      await request.declareDeliverable({ kind: "completion", summary: "做完了" });
+      return emitOutput(request, "成品");
+    },
+    pi: async (request) => {
+      results.push(await request.declareDeliverable({ kind: "completion", summary: "我也交付" }));
+      await request.submitReview?.({ verdict: "approved", summary: "没问题" });
+      return emitOutput(request, "审毕");
+    },
+  });
+
+  await platform.postUserMessage({ content: "@codex 干活" });
+  const events = await platform.getEvents();
+
+  assert.equal(results.length, 1);
+  assert.equal(results[0]?.accepted, false);
+  assert.match(results[0]?.reason ?? "", /does not declare one/);
+  // Only the author's declaration is on the log; the review round is unchanged.
+  assert.equal(countEvents(events, "deliverable.declared"), 1);
+  assert.equal(single(events, "review.requested").reviewType, "verify");
+});
+
+test("a declaration cannot switch kind once the run has made one", async () => {
+  const results: Array<{ accepted: boolean; reason?: string }> = [];
+  const platform = createSmartPlatform([agent("codex"), agent("pi")], {
+    codex: async (request) => {
+      results.push(await request.declareDeliverable({ kind: "completion", summary: "做完了" }));
+      results.push(await request.declareDeliverable({ kind: "plan", summary: "其实是个方案" }));
+      results.push(await request.declareDeliverable({ kind: "completion", summary: "改口径" }));
+      return emitOutput(request, "成品");
+    },
+    pi: approving([]),
+  });
+
+  await platform.postUserMessage({ content: "@codex 干活" });
+  const events = await platform.getEvents();
+
+  assert.deepEqual(results.map((result) => result.accepted), [true, false, true]);
+  assert.match(results[1]?.reason ?? "", /already declared a completion/);
+  assert.equal(single(events, "review.requested").reviewType, "verify");
+});
+
+test("required mode still reviews a task that declares nothing", async () => {
+  const platform = createReviewPlatform([agent("codex"), agent("pi")], {
+    codex: async (request) => emitOutput(request, "你好"),
+    pi: approving([]),
+  });
+
+  await platform.postUserMessage({ content: "@codex 你好" });
+  const events = await platform.getEvents();
+
+  assert.equal(single(events, "review.requested").reviewType, "verify");
+  assert.equal(single(events, "review.resolved").outcome, "approved");
+});
+
+test("a smart-gate event log replays its declarations and review types", async () => {
+  const store = new InMemoryEventStore();
+  const first = createSmartPlatform([agent("codex"), agent("pi")], {
+    codex: async (request) => {
+      await request.declareDeliverable({ kind: "plan", summary: "分三步重构" });
+      return emitOutput(request, "方案");
+    },
+    pi: approving([]),
+  }, { eventStore: store });
+  await first.postUserMessage({ content: "@codex 给个方案" });
+
+  const replayed = createSmartPlatform([agent("codex"), agent("pi")], {
+    codex: async (request) => emitOutput(request, "不该再跑"),
+  }, { eventStore: store });
+  await replayed.initialize();
+  const events = await replayed.getEvents();
+
+  assert.equal(countEvents(events, "review.requested"), 1);
+  assert.equal(single(events, "review.requested").reviewType, "critique");
+  assert.equal(single(events, "review.resolved").outcome, "approved");
+});
+
+test("streamed deltas are coalesced without losing text or reordering events", async () => {
+  const platform = createPlatform([agent("pi")], new Map([["pi", runtime("pi", async (request) => {
+    for (const piece of ["一", "二", "三", "四", "五"]) {
+      await request.emit({ type: "text_delta", text: piece });
+    }
+    await request.emit({ type: "tool_start", toolName: "read", toolCallId: "call-1" });
+    for (const piece of ["六", "七"]) {
+      await request.emit({ type: "text_delta", text: piece });
+    }
+    return { output: "一二三四五六七" };
+  })]]), "pi");
+
+  await platform.postUserMessage({ content: "@pi 数数" });
+  const events = await platform.getEvents();
+
+  const deltas = events.filter((event) => event.type === "run.delta");
+  // Seven tokens, but the log holds one event per flush boundary, not per token.
+  assert.ok(deltas.length < 7, `expected coalesced deltas, got ${deltas.length}`);
+  assert.equal(
+    deltas.map((event) => (event.type === "run.delta" ? event.text : "")).join(""),
+    "一二三四五六七",
+  );
+  // The tool call must not overtake the text that preceded it.
+  const toolIndex = events.findIndex((event) => event.type === "run.tool");
+  const firstDeltaIndex = events.findIndex((event) => event.type === "run.delta");
+  const lastDeltaIndex = events.map((event) => event.type).lastIndexOf("run.delta");
+  assert.ok(firstDeltaIndex < toolIndex, "text before the tool call must be flushed first");
+  assert.ok(lastDeltaIndex > toolIndex, "text after the tool call must follow it");
+});
+
 function createPlatform(
   agents: AgentDefinition[],
   runtimes: Map<string, AgentRuntime>,
@@ -1058,6 +1325,15 @@ function createReviewPlatform(
     reviewMode: "required",
     ...platformOptions,
   });
+}
+
+/** A platform with the smart gate on: review follows what a run produced. */
+function createSmartPlatform(
+  agents: AgentDefinition[],
+  handlers: Record<string, (request: RuntimeRequest) => Promise<RuntimeResult>>,
+  options: ReviewPlatformOptions = {},
+): MultiAgentPlatform {
+  return createReviewPlatform(agents, handlers, { ...options, reviewMode: "smart" });
 }
 
 /** A reviewer that always approves, recording the order it ran in. */

@@ -131,6 +131,67 @@ export class PiRuntimeAdapter implements AgentRuntime {
       },
     });
 
+    // Declaring a deliverable is how an Agent opens the review gate on itself.
+    // Declared on every run so a resumed session keeps a stable tool surface;
+    // the platform decides whether a declaration is admissible.
+    const declare = async (
+      kind: "completion" | "plan",
+      summary: string,
+      evidence: string[] | undefined,
+      verb: string,
+    ) => {
+      const result = await request.declareDeliverable({
+        kind,
+        summary,
+        ...(evidence ? { evidence } : {}),
+      });
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: result.accepted
+              ? `${verb} submitted for peer review. A different Agent will check it before it counts as delivered.`
+              : `Declaration rejected: ${result.reason ?? "unknown reason"}`,
+          },
+        ],
+        details: result,
+      };
+    };
+
+    const completeTaskTool = defineTool({
+      name: "complete_task",
+      label: "Declare the task finished and submit it for verification",
+      description:
+        "Call when you have FINISHED work a human asked for and produced a real deliverable. Include evidence a reviewer can check: files you changed, commands you ran, how to verify it. This submits your work to a peer for verification — your own word that it is done is not enough. Do not call it for conversation, questions, or explanations.",
+      parameters: Type.Object({
+        summary: Type.String({ description: "What you delivered, in your own words" }),
+        evidence: Type.Optional(
+          Type.Array(Type.String(), {
+            description:
+              "How a reviewer can check the claim: files changed, commands run, tests to execute.",
+          }),
+        ),
+      }),
+      execute: async (_toolCallId, params) =>
+        declare("completion", params.summary, params.evidence, "Completed work"),
+    });
+
+    const submitPlanTool = defineTool({
+      name: "submit_plan",
+      label: "Submit a plan for peer critique",
+      description:
+        "Call when your output is a plan, design, or proposal that should be pressure-tested by a peer before anyone executes it. A teammate will critique it and you get one revision round. Do not call it for conversation or for work already finished — use complete_task for that.",
+      parameters: Type.Object({
+        summary: Type.String({ description: "The plan you are proposing, in your own words" }),
+        evidence: Type.Optional(
+          Type.Array(Type.String(), {
+            description: "Assumptions, constraints, or open questions a reviewer should weigh.",
+          }),
+        ),
+      }),
+      execute: async (_toolCallId, params) =>
+        declare("plan", params.summary, params.evidence, "Plan"),
+    });
     const { loader: sharedLoader, settingsManager } =
       await this.options.shared.resourcesFor(cwd);
     const loader = new RequestResourceLoader(sharedLoader, buildSystemPrompt(request));
@@ -168,7 +229,7 @@ export class PiRuntimeAdapter implements AgentRuntime {
       sessionManager: manager,
       settingsManager,
       modelRuntime,
-      customTools: [postMessageTool, submitReviewTool],
+      customTools: [postMessageTool, submitReviewTool, completeTaskTool, submitPlanTool],
       excludeTools: piExcludedTools(request.agent.accessMode),
       ...(selectedModel.model ? { model: selectedModel.model } : {}),
       ...(selectedModel.thinkingLevel
@@ -559,7 +620,11 @@ export function buildSystemPrompt(request: RuntimeRequest): string {
     "",
     "Peer collaboration protocol:",
     "- You are a peer. There is no boss Agent and no fixed handoff pipeline.",
-    "- Work a human asks for is reviewed by a different peer before it counts as delivered. The reviewer is a peer, not a supervisor.",
+    "- Judge for yourself what your output is. Conversation, questions, and explanations are just answers: declare nothing, and nobody reviews them.",
+    "- Finished work a human asked for is a deliverable: call complete_task with evidence a reviewer can check (files changed, commands run, how to verify).",
+    "- A plan, design, or proposal is a deliverable too: call submit_plan so a peer pressure-tests it before anyone builds it.",
+    "- What you declare is reviewed by a different peer before it counts as delivered. The reviewer is a peer, not a supervisor.",
+    "- Your own word that the work is done does not settle it. Neither does a teammate's: when you review, check the artifacts.",
     "- Accept work you can own; challenge weak assumptions with evidence.",
     "- If a teammate should act, call post_message and put their @handle at the start of a line.",
     "- A post_message without a recognized teammate mention is visible to the human but wakes nobody.",
@@ -574,11 +639,28 @@ export function buildSystemPrompt(request: RuntimeRequest): string {
 }
 
 function reviewBrief(assignment: ReviewAssignment): string[] {
+  const critique = assignment.reviewType === "critique";
+  const header = critique
+    ? `Critique assignment — you are reviewing @${assignment.authorAgentId}'s plan, round ${assignment.round} of ${assignment.maxRounds}:`
+    : `Verification assignment — you are checking @${assignment.authorAgentId}'s completed work, round ${assignment.round} of ${assignment.maxRounds}:`;
+  // A plan is judged on its reasoning; finished work is judged on artifacts.
+  // Reading the author's summary and agreeing with it is not verification.
+  const body = critique
+    ? [
+        "- Pressure-test the plan against the human's original task before anyone executes it.",
+        "- Say what is sound, what is risky or missing, and what concretely to change.",
+        "- approved means it is ready to execute; changes-requested returns concrete suggestions.",
+      ]
+    : [
+        "- The author claims this is done. Check the claim; do not take it as evidence.",
+        "- Verify against the artifacts: read the files it says it changed, run the verification it states.",
+        "- Approve only what you actually verified. Say what you could not check with the access you have.",
+        "- Do not redo the work yourself. Say concretely what must change.",
+      ];
   return [
     "",
-    `Review assignment — you are reviewing @${assignment.authorAgentId}'s work, round ${assignment.round} of ${assignment.maxRounds}:`,
-    "- Judge the deliverable in the incoming message against the human's original task.",
-    "- Do not redo the work yourself. Say concretely what must change.",
+    header,
+    ...body,
     "- Finish by calling submit_review exactly once, approved or changes-requested.",
     "- changes-requested requires at least one concrete finding.",
     "- Ending without submit_review is not an approval: the task is escalated to the human.",

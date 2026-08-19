@@ -9,18 +9,22 @@ import type {
   AgentDefinition,
   AgentRun,
   CausalMetadata,
+  DeliverableDeclaration,
   Id,
   MessageAttachment,
   PlatformEventPayload,
   ReviewEscalation,
   ReviewOutcome,
   ReviewSubmission,
+  ReviewType,
   StoredPlatformEvent,
   Thread,
   ThreadMessage,
 } from "./types.js";
 import type {
   AgentRuntime,
+  DeclareDeliverableInput,
+  DeclareDeliverableResult,
   PostAgentMessageInput,
   PostAgentMessageResult,
   ReviewAssignment,
@@ -42,14 +46,25 @@ export interface MultiAgentPlatformOptions {
   maxPingPongHops?: number;
   maxParallelReadRuns?: number;
   /**
-   * "required" gates every user task behind a peer review. "off" restores the
-   * pre-review behaviour where a completed run is the final deliverable.
+   * "smart" reviews what an Agent declares as a deliverable (or what quietly
+   * wrote files), leaving conversation ungated. "required" gates every user
+   * task. "off" restores the pre-review behaviour where a completed run is the
+   * final deliverable.
    */
   reviewMode?: ReviewMode;
   maxReviewRounds?: number;
 }
 
-export type ReviewMode = "required" | "off";
+export type ReviewMode = "smart" | "required" | "off";
+
+/**
+ * Tools whose use means the run changed the workspace. A run that wrote files
+ * is reviewed whether or not its Agent declared anything: "I'm done" is a
+ * claim, and an undeclared edit is the case the gate exists for. Shell tools
+ * are deliberately absent — a reviewer reading files with `bash` would
+ * otherwise arm the gate on its own review run.
+ */
+const WRITE_EFFECT_TOOLS = new Set(["file_change", "edit", "write"]);
 
 export interface PostUserMessageInput {
   content: string;
@@ -84,7 +99,25 @@ interface ActiveRun {
   runtime: AgentRuntime;
   workspaceKey: string;
   context: Awaited<ReturnType<ContextCompiler["compile"]>>;
+  /** Streamed text/thinking awaiting a coalesced flush. See flushDeltas. */
+  deltas: DeltaBuffer;
 }
+
+/**
+ * Token deltas arrive one per token; each recorded event is an awaited append
+ * to the JSONL log plus an SSE frame. Buffering them into ~one event per
+ * DELTA_FLUSH_MS keeps the log and the socket sane without changing what a
+ * client renders, since App.tsx appends chunks of any size.
+ */
+interface DeltaBuffer {
+  text: string;
+  thinking: string;
+  timer: ReturnType<typeof setTimeout> | undefined;
+  /** Serializes flushes so a timer flush cannot interleave with an event flush. */
+  tail: Promise<void>;
+}
+
+const DELTA_FLUSH_MS = 120;
 
 interface ChainWaiter {
   resolve(): void;
@@ -116,6 +149,14 @@ export class MultiAgentPlatform {
   private readonly resolvedTaskRuns = new Set<Id>();
   /** reviewRunId -> the Agent whose work that review judges. */
   private readonly reviewAuthors = new Map<Id, Id>();
+  /** runId -> what that run's Agent declared it produced. */
+  private readonly runDeliverables = new Map<Id, DeliverableDeclaration>();
+  /** runIds that changed the workspace, declared or not. */
+  private readonly runWriteEffects = new Set<Id>();
+  /** taskRunId -> what its review rounds judge, stable across rework. */
+  private readonly taskReviewTypes = new Map<Id, ReviewType>();
+  /** reviewRunId -> the claim that review is checking, if the author made one. */
+  private readonly reviewDeclarations = new Map<Id, DeliverableDeclaration>();
   private readonly maxA2ADepth: number;
   private readonly maxAgentRunsPerChain: number;
   private readonly maxMentionTargets: number;
@@ -138,7 +179,7 @@ export class MultiAgentPlatform {
     this.maxMentionTargets = options.maxMentionTargets ?? 2;
     this.maxPingPongHops = options.maxPingPongHops ?? 4;
     this.maxParallelReadRuns = options.maxParallelReadRuns ?? 4;
-    this.reviewMode = options.reviewMode ?? "required";
+    this.reviewMode = options.reviewMode ?? "smart";
     this.maxReviewRounds = Math.max(1, options.maxReviewRounds ?? 2);
   }
 
@@ -435,9 +476,18 @@ export class MultiAgentPlatform {
         this.acceptedIdempotencyKeys.add(event.idempotencyKey);
       } else if (event.type === "context.delivered") {
         this.deliveryCursors.set(cursorKey(event.threadId, event.agentId), event.messageId);
+      } else if (event.type === "deliverable.declared") {
+        this.runDeliverables.set(event.runId, {
+          kind: event.kind,
+          summary: event.summary,
+          ...(event.evidence ? { evidence: event.evidence } : {}),
+        });
       } else if (event.type === "review.requested") {
         this.reviewRounds.set(event.taskRunId, event.round);
         this.reviewAuthors.set(event.reviewRunId, event.authorAgentId);
+        // Pre-smart-gate logs carry no reviewType; those reviews were all
+        // completion checks, which is exactly what "verify" means.
+        this.taskReviewTypes.set(event.taskRunId, event.reviewType ?? "verify");
       } else if (event.type === "review.rework") {
         this.reviewRounds.set(event.taskRunId, event.round);
       } else if (event.type === "review.submitted") {
@@ -448,6 +498,7 @@ export class MultiAgentPlatform {
         });
       } else if (event.type === "review.resolved") {
         this.resolvedTaskRuns.add(event.taskRunId);
+        this.forgetReviewState(event.taskRunId);
       }
     }
     this.hydrated = true;
@@ -501,6 +552,7 @@ export class MultiAgentPlatform {
         started = true;
         void this.executeRun(active).finally(() => {
           this.activeRuns.delete(active.run.id);
+          this.forgetRunGateState(active.run.id);
           this.finishPendingRun(active.run);
           this.wakeScheduler();
         });
@@ -567,6 +619,7 @@ export class MultiAgentPlatform {
       runtime,
       workspaceKey: this.workspaceKey(run),
       context,
+      deltas: { text: "", thinking: "", timer: undefined, tail: Promise.resolve() },
     };
     this.activeRuns.set(run.id, active);
     return active;
@@ -613,8 +666,10 @@ export class MultiAgentPlatform {
           : {}),
         emit: (event) => this.recordRuntimeEvent(active, event),
         postMessage: (message) => this.acceptAgentMessage(run, message),
+        declareDeliverable: (input) => this.acceptDeliverableDeclaration(run, input),
       });
 
+      await this.flushDeltas(active);
       if (controller.signal.aborted || this.cancelledChains.has(run.causal.chainId)) {
         await this.recordCancelled(run, abortReason(controller.signal));
         return;
@@ -644,6 +699,7 @@ export class MultiAgentPlatform {
       this.runStatuses.set(run.id, "completed");
       completedOutput = result.output;
     } catch (error) {
+      await this.flushDeltas(active);
       if (controller.signal.aborted || isAbortError(error)) {
         await this.recordCancelled(run, abortReason(controller.signal));
       } else {
@@ -802,24 +858,50 @@ export class MultiAgentPlatform {
     return run.taskRunId ?? run.id;
   }
 
-  /** Only work a human directly asked for is gated; A2A collaboration is not. */
+  /**
+   * Only work a human directly asked for is gated; A2A collaboration is not.
+   *
+   * "required" gates every such run, which is what made a greeting cost a full
+   * review round-trip. "smart" additionally asks what the run actually
+   * produced: an Agent that declared a deliverable, a run that wrote files
+   * without declaring one, or a rework round already inside the gate. Plain
+   * conversation declares nothing, touches nothing, and is reviewed by nobody.
+   */
   private isReviewGated(run: AgentRun): boolean {
-    if (this.reviewMode !== "required") return false;
+    if (this.reviewMode === "off") return false;
     if ((run.purpose ?? "task") !== "task") return false;
     if (run.causal.depth !== 0) return false;
-    return this.messages.get(run.incomingMessageId)?.sender.type === "human" ||
+    const humanAsked =
+      this.messages.get(run.incomingMessageId)?.sender.type === "human" ||
       (run.reviewRound ?? 0) > 0;
+    if (!humanAsked) return false;
+    if (this.reviewMode === "required") return true;
+    return (
+      this.runDeliverables.has(run.id) ||
+      this.runWriteEffects.has(run.id) ||
+      (run.reviewRound ?? 0) > 0
+    );
+  }
+
+  /** What the pending review round judges, given how the gate was armed. */
+  private reviewTypeFor(run: AgentRun, taskRunId: Id): ReviewType {
+    const settled = this.taskReviewTypes.get(taskRunId);
+    if (settled) return settled;
+    return this.runDeliverables.get(run.id)?.kind === "plan" ? "critique" : "verify";
   }
 
   private reviewAssignmentFor(run: AgentRun): ReviewAssignment | undefined {
     if (run.purpose !== "review" || !run.taskRunId) return undefined;
     const authorAgentId = this.reviewAuthors.get(run.id);
     if (!authorAgentId) return undefined;
+    const declaration = this.reviewDeclarations.get(run.id);
     return {
       taskRunId: run.taskRunId,
       authorAgentId,
       round: run.reviewRound ?? 1,
       maxRounds: this.maxReviewRounds,
+      reviewType: run.reviewType ?? this.taskReviewTypes.get(run.taskRunId) ?? "verify",
+      ...(declaration ? { declaration } : {}),
     };
   }
 
@@ -838,6 +920,8 @@ export class MultiAgentPlatform {
     if (this.resolvedTaskRuns.has(taskRunId)) return;
     if (this.cancelledChains.has(run.causal.chainId)) return;
     const round = (this.reviewRounds.get(taskRunId) ?? 0) + 1;
+    const reviewType = this.reviewTypeFor(run, taskRunId);
+    const declaration = this.runDeliverables.get(run.id);
 
     const reviewerAgentId = this.resolveReviewer(run.agentId);
     const reviewer = reviewerAgentId ? this.agents.get(reviewerAgentId) : undefined;
@@ -870,6 +954,8 @@ export class MultiAgentPlatform {
         deliverable: output,
         round,
         maxRounds: this.maxReviewRounds,
+        reviewType,
+        ...(declaration ? { declaration } : {}),
       }),
       intent: "review-request",
       createdAt: now(),
@@ -895,9 +981,12 @@ export class MultiAgentPlatform {
       purpose: "review",
       taskRunId,
       reviewRound: round,
+      reviewType,
     };
     this.reviewRounds.set(taskRunId, round);
     this.reviewAuthors.set(reviewRun.id, run.agentId);
+    this.taskReviewTypes.set(taskRunId, reviewType);
+    if (declaration) this.reviewDeclarations.set(reviewRun.id, declaration);
     await this.record({
       type: "review.requested",
       threadId: run.threadId,
@@ -907,6 +996,7 @@ export class MultiAgentPlatform {
       reviewerAgentId,
       round,
       messageId: message.id,
+      reviewType,
     });
     await this.enqueueRun(reviewRun);
     this.startScheduler();
@@ -927,6 +1017,7 @@ export class MultiAgentPlatform {
     const taskRunId = reviewRun.taskRunId;
     if (!taskRunId || this.resolvedTaskRuns.has(taskRunId)) return;
     const round = reviewRun.reviewRound ?? 1;
+    const reviewType = reviewRun.reviewType ?? this.taskReviewTypes.get(taskRunId) ?? "verify";
     const submission = this.reviewSubmissions.get(reviewRun.id);
 
     if (!submission) {
@@ -983,6 +1074,7 @@ export class MultiAgentPlatform {
         submission,
         round,
         maxRounds: this.maxReviewRounds,
+        reviewType,
       }),
       intent: "review-changes-requested",
       createdAt: now(),
@@ -1006,6 +1098,7 @@ export class MultiAgentPlatform {
       purpose: "task",
       taskRunId,
       reviewRound: round,
+      reviewType,
     };
     await this.record({
       type: "review.rework",
@@ -1031,6 +1124,7 @@ export class MultiAgentPlatform {
     const taskRunId = this.taskRunIdOf(run);
     if (this.resolvedTaskRuns.has(taskRunId)) return;
     this.resolvedTaskRuns.add(taskRunId);
+    const reviewType = run.reviewType ?? this.taskReviewTypes.get(taskRunId);
     await this.record({
       type: "review.resolved",
       threadId: run.threadId,
@@ -1039,7 +1133,33 @@ export class MultiAgentPlatform {
       rounds,
       ...(escalation ? { escalation } : {}),
       ...(detail ? { detail } : {}),
+      ...(reviewType ? { reviewType } : {}),
     });
+    this.forgetReviewState(taskRunId);
+  }
+
+  /**
+   * Drops a finished run's gate bookkeeping. The gate reads it while the run is
+   * still executing; by the time the run leaves the scheduler, requestReview
+   * has already copied any declaration onto the review run. Without this, a
+   * session with the gate off would accumulate declarations forever.
+   */
+  private forgetRunGateState(runId: Id): void {
+    this.runDeliverables.delete(runId);
+    this.runWriteEffects.delete(runId);
+    this.reviewDeclarations.delete(runId);
+  }
+
+  /**
+   * Drops the per-task gate bookkeeping once the task is terminal. The
+   * resolved-task and round maps outlive it: they are what stop a late review
+   * from reopening a settled task.
+   */
+  private forgetReviewState(taskRunId: Id): void {
+    this.taskReviewTypes.delete(taskRunId);
+    // Per-run state is dropped as each run leaves the scheduler; the
+    // originating run keys itself, so replay reaches it here too.
+    this.forgetRunGateState(taskRunId);
   }
 
   /** A review run that never reached a verdict leaves the task for a human. */
@@ -1051,6 +1171,60 @@ export class MultiAgentPlatform {
       return;
     }
     await this.resolveReview(run, "escalated", round, "review-failed", detail);
+  }
+
+  /**
+   * Backs the complete_task and submit_plan tools. An Agent judges for itself
+   * whether its output is a deliverable; this records that judgment. It is a
+   * claim, not a conclusion — accepting it opens the review gate rather than
+   * closing the task, and a peer decides whether the claim holds.
+   */
+  private async acceptDeliverableDeclaration(
+    run: AgentRun,
+    input: DeclareDeliverableInput,
+  ): Promise<DeclareDeliverableResult> {
+    if (run.purpose === "review") {
+      return {
+        accepted: false,
+        reason: "a review run judges someone else's deliverable; it does not declare one",
+      };
+    }
+    if (input.kind !== "completion" && input.kind !== "plan") {
+      return { accepted: false, reason: "kind must be completion or plan" };
+    }
+    if (this.resolvedTaskRuns.has(this.taskRunIdOf(run))) {
+      return { accepted: false, reason: "this task has already been resolved" };
+    }
+    const summary = input.summary?.trim() ?? "";
+    if (!summary) return { accepted: false, reason: "summary is required" };
+    if (summary.length > 20_000) {
+      return { accepted: false, reason: "summary must be at most 20,000 characters" };
+    }
+    const existing = this.runDeliverables.get(run.id);
+    if (existing && existing.kind !== input.kind) {
+      return {
+        accepted: false,
+        reason: `this run already declared a ${existing.kind}; it cannot also be a ${input.kind}`,
+      };
+    }
+    const evidence = (input.evidence ?? [])
+      .map((item) => item.trim())
+      .filter(Boolean)
+      .slice(0, 20);
+    const declaration: DeliverableDeclaration = {
+      kind: input.kind,
+      summary,
+      ...(evidence.length > 0 ? { evidence } : {}),
+    };
+    this.runDeliverables.set(run.id, declaration);
+    await this.record({
+      type: "deliverable.declared",
+      runId: run.id,
+      threadId: run.threadId,
+      agentId: run.agentId,
+      ...declaration,
+    });
+    return { accepted: true };
   }
 
   /**
@@ -1175,18 +1349,76 @@ export class MultiAgentPlatform {
     if (!this.threads.has(thread.id)) this.threads.set(thread.id, thread);
   }
 
-  private async recordRuntimeEvent(active: ActiveRun, event: RuntimeEvent): Promise<void> {
-    const { run, context } = active;
-    if (event.type === "text_delta") {
+  /**
+   * Holds a streamed chunk until the flush timer fires. Never awaited by the
+   * runtime: a token-rate emit() that awaited an fs append would throttle the
+   * model's own output loop.
+   */
+  private bufferDelta(active: ActiveRun, type: "text_delta" | "thinking_delta", text: string): void {
+    if (!text) return;
+    if (type === "text_delta") active.deltas.text += text;
+    else active.deltas.thinking += text;
+    if (active.deltas.timer) return;
+    active.deltas.timer = setTimeout(() => {
+      active.deltas.timer = undefined;
+      void this.flushDeltas(active);
+    }, DELTA_FLUSH_MS);
+    // A pending flush must never hold the process open past its work.
+    active.deltas.timer.unref?.();
+  }
+
+  /**
+   * Emits whatever is buffered as at most one delta event per stream. Flushes
+   * are chained rather than concurrent: the timer and an incoming event can
+   * both trigger one, and a later event must never be appended ahead of the
+   * text that preceded it.
+   */
+  private flushDeltas(active: ActiveRun): Promise<void> {
+    if (active.deltas.timer) {
+      clearTimeout(active.deltas.timer);
+      active.deltas.timer = undefined;
+    }
+    active.deltas.tail = active.deltas.tail.then(() => this.emitBufferedDeltas(active));
+    return active.deltas.tail;
+  }
+
+  private async emitBufferedDeltas(active: ActiveRun): Promise<void> {
+    const { text, thinking } = active.deltas;
+    if (!text && !thinking) return;
+    active.deltas.text = "";
+    active.deltas.thinking = "";
+    const { run } = active;
+    if (thinking) {
+      await this.record({
+        type: "run.thinking",
+        runId: run.id,
+        threadId: run.threadId,
+        agentId: run.agentId,
+        text: thinking,
+      });
+    }
+    if (text) {
       await this.record({
         type: "run.delta",
         runId: run.id,
         threadId: run.threadId,
         agentId: run.agentId,
-        text: event.text,
+        text,
       });
+    }
+  }
+
+  private async recordRuntimeEvent(active: ActiveRun, event: RuntimeEvent): Promise<void> {
+    const { run, context } = active;
+    if (event.type === "text_delta" || event.type === "thinking_delta") {
+      this.bufferDelta(active, event.type, event.text);
       return;
     }
+    // Every other event is ordered against the stream the Agent was producing
+    // when it fired, so the buffer drains before it is recorded. That includes
+    // output_reset: the discarded attempt still happened, and the log keeps it
+    // ahead of the reset that tells clients to clear it.
+    await this.flushDeltas(active);
     if (event.type === "session") {
       await this.record({
         type: "run.session",
@@ -1209,16 +1441,6 @@ export class MultiAgentPlatform {
         agentId: run.agentId,
         messageId: context.deliveryCursor,
         truncated: context.truncated,
-      });
-      return;
-    }
-    if (event.type === "thinking_delta") {
-      await this.record({
-        type: "run.thinking",
-        runId: run.id,
-        threadId: run.threadId,
-        agentId: run.agentId,
-        text: event.text,
       });
       return;
     }
@@ -1264,6 +1486,15 @@ export class MultiAgentPlatform {
         ...usage,
       });
       return;
+    }
+    // A run that edits the workspace is reviewable on that evidence alone, so
+    // an Agent cannot skip the gate by simply not declaring what it did.
+    if (
+      event.type === "tool_start" &&
+      run.accessMode !== "read-only" &&
+      WRITE_EFFECT_TOOLS.has(event.toolName)
+    ) {
+      this.runWriteEffects.add(run.id);
     }
     await this.record({
       type: "run.tool",
@@ -1473,20 +1704,56 @@ function buildReviewRequestContent(input: {
   deliverable: string;
   round: number;
   maxRounds: number;
+  reviewType: ReviewType;
+  declaration?: DeliverableDeclaration;
 }): string {
+  const evidence = input.declaration?.evidence ?? [];
+  const claim = input.declaration
+    ? [
+        "",
+        `<author-claim kind="${input.declaration.kind}">`,
+        excerpt(input.declaration.summary),
+        ...(evidence.length > 0
+          ? ["", "Evidence the author offers:", ...evidence.map((item) => `- ${item}`)]
+          : []),
+        "</author-claim>",
+      ]
+    : [];
+  const header =
+    input.reviewType === "critique"
+      ? `@${input.reviewerAgentId} Critique @${input.authorAgentId}'s plan — round ${input.round} of ${input.maxRounds}.`
+      : `@${input.reviewerAgentId} Verify @${input.authorAgentId}'s completed work — round ${input.round} of ${input.maxRounds}.`;
+  // The two briefs differ in what counts as doing the job: a plan is judged on
+  // its reasoning, finished work on the artifacts it claims to have produced.
+  // An author's "done" is a claim to check, never a fact to take on trust.
+  const brief =
+    input.reviewType === "critique"
+      ? [
+          "This is a plan, not finished work. Pressure-test it before anyone builds it.",
+          "Give structured feedback: what is sound, what is risky or missing, and concrete improvements.",
+          "approved means the plan is ready to execute. changes-requested returns concrete suggestions for one revision round.",
+        ]
+      : [
+          "The author says this is done. That claim is what you are checking, not evidence that it is true.",
+          "Verify against the artifacts: read the files it says it changed, run the verification it states.",
+          "Approve only what you actually verified. Say plainly what you could not check with the access you have.",
+          "Do not redo the work yourself. Say concretely what must change.",
+        ];
   return [
-    `@${input.reviewerAgentId} Review @${input.authorAgentId}'s work — round ${input.round} of ${input.maxRounds}.`,
+    header,
     "",
     "<original-task>",
     excerpt(input.task),
     "</original-task>",
+    ...claim,
     "",
     "<deliverable>",
     excerpt(input.deliverable),
     "</deliverable>",
     "",
-    "Judge the deliverable against the original task. Do not redo the work yourself.",
+    ...brief,
     "Finish by calling submit_review exactly once: approved, or changes-requested with concrete findings.",
+    "Do not manufacture agreement to close the loop.",
     "Ending without submit_review is not an approval — it escalates the task to the human.",
   ].join("\n");
 }
@@ -1496,15 +1763,20 @@ function buildReviewFeedbackContent(input: {
   submission: ReviewSubmission;
   round: number;
   maxRounds: number;
+  reviewType: ReviewType;
 }): string {
   const findings = input.submission.findings ?? [];
+  const closing =
+    input.reviewType === "critique"
+      ? `Revise your plan to address these. Round ${input.round + 1} will review the revision.`
+      : `Fix these and deliver again. Round ${input.round + 1} will verify your update.`;
   return [
     `@${input.authorAgentId} Review round ${input.round} of ${input.maxRounds}: changes requested.`,
     "",
     input.submission.summary,
     ...(findings.length > 0 ? ["", "Findings:", ...findings.map((f) => `- ${f}`)] : []),
     "",
-    `Address these and deliver again. Round ${input.round + 1} will review your update.`,
+    closing,
   ].join("\n");
 }
 
