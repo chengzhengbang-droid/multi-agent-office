@@ -9,6 +9,7 @@ import {
   SessionManager,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { providerEnvKeys } from "../config/provider-presets.js";
 import type { PiRuntimeSpec, RuntimeAvailability } from "../core/types.js";
 import { PiSharedRuntime, RequestResourceLoader } from "./pi-shared.js";
 import type {
@@ -528,14 +529,7 @@ export class PiRuntimeAdapter implements AgentRuntime {
 }
 
 /** Environment variables pi reads for providers the workbench offers presets for. */
-const PROVIDER_ENVIRONMENT_KEYS: Record<string, string[]> = {
-  "zai-coding-cn": ["ZAI_CODING_CN_API_KEY"],
-  zai: ["ZAI_API_KEY"],
-  deepseek: ["DEEPSEEK_API_KEY"],
-  openai: ["OPENAI_API_KEY"],
-  anthropic: ["ANTHROPIC_API_KEY"],
-  google: ["GEMINI_API_KEY", "GOOGLE_API_KEY"],
-};
+const PROVIDER_ENVIRONMENT_KEYS: Record<string, string[]> = providerEnvKeys();
 
 export interface PiAvailabilityProbe {
   /** Mirrors `ModelRuntime.hasConfiguredAuth`. */

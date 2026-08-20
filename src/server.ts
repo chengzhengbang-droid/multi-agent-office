@@ -22,6 +22,12 @@ import {
   saveFirstRunConfig,
   saveProviderCredential,
 } from "./config/first-run.js";
+import {
+  FileCustomProviderStore,
+  customProviderEnvKey,
+  findCustomProvider,
+  type CustomProviderCatalogV1,
+} from "./config/custom-providers.js";
 import { findApiProvider } from "./config/provider-presets.js";
 import {
   parseAttachmentInputs,
@@ -74,7 +80,10 @@ const sessionStore = new FileRuntimeSessionStore(
   resolve(dataRoot, "runtime-sessions", "index.json"),
 );
 const callbackRegistry = new RunCallbackRegistry();
-const piShared = new PiSharedRuntime();
+const customProviderStore = new FileCustomProviderStore(
+  resolve(dataRoot, "custom-providers.json"),
+);
+const piShared = new PiSharedRuntime({ customProviders: customProviderStore });
 const runtimeFactoryOptions: RuntimeFactoryOptions = {
   projectRoot: defaultWorkspaceRoot,
   piShared,
@@ -354,7 +363,10 @@ const server = createServer(async (request, response) => {
         return;
       }
       try {
-        const input = parseProviderCredentialInput(await readJson(request));
+        const input = parseProviderCredentialInput(
+          await readJson(request),
+          await providerCredentialResolver(),
+        );
         // Reloading credentials rebuilds every runtime adapter, which disposes
         // the outgoing ones, so a live run would be aborted mid-turn.
         const busy = catalog.agents.find((agent) => platform.hasLiveAgentRun(agent.id));
@@ -366,6 +378,46 @@ const server = createServer(async (request, response) => {
         }
         await saveProviderCredential(configPath, input);
         applyProviderCredential(input);
+        await reloadProviderCredentials();
+        sendJson(response, 200, {
+          agents: buildAgentViews(catalog, runtimes),
+          models: await buildModelCatalog(),
+        });
+      } catch (error) {
+        sendJson(response, 400, { error: errorMessage(error) });
+      }
+      return;
+    }
+
+    // Third-party and self-hosted deployments pi does not ship with. Saving the
+    // list rebuilds the model runtime so the new provider is selectable, and its
+    // Agents become routable, without restarting the app.
+    if (url.pathname === "/api/providers/custom" && request.method === "POST") {
+      if (!isTrustedLocalOrigin(request)) {
+        sendJson(response, 403, { error: "拒绝来自其他网页的配置请求" });
+        return;
+      }
+      if (setupRequired) {
+        sendJson(response, 409, { error: "请先完成首次启动配置" });
+        return;
+      }
+      try {
+        const busy = catalog.agents.find((agent) => platform.hasLiveAgentRun(agent.id));
+        if (busy) {
+          sendJson(response, 409, {
+            error: `@${busy.id} 正在运行或排队，请等待本轮结束后再保存提供商`,
+          });
+          return;
+        }
+        const requested = await readJson(request);
+        const orphaned = await orphanedProviderAgent(requested);
+        if (orphaned) {
+          sendJson(response, 409, {
+            error: `@${orphaned.agentId} 正在使用提供商 ${orphaned.provider}，请先改用其他提供商再删除`,
+          });
+          return;
+        }
+        await customProviderStore.replace(requested);
         await reloadProviderCredentials();
         sendJson(response, 200, {
           agents: buildAgentViews(catalog, runtimes),
@@ -562,25 +614,86 @@ async function buildModelCatalog(): Promise<{
     name: string;
     configured: boolean;
     subscription: boolean;
+    custom: boolean;
+    /** Set when this app can store the provider's key itself. */
+    envKey?: string;
     models: Array<{ id: string; name: string }>;
   }>;
+  custom: CustomProviderCatalogV1;
+  warnings?: string[];
   error?: string;
 }> {
+  const custom = await customProviderStore
+    .load()
+    .catch(() => ({ version: 1, providers: [] }) as CustomProviderCatalogV1);
   try {
     const modelRuntime = await piShared.modelRuntime();
-    const providers = modelRuntime.getProviders().map((provider) => ({
-      id: provider.id,
-      name: provider.name ?? provider.id,
-      configured: modelRuntime.hasConfiguredAuth(provider.id),
-      subscription: modelRuntime.isUsingSubscription(provider.id),
-      models: modelRuntime
-        .getModels(provider.id)
-        .map((model) => ({ id: model.id, name: model.name ?? model.id })),
-    }));
-    return { providers };
+    const providers = modelRuntime.getProviders().map((provider) => {
+      const preset = findApiProvider(provider.id);
+      const declared = findCustomProvider(custom, provider.id);
+      const status = modelRuntime.getProviderAuthStatus(provider.id);
+      return {
+        id: provider.id,
+        name: declared?.label ?? provider.name ?? provider.id,
+        configured: status.configured || modelRuntime.hasConfiguredAuth(provider.id),
+        subscription: modelRuntime.isUsingSubscription(provider.id),
+        custom: Boolean(declared),
+        ...(preset
+          ? { envKey: preset.envKey }
+          : declared
+            ? { envKey: customProviderEnvKey(declared.id) }
+            : {}),
+        models: modelRuntime
+          .getModels(provider.id)
+          .map((model) => ({ id: model.id, name: model.name ?? model.id })),
+      };
+    });
+    const warnings = piShared.warnings();
+    return { providers, custom, ...(warnings.length > 0 ? { warnings } : {}) };
   } catch (error) {
-    return { providers: [], error: errorMessage(error) };
+    return { providers: [], custom, error: errorMessage(error) };
   }
+}
+
+/**
+ * Which providers this app can store a key for: the built-in presets plus every
+ * third-party deployment the workspace has declared.
+ */
+async function providerCredentialResolver(): Promise<
+  (providerId: string) => { id: string; envKey: string } | undefined
+> {
+  const custom = await customProviderStore.load();
+  return (providerId: string) => {
+    const preset = findApiProvider(providerId);
+    if (preset) return { id: preset.id, envKey: preset.envKey };
+    const declared = findCustomProvider(custom, providerId);
+    if (declared) return { id: declared.id, envKey: customProviderEnvKey(declared.id) };
+    return undefined;
+  };
+}
+
+/**
+ * An Agent left pointing at a deleted provider would go offline with a model
+ * resolution error instead of an explanation, so the removal is refused while
+ * the Agent still uses it.
+ */
+async function orphanedProviderAgent(
+  requested: unknown,
+): Promise<{ agentId: string; provider: string } | undefined> {
+  const current = await customProviderStore.load();
+  const declared = new Set(current.providers.map((provider) => provider.id));
+  const kept = new Set(
+    Array.isArray((requested as CustomProviderCatalogV1 | undefined)?.providers)
+      ? (requested as CustomProviderCatalogV1).providers.map((provider) => provider?.id)
+      : [],
+  );
+  for (const agent of catalog.agents) {
+    if (agent.runtime.kind !== "pi") continue;
+    const provider = agent.runtime.provider;
+    if (!declared.has(provider) || kept.has(provider)) continue;
+    return { agentId: agent.id, provider };
+  }
+  return undefined;
 }
 
 function configureCatalogForSetup(
