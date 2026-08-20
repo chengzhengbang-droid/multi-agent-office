@@ -14,33 +14,52 @@ export interface FirstRunInput {
 }
 
 export interface ProviderCredentialInput {
-  provider: ApiProviderId;
+  provider: string;
+  /** Environment variable the key is written to; pi reads the credential there. */
+  envKey: string;
   apiKey: string;
 }
+
+/** Where a provider's key belongs. Presets answer for themselves. */
+export interface ProviderCredentialTarget {
+  id: string;
+  envKey: string;
+}
+
+export type ProviderCredentialResolver = (
+  providerId: string,
+) => ProviderCredentialTarget | undefined;
 
 export function parseFirstRunInput(value: Record<string, unknown>): FirstRunInput {
   const credential = parseProviderCredentialInput(value);
   if (typeof value.useCodex !== "boolean") throw new Error("请选择是否启用 Codex");
-  return { ...credential, useCodex: value.useCodex };
+  const provider = findApiProvider(credential.provider);
+  if (!provider) throw new Error("请选择受支持的 API 提供商");
+  return { provider: provider.id, apiKey: credential.apiKey, useCodex: value.useCodex };
 }
 
 /**
  * A key for one provider, with no say over which provider the roster uses.
  * Adding a second Pi Agent on another provider needs its credential without
  * repointing the Agents that already work.
+ *
+ * The resolver decides which providers are addressable, so a workspace that has
+ * defined third-party deployments can store their keys the same way; callers
+ * that only deal with built-in providers get the preset table by default.
  */
 export function parseProviderCredentialInput(
   value: Record<string, unknown>,
+  resolveProvider: ProviderCredentialResolver = findApiProvider,
 ): ProviderCredentialInput {
   const providerId = typeof value.provider === "string" ? value.provider : "";
-  const provider = findApiProvider(providerId);
+  const provider = resolveProvider(providerId);
   if (!provider) throw new Error("请选择受支持的 API 提供商");
   const apiKey = typeof value.apiKey === "string" ? value.apiKey.trim() : "";
   if (apiKey.length < 8 || apiKey.length > 8_000) {
     throw new Error("请输入有效的 API Key");
   }
   if (/[\r\n\0]/.test(apiKey)) throw new Error("API Key 格式无效");
-  return { provider: provider.id, apiKey };
+  return { provider: provider.id, envKey: provider.envKey, apiKey };
 }
 
 export function isFirstRunSetupRequired(
@@ -55,9 +74,7 @@ export function applyProviderCredential(
   input: ProviderCredentialInput,
   environment: NodeJS.ProcessEnv = process.env,
 ): void {
-  const provider = findApiProvider(input.provider);
-  if (!provider) throw new Error("Unsupported API provider");
-  environment[provider.envKey] = input.apiKey;
+  environment[input.envKey] = input.apiKey;
 }
 
 /**
@@ -69,9 +86,7 @@ export async function saveProviderCredential(
   path: string,
   input: ProviderCredentialInput,
 ): Promise<void> {
-  const provider = findApiProvider(input.provider);
-  if (!provider) throw new Error("Unsupported API provider");
-  await writeEnvValues(path, { [provider.envKey]: input.apiKey });
+  await writeEnvValues(path, { [input.envKey]: input.apiKey });
 }
 
 export function applyFirstRunEnvironment(

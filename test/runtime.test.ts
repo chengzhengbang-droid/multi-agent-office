@@ -95,18 +95,33 @@ test("Pi credentials stored in auth.json count as configured", () => {
 });
 
 test("providers outside the preset table are not blocked without a probe", () => {
-  // The preset table only covers the first-run page; judging an unlisted
-  // provider offline from it would block a valid auth.json setup.
-  const xai = {
+  // The preset table covers the providers this app can store a key for; a
+  // provider declared straight in pi's own models.json is not in it, and
+  // judging it offline from the table would block a valid setup.
+  const declaredInPi = {
     kind: "pi" as const,
-    provider: "xai",
-    model: "grok-4",
+    provider: "corp-gateway",
+    model: "house-model",
     thinkingLevel: "medium" as const,
   };
-  assert.equal(resolvePiAvailability(xai, {}).available, true);
+  assert.equal(resolvePiAvailability(declaredInPi, {}).available, true);
   assert.equal(
-    resolvePiAvailability(xai, {}, { hasConfiguredAuth: () => false }).available,
+    resolvePiAvailability(declaredInPi, {}, { hasConfiguredAuth: () => false }).available,
     false,
+  );
+});
+
+test("a preset added since the first release is judged by its own key", () => {
+  const kimi = {
+    kind: "pi" as const,
+    provider: "moonshotai-cn",
+    model: "kimi-k2.7-code",
+    thinkingLevel: "medium" as const,
+  };
+  assert.equal(resolvePiAvailability(kimi, {}).available, false);
+  assert.equal(
+    resolvePiAvailability(kimi, { MOONSHOT_API_KEY: "sk-example" }).available,
+    true,
   );
 });
 
