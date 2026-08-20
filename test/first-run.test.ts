@@ -13,6 +13,7 @@ import {
   saveProviderCredential,
   updateEnvText,
 } from "../src/config/first-run.js";
+import { customProviderEnvKey } from "../src/config/custom-providers.js";
 
 test("first-run status respects the completion marker and existing users", () => {
   assert.equal(isFirstRunSetupRequired({ MAO_SETUP_COMPLETED: "0" }), true);
@@ -107,7 +108,11 @@ test("a second provider credential is added without disturbing the first", async
       { provider: "zai-coding-cn", apiKey: "zai-example-key", useCodex: false },
       true,
     );
-    await saveProviderCredential(path, { provider: "deepseek", apiKey: "sk-deepseek-example" });
+    await saveProviderCredential(path, {
+      provider: "deepseek",
+      envKey: "DEEPSEEK_API_KEY",
+      apiKey: "sk-deepseek-example",
+    });
     const saved = await readFile(path, "utf8");
     assert.match(saved, /^ZAI_CODING_CN_API_KEY="zai-example-key"$/m);
     assert.match(saved, /^DEEPSEEK_API_KEY="sk-deepseek-example"$/m);
@@ -125,7 +130,7 @@ test("a second provider credential is added without disturbing the first", async
 test("provider credential input validates the provider and the key alone", () => {
   assert.deepEqual(
     parseProviderCredentialInput({ provider: "deepseek", apiKey: "  sk-deepseek-example  " }),
-    { provider: "deepseek", apiKey: "sk-deepseek-example" },
+    { provider: "deepseek", envKey: "DEEPSEEK_API_KEY", apiKey: "sk-deepseek-example" },
   );
   assert.throws(
     () => parseProviderCredentialInput({ provider: "unknown", apiKey: "long-enough" }),
@@ -133,7 +138,27 @@ test("provider credential input validates the provider and the key alone", () =>
   );
   assert.throws(() => parseProviderCredentialInput({ provider: "zai", apiKey: "short" }), /API Key/);
   const environment: NodeJS.ProcessEnv = { MAO_PI_PROVIDER: "zai-coding-cn" };
-  applyProviderCredential({ provider: "deepseek", apiKey: "sk-deepseek-example" }, environment);
+  applyProviderCredential(
+    { provider: "deepseek", envKey: "DEEPSEEK_API_KEY", apiKey: "sk-deepseek-example" },
+    environment,
+  );
   assert.equal(environment.DEEPSEEK_API_KEY, "sk-deepseek-example");
   assert.equal(environment.MAO_PI_PROVIDER, "zai-coding-cn");
+});
+
+test("a third-party deployment stores its key like any built-in provider", () => {
+  const resolver = (providerId: string) =>
+    providerId === "my-vllm"
+      ? { id: "my-vllm", envKey: customProviderEnvKey("my-vllm") }
+      : undefined;
+  assert.deepEqual(
+    parseProviderCredentialInput({ provider: "my-vllm", apiKey: "local-key-example" }, resolver),
+    { provider: "my-vllm", envKey: "MAO_CUSTOM_MY_VLLM_API_KEY", apiKey: "local-key-example" },
+  );
+  // The resolver decides what exists: a preset id is not addressable through a
+  // resolver that only knows the workspace's own deployments.
+  assert.throws(
+    () => parseProviderCredentialInput({ provider: "deepseek", apiKey: "long-enough" }, resolver),
+    /API 提供商/,
+  );
 });

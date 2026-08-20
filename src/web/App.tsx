@@ -41,9 +41,19 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
   API_PROVIDER_PRESETS,
+  FEATURED_API_PROVIDERS,
   findApiProvider,
   type ApiProviderId,
 } from "../config/provider-presets";
+import {
+  CUSTOM_PROVIDER_APIS,
+  DEFAULT_CUSTOM_CONTEXT_WINDOW,
+  DEFAULT_CUSTOM_MAX_TOKENS,
+  customProviderEnvKey,
+  type CustomProvider,
+  type CustomProviderApi,
+  type CustomProviderCatalogV1,
+} from "../config/custom-providers";
 import { agentAvatarTone, agentInitials } from "./agent-identity";
 import type {
   AccessMode,
@@ -471,7 +481,11 @@ function FirstRunSetup({ onComplete, onUpdate, updateTitle }: { onComplete(data:
   const [showKey, setShowKey] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
+  const [showAllProviders, setShowAllProviders] = useState(false);
   const selectedProvider = API_PROVIDER_PRESETS.find((item) => item.id === provider)!;
+  // The common providers fit on the page; the rest are one click away rather
+  // than absent, so a Kimi or MiniMax user is not stuck editing a config file.
+  const offered = showAllProviders ? API_PROVIDER_PRESETS : FEATURED_API_PROVIDERS;
 
   const submit = async () => {
     if (saving || apiKey.trim().length < 8) return;
@@ -515,13 +529,13 @@ function FirstRunSetup({ onComplete, onUpdate, updateTitle }: { onComplete(data:
         <form className="setup-form" onSubmit={(event) => { event.preventDefault(); void submit(); }}>
           <fieldset>
             <legend>API 提供商</legend>
-            <div className="provider-grid">
-              {API_PROVIDER_PRESETS.map((item) => (
+            <div className={`provider-grid ${showAllProviders ? "provider-grid--all" : ""}`}>
+              {offered.map((item) => (
                 <button
                   className={`provider-option ${provider === item.id ? "provider-option--selected" : ""}`}
                   type="button"
                   key={item.id}
-                  onClick={() => setProvider(item.id)}
+                  onClick={() => setProvider(item.id as ApiProviderId)}
                   aria-pressed={provider === item.id}
                 >
                   <span>{item.label}</span>
@@ -529,7 +543,11 @@ function FirstRunSetup({ onComplete, onUpdate, updateTitle }: { onComplete(data:
                 </button>
               ))}
             </div>
+            <button className="provider-more" type="button" onClick={() => setShowAllProviders((current) => !current)} aria-expanded={showAllProviders}>
+              {showAllProviders ? "只看常用提供商" : `更多提供商（共 ${API_PROVIDER_PRESETS.length} 个）`}<ChevronDown size={13} className={showAllProviders ? "custom-provider-caret--open" : undefined} />
+            </button>
             <p className="provider-description">{selectedProvider.description} · 默认模型 {selectedProvider.model}</p>
+            <p className="provider-description">第三方或自建部署的模型可以在进入工作台后，于 Agent 花名册里添加。</p>
           </fieldset>
 
           <label className="setup-key-label" htmlFor="setup-api-key">API Key</label>
@@ -766,14 +784,21 @@ function Composer(props: ComposerProps) {
   </div></div>;
 }
 
+interface ModelCatalogProvider {
+  id: string;
+  name: string;
+  configured: boolean;
+  subscription: boolean;
+  custom: boolean;
+  /** Present when this app can store the provider's key itself. */
+  envKey?: string;
+  models: Array<{ id: string; name: string }>;
+}
+
 interface ModelCatalog {
-  providers: Array<{
-    id: string;
-    name: string;
-    configured: boolean;
-    subscription: boolean;
-    models: Array<{ id: string; name: string }>;
-  }>;
+  providers: ModelCatalogProvider[];
+  custom?: CustomProviderCatalogV1;
+  warnings?: string[];
   error?: string;
 }
 
@@ -813,16 +838,250 @@ function ProviderCredentialField({ provider, models, onSaved }: { provider: stri
       setSaving(false);
     }
   };
+  // Any provider this app can write an environment variable for takes a key
+  // here: the built-in presets and the workspace's own third-party deployments.
+  // Everything else is a subscription or ambient-credential provider, where the
+  // key box would be a dead end.
+  const envKey = status?.envKey;
   return <div className="provider-credential">
-    <div className="provider-credential-head"><KeyRound size={13} /><span>{preset?.label ?? provider} 凭据</span><i className={configured ? "provider-credential-ready" : undefined}>{status?.subscription ? "订阅已登录" : configured ? "已配置" : "未配置"}</i></div>
-    {preset ? <>
+    <div className="provider-credential-head"><KeyRound size={13} /><span>{status?.name ?? preset?.label ?? provider} 凭据</span><i className={configured ? "provider-credential-ready" : undefined}>{status?.subscription ? "订阅已登录" : configured ? "已配置" : "未配置"}</i></div>
+    {envKey ? <>
       <div className="provider-credential-row">
-        <input type={showKey ? "text" : "password"} value={apiKey} onChange={(event) => setApiKey(event.target.value)} placeholder={configured ? "输入新的 Key 可覆盖现有凭据" : preset.keyPlaceholder} autoComplete="off" spellCheck={false} />
+        <input type={showKey ? "text" : "password"} value={apiKey} onChange={(event) => setApiKey(event.target.value)} placeholder={configured ? "输入新的 Key 可覆盖现有凭据" : preset?.keyPlaceholder ?? `请输入 ${status?.name ?? provider} 的 API Key`} autoComplete="off" spellCheck={false} />
         <button type="button" onClick={() => setShowKey((current) => !current)} aria-label={showKey ? "隐藏 API Key" : "显示 API Key"}>{showKey ? <EyeOff size={14} /> : <Eye size={14} />}</button>
         <button type="button" onClick={() => void save()} disabled={saving || apiKey.trim().length < 8}>{saving ? <span className="button-spinner" /> : <Save size={13} />}{saving ? "保存中" : "保存密钥"}</button>
       </div>
-      <p className={`provider-credential-note${error ? " provider-credential-note--error" : notice ? " provider-credential-note--ok" : ""}`}>{error || notice || "密钥写入本机配置文件，不会进入花名册或任何 API 响应。每个提供商各存一份，互不覆盖。"}</p>
-    </> : <p className="provider-credential-note">{configured ? `${provider} 的凭据来自 pi 的 auth.json，在这里无需重复填写。` : `${provider} 不是内置提供商，请先用 pi 登录写入 auth.json。`}</p>}
+      <p className={`provider-credential-note${error ? " provider-credential-note--error" : notice ? " provider-credential-note--ok" : ""}`}>{error || notice || `密钥以 ${envKey} 写入本机配置文件，不会进入花名册或任何 API 响应。每个提供商各存一份，互不覆盖。`}</p>
+    </> : <p className="provider-credential-note">{configured ? `${provider} 的凭据来自 pi 的 auth.json，在这里无需重复填写。` : status ? `${provider} 使用订阅或系统凭据登录，请先用 pi 的 /login 写入 auth.json。` : `pi 的模型目录里没有 ${provider}：如果它写在 pi 的 models.json 里，请用 pi 登录写入 auth.json；也可以在下方把它登记为自定义提供商。`}</p>}
+  </div>;
+}
+
+/**
+ * Where a new Pi Agent starts.
+ *
+ * A hardcoded provider sends every new Agent to one vendor even when its key is
+ * the one credential the workspace does not have, so the first provider that is
+ * actually configured wins, with its preset default model when that model is
+ * still in the catalog.
+ */
+function defaultPiRuntime(models: ModelCatalog): Extract<AgentDefinition["runtime"], { kind: "pi" }> {
+  const configured = models.providers.filter((provider) => provider.configured);
+  const provider = configured.find((item) => findApiProvider(item.id)) ?? configured[0];
+  const preset = provider ? findApiProvider(provider.id) : undefined;
+  const model = preset && provider?.models.some((item) => item.id === preset.model)
+    ? preset.model
+    : provider?.models[0]?.id;
+  return {
+    kind: "pi",
+    provider: provider?.id ?? "zai-coding-cn",
+    model: model ?? "glm-5.2",
+    thinkingLevel: "medium",
+  };
+}
+
+const MANUAL_OPTION = "__manual__";
+
+/**
+ * Provider and model choosers for a Pi Agent.
+ *
+ * Pi ships around forty providers and the workspace can declare more, so the
+ * catalog is offered as a real list instead of an autocomplete hint that only
+ * appears once the user guesses the first character. Manual entry stays
+ * reachable for a provider declared straight in pi's own `models.json`, which
+ * this app never sees.
+ */
+function ProviderPicker({ value, providers, onChange }: { value: string; providers: ModelCatalogProvider[]; onChange(provider: string): void }) {
+  const [manual, setManual] = useState(false);
+  // Before the catalog arrives there is nothing to choose from, so the field
+  // stays a plain input rather than a select that cannot show its own value.
+  if (providers.length === 0) {
+    return <label>Provider<input value={value} onChange={(event) => onChange(event.target.value.trim())} spellCheck={false} autoComplete="off" /></label>;
+  }
+  const known = providers.some((provider) => provider.id === value);
+  const showManual = manual || !known;
+  const custom = providers.filter((provider) => provider.custom);
+  const configured = providers.filter((provider) => !provider.custom && provider.configured);
+  const rest = providers.filter((provider) => !provider.custom && !provider.configured);
+  const option = (provider: ModelCatalogProvider) => <option value={provider.id} key={provider.id}>{provider.name}（{provider.id}）</option>;
+  return <label>Provider
+    <select
+      value={showManual ? MANUAL_OPTION : value}
+      onChange={(event) => {
+        setManual(event.target.value === MANUAL_OPTION);
+        if (event.target.value !== MANUAL_OPTION) onChange(event.target.value);
+      }}
+    >
+      {custom.length > 0 && <optgroup label="自定义 / 第三方部署">{custom.map(option)}</optgroup>}
+      {configured.length > 0 && <optgroup label="已配置凭据">{configured.map(option)}</optgroup>}
+      {rest.length > 0 && <optgroup label="未配置凭据">{rest.map(option)}</optgroup>}
+      <option value={MANUAL_OPTION}>其他（手动输入 provider id）</option>
+    </select>
+    {showManual && <input className="picker-manual" value={value} placeholder="provider id，例如 models.json 中自定义的名称" onChange={(event) => onChange(event.target.value.trim())} spellCheck={false} autoComplete="off" />}
+  </label>;
+}
+
+function ModelPicker({ value, models, onChange }: { value: string; models: Array<{ id: string; name: string }>; onChange(model: string): void }) {
+  const [manual, setManual] = useState(false);
+  // A provider whose catalog this app cannot see — one declared in pi's own
+  // models.json — has no list to offer, so the model stays free text.
+  if (models.length === 0) {
+    return <label>Model<input value={value} onChange={(event) => onChange(event.target.value.trim())} spellCheck={false} autoComplete="off" /></label>;
+  }
+  const known = models.some((model) => model.id === value);
+  const showManual = manual || !known;
+  return <label>Model
+    <select
+      value={showManual ? MANUAL_OPTION : value}
+      onChange={(event) => {
+        setManual(event.target.value === MANUAL_OPTION);
+        if (event.target.value !== MANUAL_OPTION) onChange(event.target.value);
+      }}
+    >
+      {models.map((model) => <option value={model.id} key={model.id}>{model.id === model.name ? model.id : `${model.name}（${model.id}）`}</option>)}
+      <option value={MANUAL_OPTION}>其他（手动输入模型名）</option>
+    </select>
+    {showManual && <input className="picker-manual" value={value} placeholder="模型名，例如 glm-5.2" onChange={(event) => onChange(event.target.value.trim())} spellCheck={false} autoComplete="off" />}
+  </label>;
+}
+
+interface CustomProviderPanelProps {
+  catalog: CustomProviderCatalogV1;
+  models: ModelCatalog;
+  onSaved(agents: AgentSummary[], models: ModelCatalog): void;
+  onSelect(providerId: string, modelId: string): void;
+}
+
+const EMPTY_CUSTOM_FORM = { id: "", label: "", baseUrl: "", api: "openai-completions" as CustomProviderApi, models: "", reasoning: false, developerRole: true, apiKey: "" };
+
+/**
+ * Third-party and self-hosted deployments.
+ *
+ * A company gateway, a vLLM/Ollama box or any other OpenAI-compatible endpoint
+ * used to require hand-editing pi's `models.json` outside the app. Declaring one
+ * here registers it on pi's model runtime, so it shows up in the provider picker
+ * and takes a key like any built-in provider.
+ */
+function CustomProviderPanel({ catalog, models, onSaved, onSelect }: CustomProviderPanelProps) {
+  const [open, setOpen] = useState(false);
+  const [form, setForm] = useState(EMPTY_CUSTOM_FORM);
+  const [editingId, setEditingId] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
+  const update = (changes: Partial<typeof EMPTY_CUSTOM_FORM>) => setForm((current) => ({ ...current, ...changes }));
+  const reset = () => { setForm(EMPTY_CUSTOM_FORM); setEditingId(""); setError(""); };
+
+  const write = async (providers: CustomProvider[]): Promise<ModelCatalog> => {
+    const response = await fetch("/api/providers/custom", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ version: 1, providers }) });
+    const result = (await response.json()) as CredentialResponse;
+    if (!response.ok || !result.agents) throw new Error(result.error ?? "提供商保存失败");
+    onSaved(result.agents, result.models);
+    return result.models;
+  };
+
+  const submit = async () => {
+    if (saving) return;
+    setSaving(true); setError(""); setNotice("");
+    try {
+      const id = (editingId || form.id).trim();
+      const modelIds = form.models.split(/[\n,，]/).map((item) => item.trim()).filter(Boolean);
+      if (modelIds.length === 0) throw new Error("请至少填写一个模型名");
+      const provider: CustomProvider = {
+        id,
+        label: form.label.trim() || id,
+        baseUrl: form.baseUrl.trim(),
+        api: form.api,
+        models: modelIds.map((modelId) => ({ id: modelId, reasoning: form.reasoning, contextWindow: DEFAULT_CUSTOM_CONTEXT_WINDOW, maxTokens: DEFAULT_CUSTOM_MAX_TOKENS })),
+        ...(form.developerRole ? {} : { compat: { supportsDeveloperRole: false, supportsReasoningEffort: false } }),
+      };
+      const providers = editingId
+        ? catalog.providers.map((item) => (item.id === editingId ? provider : item))
+        : [...catalog.providers, provider];
+      let latest = await write(providers);
+      // The key is stored separately, exactly like a built-in provider's, so the
+      // definition itself never carries a secret.
+      if (form.apiKey.trim().length >= 8) {
+        const response = await fetch("/api/providers/credential", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ provider: id, apiKey: form.apiKey.trim() }) });
+        const result = (await response.json()) as CredentialResponse;
+        if (!response.ok || !result.agents) throw new Error(result.error ?? "凭据保存失败");
+        onSaved(result.agents, result.models);
+        latest = result.models;
+      }
+      const firstModel = latest.providers.find((item) => item.id === id)?.models[0]?.id ?? modelIds[0];
+      onSelect(id, firstModel ?? "");
+      setNotice(`${provider.label} 已可用，无需重启。`);
+      reset();
+    } catch (saveError) {
+      setError(errorMessage(saveError));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const remove = async (provider: CustomProvider) => {
+    if (saving) return;
+    setSaving(true); setError(""); setNotice("");
+    try {
+      await write(catalog.providers.filter((item) => item.id !== provider.id));
+      if (editingId === provider.id) reset();
+      setNotice(`${provider.label} 已删除。`);
+    } catch (deleteError) {
+      setError(errorMessage(deleteError));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const edit = (provider: CustomProvider) => {
+    setEditingId(provider.id);
+    setOpen(true);
+    setError(""); setNotice("");
+    setForm({
+      id: provider.id,
+      label: provider.label,
+      baseUrl: provider.baseUrl,
+      api: provider.api,
+      models: provider.models.map((model) => model.id).join("\n"),
+      reasoning: provider.models.some((model) => model.reasoning),
+      developerRole: provider.compat?.supportsDeveloperRole !== false,
+      apiKey: "",
+    });
+  };
+
+  const idValid = /^[a-z][a-z0-9-]{0,31}$/.test((editingId || form.id).trim());
+  const ready = idValid && form.baseUrl.trim() !== "" && form.models.trim() !== "";
+  return <div className="custom-provider-panel">
+    <button className="custom-provider-toggle" type="button" onClick={() => setOpen((current) => !current)} aria-expanded={open}>
+      <Wrench size={13} />自定义 / 第三方部署的模型{catalog.providers.length > 0 ? `（已配置 ${catalog.providers.length} 个）` : ""}<ChevronDown size={13} className={open ? "custom-provider-caret--open" : undefined} />
+    </button>
+    {open && <div className="custom-provider-body">
+      {catalog.providers.length > 0 && <ul className="custom-provider-list">
+        {catalog.providers.map((provider) => <li key={provider.id}>
+          <span><strong>{provider.label}</strong><small>{provider.id} · {provider.baseUrl} · {provider.models.length} 个模型{models.providers.find((item) => item.id === provider.id)?.configured ? " · 凭据已配置" : " · 未配置凭据"}</small></span>
+          <button type="button" onClick={() => edit(provider)} disabled={saving}>编辑</button>
+          <button type="button" onClick={() => void remove(provider)} disabled={saving}>删除</button>
+        </li>)}
+      </ul>}
+      <div className="form-grid">
+        <label>名称<input value={form.label} placeholder="例如 公司网关" onChange={(event) => update({ label: event.target.value })} /></label>
+        <label>Provider id<input value={editingId || form.id} disabled={Boolean(editingId)} placeholder="小写字母、数字和连字符" onChange={(event) => update({ id: event.target.value.toLocaleLowerCase().replace(/[^a-z0-9-]/g, "") })} /></label>
+      </div>
+      <label>Base URL<input value={form.baseUrl} placeholder="https://gateway.example.com/v1" onChange={(event) => update({ baseUrl: event.target.value })} spellCheck={false} /></label>
+      <div className="form-grid">
+        <label>API 类型<select value={form.api} onChange={(event) => update({ api: event.target.value as CustomProviderApi })}>{CUSTOM_PROVIDER_APIS.map((api) => <option value={api} key={api}>{api}</option>)}</select><small className="field-hint">多数第三方与自建部署使用 openai-completions。</small></label>
+        <label>API Key（可选）<input type="password" value={form.apiKey} placeholder={editingId ? "留空表示不修改" : "本地服务可填任意占位值"} onChange={(event) => update({ apiKey: event.target.value })} autoComplete="off" /></label>
+      </div>
+      <label>模型（每行一个）<textarea value={form.models} rows={3} placeholder={"qwen3-coder\ndeepseek-v4-pro"} onChange={(event) => update({ models: event.target.value })} spellCheck={false} /></label>
+      <div className="catalog-switches">
+        <label><input type="checkbox" checked={form.reasoning} onChange={(event) => update({ reasoning: event.target.checked })} />模型支持思考（reasoning）</label>
+        <label><input type="checkbox" checked={!form.developerRole} onChange={(event) => update({ developerRole: !event.target.checked })} />服务端不支持 developer 角色（vLLM、Ollama 等）</label>
+      </div>
+      <p className={`provider-credential-note${error ? " provider-credential-note--error" : notice ? " provider-credential-note--ok" : ""}`}>{error || notice || `密钥以 ${customProviderEnvKey((editingId || form.id).trim() || "provider")} 写入本机配置文件；定义本身不含密钥。`}</p>
+      <div className="custom-provider-actions">
+        {editingId && <button type="button" onClick={reset} disabled={saving}>取消编辑</button>}
+        <button type="button" className="catalog-save" onClick={() => void submit()} disabled={saving || !ready}><Save size={13} />{saving ? "保存中…" : editingId ? "保存修改" : "添加提供商"}</button>
+      </div>
+    </div>}
   </div>;
 }
 
@@ -865,10 +1124,39 @@ function AgentCatalogEditor({ open, catalog, agents, onClose, onSave, onAgentsRe
     <div className={`health-banner ${health?.available ? "health-banner--ready" : ""}`}><Activity size={14} /><span><strong>{health?.label ?? "保存后检查运行时"}</strong><small>{health?.detail ?? "新的运行时配置会创建独立 session"}</small></span></div>
     <div className="form-grid"><label>Handle<input value={selected.id} onChange={(event) => renameNewAgent(event.target.value)} disabled={originalIds.has(selected.id)} /></label><label>显示名<input value={selected.displayName} onChange={(event) => update({ displayName: event.target.value })} /></label></div>
     <label>简介<input value={selected.description} onChange={(event) => update({ description: event.target.value })} /></label><label>能力（逗号分隔）<input value={selected.capabilities.join(", ")} onChange={(event) => update({ capabilities: event.target.value.split(/[,，]/).map((item) => item.trim()).filter(Boolean) })} /></label><label>System prompt<textarea value={selected.systemPrompt} onChange={(event) => update({ systemPrompt: event.target.value })} rows={5} /></label>
-    <div className="form-grid"><label>Runtime<select value={selected.runtime.kind} onChange={(event) => update({ runtime: event.target.value === "pi" ? { kind: "pi", provider: "zai-coding-cn", model: "glm-5.2", thinkingLevel: "medium" } : { kind: "codex", command: "codex" } })}><option value="codex">Codex CLI</option><option value="pi">Pi SDK</option></select></label><label>访问级别<select value={selected.accessMode} onChange={(event) => update({ accessMode: event.target.value as AccessMode })}><option value="read-only">read-only</option><option value="workspace-write">workspace-write</option><option value="full">full</option></select></label></div>
+    <div className="form-grid"><label>Runtime<select value={selected.runtime.kind} onChange={(event) => update({ runtime: event.target.value === "pi" ? defaultPiRuntime(catalogModels) : { kind: "codex", command: "codex" } })}><option value="codex">Codex CLI</option><option value="pi">Pi SDK</option></select></label><label>访问级别<select value={selected.accessMode} onChange={(event) => update({ accessMode: event.target.value as AccessMode })}><option value="read-only">read-only</option><option value="workspace-write">workspace-write</option><option value="full">full</option></select></label></div>
     <div className="form-grid"><label>默认审核者<select value={selected.reviewerAgentId ?? ""} onChange={(event) => update({ reviewerAgentId: event.target.value || undefined })}><option value="">自动选择在线队友</option>{draft.agents.filter((candidate) => candidate.id !== selected.id).map((candidate) => <option value={candidate.id} key={candidate.id}>@{candidate.id}</option>)}</select><small className="field-hint">该 Agent 完成用户任务后，交由谁审核。离线或未配置时自动回退到其他在线 Agent。</small></label></div>
-    {selected.runtime.kind === "pi" ? <div className="form-grid form-grid--three"><label>Provider<input list="pi-provider-options" value={selected.runtime.provider} onChange={(event) => update({ runtime: { ...selected.runtime, provider: event.target.value } as AgentDefinition["runtime"] })} /><datalist id="pi-provider-options">{catalogModels.providers.map((provider) => <option value={provider.id} key={provider.id}>{provider.name}{provider.configured ? (provider.subscription ? "（订阅已登录）" : "（凭据已配置）") : "（未配置凭据）"}</option>)}</datalist></label><label>Model<input list="pi-model-options" value={selected.runtime.model} onChange={(event) => update({ runtime: { ...selected.runtime, model: event.target.value } as AgentDefinition["runtime"] })} /><datalist id="pi-model-options">{(catalogModels.providers.find((provider) => provider.id === (selected.runtime as { provider: string }).provider)?.models ?? []).map((model) => <option value={model.id} key={model.id}>{model.name}</option>)}</datalist></label><label>Thinking<select value={selected.runtime.thinkingLevel} onChange={(event) => update({ runtime: { ...selected.runtime, thinkingLevel: event.target.value as ThinkingLevel } as AgentDefinition["runtime"] })}>{["off", "minimal", "low", "medium", "high", "xhigh", "max"].map((level) => <option key={level}>{level}</option>)}</select></label></div> : <><div className="form-grid"><label>CLI 路径<input value={selected.runtime.command} onChange={(event) => update({ runtime: { ...selected.runtime, command: event.target.value } as AgentDefinition["runtime"] })} /></label><label>Model<input value={selected.runtime.model ?? ""} placeholder="使用 profile 默认值" onChange={(event) => update({ runtime: { ...selected.runtime, model: event.target.value || undefined } as AgentDefinition["runtime"] })} /></label></div><div className="form-grid"><label>Profile<input value={selected.runtime.profile ?? ""} onChange={(event) => update({ runtime: { ...selected.runtime, profile: event.target.value || undefined } as AgentDefinition["runtime"] })} /></label><label>Reasoning<select value={selected.runtime.reasoningEffort ?? ""} onChange={(event) => update({ runtime: { ...selected.runtime, reasoningEffort: (event.target.value || undefined) as "low" | "medium" | "high" | "xhigh" | undefined } as AgentDefinition["runtime"] })}><option value="">profile 默认值</option>{["low", "medium", "high", "xhigh"].map((level) => <option key={level}>{level}</option>)}</select></label></div></>}
+    {selected.runtime.kind === "pi" ? <div className="form-grid form-grid--three">
+      <ProviderPicker
+        key={selected.id}
+        value={selected.runtime.provider}
+        providers={catalogModels.providers}
+        onChange={(provider) => {
+          const runtime = selected.runtime as Extract<AgentDefinition["runtime"], { kind: "pi" }>;
+          // A model from the previous provider almost never exists on the new
+          // one, so the first model there is a better starting point than an
+          // Agent that cannot resolve its model.
+          const models = catalogModels.providers.find((item) => item.id === provider)?.models ?? [];
+          const model = models.some((item) => item.id === runtime.model) ? runtime.model : models[0]?.id ?? runtime.model;
+          update({ runtime: { ...runtime, provider, model } });
+        }}
+      />
+      <ModelPicker
+        key={`${selected.id}:${selected.runtime.provider}`}
+        value={selected.runtime.model}
+        models={catalogModels.providers.find((item) => item.id === (selected.runtime as { provider: string }).provider)?.models ?? []}
+        onChange={(model) => update({ runtime: { ...selected.runtime, model } as AgentDefinition["runtime"] })}
+      />
+      <label>Thinking<select value={selected.runtime.thinkingLevel} onChange={(event) => update({ runtime: { ...selected.runtime, thinkingLevel: event.target.value as ThinkingLevel } as AgentDefinition["runtime"] })}>{["off", "minimal", "low", "medium", "high", "xhigh", "max"].map((level) => <option key={level}>{level}</option>)}</select></label>
+    </div> : <><div className="form-grid"><label>CLI 路径<input value={selected.runtime.command} onChange={(event) => update({ runtime: { ...selected.runtime, command: event.target.value } as AgentDefinition["runtime"] })} /></label><label>Model<input value={selected.runtime.model ?? ""} placeholder="使用 profile 默认值" onChange={(event) => update({ runtime: { ...selected.runtime, model: event.target.value || undefined } as AgentDefinition["runtime"] })} /></label></div><div className="form-grid"><label>Profile<input value={selected.runtime.profile ?? ""} onChange={(event) => update({ runtime: { ...selected.runtime, profile: event.target.value || undefined } as AgentDefinition["runtime"] })} /></label><label>Reasoning<select value={selected.runtime.reasoningEffort ?? ""} onChange={(event) => update({ runtime: { ...selected.runtime, reasoningEffort: (event.target.value || undefined) as "low" | "medium" | "high" | "xhigh" | undefined } as AgentDefinition["runtime"] })}><option value="">profile 默认值</option>{["low", "medium", "high", "xhigh"].map((level) => <option key={level}>{level}</option>)}</select></label></div></>}
     {selected.runtime.kind === "pi" && <ProviderCredentialField provider={selected.runtime.provider} models={catalogModels} onSaved={(nextAgents, nextModels) => { onAgentsRefreshed(nextAgents); setCatalogModels(nextModels); }} />}
+    {selected.runtime.kind === "pi" && <CustomProviderPanel
+      catalog={catalogModels.custom ?? { version: 1, providers: [] }}
+      models={catalogModels}
+      onSaved={(nextAgents, nextModels) => { onAgentsRefreshed(nextAgents); setCatalogModels(nextModels); }}
+      onSelect={(provider, model) => update({ runtime: { ...(selected.runtime as Extract<AgentDefinition["runtime"], { kind: "pi" }>), provider, ...(model ? { model } : {}) } })}
+    />}
+    {(catalogModels.warnings ?? []).map((warning) => <p className="risk-warning" key={warning}>{warning}</p>)}
     <div className="catalog-switches"><label><input type="checkbox" checked={selected.enabled} disabled={selected.id === draft.defaultAgentId} onChange={(event) => update({ enabled: event.target.checked })} />启用</label><label><input type="radio" name="default-agent" checked={selected.id === draft.defaultAgentId} onChange={() => setDraft((current) => ({ ...current, defaultAgentId: selected.id, agents: current.agents.map((agent) => agent.id === selected.id ? { ...agent, enabled: true } : agent) }))} />设为默认 Agent</label></div>
     {selected.runtime.kind === "pi" && selected.accessMode === "full" && <p className="risk-warning">Pi full 会开放 Bash/edit/write，缺少完整文件系统沙箱。只在信任的本地工作目录使用。</p>}{selected.runtime.kind === "codex" && selected.accessMode === "full" && <p className="risk-warning">Codex v1 会把 full 映射为 workspace-write，不启用 danger-full-access。</p>}
   </div>}</div><footer>{error && <span className="catalog-error"><XCircle size={13} />{error}</span>}<button type="button" className="catalog-cancel" onClick={onClose}>取消</button><button type="button" className="catalog-save" onClick={() => void submit()} disabled={saving}><Save size={14} />{saving ? "保存中…" : "原子保存花名册"}</button></footer></section></div>;

@@ -8,6 +8,14 @@ import {
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
 import { resolve } from "node:path";
+import {
+  customProviderEnvKey,
+  DEFAULT_CUSTOM_CONTEXT_WINDOW,
+  DEFAULT_CUSTOM_MAX_TOKENS,
+  emptyCustomProviderCatalog,
+  type CustomProvider,
+  type CustomProviderCatalogV1,
+} from "../config/custom-providers.js";
 
 export type ProjectTrustMode = "never" | "always";
 
@@ -21,6 +29,16 @@ export function resolveProjectTrustMode(
   environment: NodeJS.ProcessEnv = process.env,
 ): ProjectTrustMode {
   return environment.MAO_PI_PROJECT_TRUST === "always" ? "always" : "never";
+}
+
+export interface PiCustomProviderSource {
+  load(): Promise<CustomProviderCatalogV1>;
+}
+
+export interface PiSharedRuntimeOptions {
+  trustMode?: ProjectTrustMode;
+  /** Third-party deployments registered on the model runtime before first use. */
+  customProviders?: PiCustomProviderSource;
 }
 
 export interface PiResources {
@@ -39,14 +57,23 @@ export interface PiResources {
 export class PiSharedRuntime {
   private modelRuntimePromise: Promise<ModelRuntime> | undefined;
   private readonly resources = new Map<string, Promise<PiResources>>();
+  private readonly trustMode: ProjectTrustMode;
+  private readonly customProviders: PiCustomProviderSource | undefined;
+  private providerWarnings: string[] = [];
 
-  public constructor(
-    private readonly trustMode: ProjectTrustMode = resolveProjectTrustMode(),
-  ) {}
+  public constructor(options: PiSharedRuntimeOptions = {}) {
+    this.trustMode = options.trustMode ?? resolveProjectTrustMode();
+    this.customProviders = options.customProviders;
+  }
 
   public modelRuntime(): Promise<ModelRuntime> {
-    this.modelRuntimePromise ??= ModelRuntime.create();
+    this.modelRuntimePromise ??= this.createModelRuntime();
     return this.modelRuntimePromise;
+  }
+
+  /** Custom providers that could not be registered, for the roster editor. */
+  public warnings(): string[] {
+    return [...this.providerWarnings];
   }
 
   public resourcesFor(cwd: string): Promise<PiResources> {
@@ -69,7 +96,33 @@ export class PiSharedRuntime {
 
   public dispose(): void {
     this.modelRuntimePromise = undefined;
+    this.providerWarnings = [];
     this.resources.clear();
+  }
+
+  /**
+   * One bad custom provider must not take the whole model runtime down with it:
+   * every other Agent would go offline for a definition none of them use. The
+   * failure is recorded and surfaced next to the definition instead.
+   */
+  private async createModelRuntime(): Promise<ModelRuntime> {
+    const runtime = await ModelRuntime.create();
+    const warnings: string[] = [];
+    const catalog = this.customProviders
+      ? await this.customProviders.load().catch((error: unknown) => {
+          warnings.push(`自定义提供商配置读取失败：${describe(error)}`);
+          return emptyCustomProviderCatalog();
+        })
+      : emptyCustomProviderCatalog();
+    for (const provider of catalog.providers) {
+      try {
+        runtime.registerProvider(provider.id, toPiProviderConfig(provider));
+      } catch (error) {
+        warnings.push(`自定义提供商 ${provider.id} 注册失败：${describe(error)}`);
+      }
+    }
+    this.providerWarnings = warnings;
+    return runtime;
   }
 
   private async loadResources(cwd: string): Promise<PiResources> {
@@ -151,4 +204,36 @@ export class RequestResourceLoader implements ResourceLoader {
   ): Promise<void> {
     await this.base.reload(options);
   }
+}
+
+/**
+ * Pi's provider config wants a complete model definition; the editor only asks
+ * for what a user can reasonably know, so the rest gets neutral defaults. Cost
+ * is zero because a self-hosted or proxied deployment has no public price list
+ * — usage still shows tokens, just no dollar figure.
+ */
+export function toPiProviderConfig(
+  provider: CustomProvider,
+): Parameters<ModelRuntime["registerProvider"]>[1] {
+  return {
+    name: provider.label,
+    baseUrl: provider.baseUrl,
+    apiKey: `$${customProviderEnvKey(provider.id)}`,
+    api: provider.api,
+    ...(provider.headers ? { headers: { ...provider.headers } } : {}),
+    models: provider.models.map((model) => ({
+      id: model.id,
+      name: model.name ?? model.id,
+      reasoning: model.reasoning ?? false,
+      input: model.input ? [...model.input] : ["text"],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: model.contextWindow ?? DEFAULT_CUSTOM_CONTEXT_WINDOW,
+      maxTokens: model.maxTokens ?? DEFAULT_CUSTOM_MAX_TOKENS,
+      ...(provider.compat ? { compat: { ...provider.compat } } : {}),
+    })),
+  };
+}
+
+function describe(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }

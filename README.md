@@ -20,7 +20,20 @@ Agent 交付的成果要由**另一个** Agent 把关后才算完成：自称做
 - **配置凭据**：花名册里选中一个 Pi Agent，在 provider 下方直接填写该 provider 的 API Key。密钥按 provider 分别保存，不会覆盖其他 provider，也不会改变已有 Agent 指向的 provider。保存后立即生效，无需重启；有 Agent 正在运行或排队时会拒绝保存，以免中断本轮对话。
 - **前端区分**：头像颜色由 handle 哈希得出，首字母取每个连字符段的首字符（`pi-deepseek` → `PD`，`pi-glm` → `PG`），消息头的运行时标签为 `Pi · provider · model`，因此同模型不同 provider 的两个 Agent 也能分辨。
 - **并发**：只读 Agent 可并行（上限 `MAO_MAX_PARALLEL_READ_RUNS`），同一工作目录内的写运行仍然串行，与 provider 无关。
-- 自定义 provider（写在 pi 的 `models.json` 里）不在内置列表中，凭据请用 `pi` 登录写入 `auth.json`。
+- **选择模型**：provider 和 model 都是下拉列表，直接列出 pi 认识的全部提供商（按「自定义 / 已配置凭据 / 未配置凭据」分组）和该提供商的模型；两个下拉都保留「手动输入」，因此写在 pi 自己 `models.json` 里的 provider 依然可用。
+- 换 provider 时，如果原来的模型在新 provider 上不存在，会自动切到该 provider 的第一个模型，而不是留下一个解析不出模型的 Agent。
+
+## 模型提供商与第三方部署
+
+内置提供商共 35 个，覆盖 Z.AI、DeepSeek、Kimi、通义千问、MiniMax、小米 MiMo、百灵、OpenAI、Anthropic、Gemini、xAI、OpenRouter、Vercel AI Gateway、Mistral、Groq、Cerebras、Together、Fireworks、Baseten、NVIDIA、Hugging Face、OpenCode、Azure OpenAI、Bedrock、Vertex 等。首次启动页先显示常用的几个，点「更多提供商」展开全部；花名册里则可以为其中任何一个直接填 API Key，密钥按提供商各写一份到本机配置文件，互不覆盖。
+
+公司网关、代理和自建部署（vLLM、Ollama、LM Studio 等 OpenAI 兼容服务）不需要再手改 pi 的 `models.json`：在花名册里选中一个 Pi Agent，展开「自定义 / 第三方部署的模型」，填写名称、provider id、Base URL、API 类型和模型名即可。
+
+- 定义保存在 `.data/custom-providers.json`，保存后立即注册到 pi 的模型运行时，无需重启；密钥仍然单独存放（环境变量 `MAO_CUSTOM_<ID>_API_KEY`），定义本身不含密钥。
+- API 类型支持 `openai-completions`、`openai-responses`、`anthropic-messages`、`google-generative-ai`，多数第三方与自建服务用 `openai-completions`。勾选「服务端不支持 developer 角色」可兼容 vLLM、Ollama 一类不接受 `developer` 角色和 `reasoning_effort` 的服务。
+- 有 Agent 正在运行或排队时拒绝保存；删除仍被某个 Agent 使用的提供商会被拒绝，而不是让那个 Agent 悄悄离线。
+- 一个自定义定义写错不会拖垮其他 Agent：注册失败只记录为警告并显示在花名册里，其余提供商照常可用。
+- 走订阅或系统凭据登录的提供商（Codex 订阅、Copilot、Vertex ADC 等）仍然请用 `pi` 的 `/login` 写入 `auth.json`，界面会如实说明。
 
 ## 路由语义
 
@@ -77,7 +90,7 @@ JSONL EventStore 使用串行 append。旧日志中的 `recipientAgentId`、`roo
 3. 选择“仅使用 API”即可完全不使用 Codex；如本机已经安装并登录 Codex CLI，也可以选择“API + Codex”。
 4. 点击“保存并进入工作台”。配置会立即生效，不需要打开配置文件或重启应用。
 
-首次启动页支持 Z.AI 中国区/全球版、DeepSeek、OpenAI、Anthropic 和 Google Gemini。选择 DeepSeek 时默认使用官方 `deepseek-v4-flash` 模型和 `DEEPSEEK_API_KEY`。密钥只发送给应用自身绑定在 `127.0.0.1` 的本地服务，并以仅当前用户可读的方式写入用户数据目录。已经通过旧版 `config.env` 配置过密钥的用户会直接进入工作台，不会被重复拦截。
+首次启动页默认列出常用提供商（Z.AI 中国区/全球版、DeepSeek、Kimi、通义千问、OpenAI、Anthropic、Gemini、OpenRouter），点「更多提供商」可展开全部 35 个；第三方或自建部署的模型进入工作台后在 Agent 花名册里添加。选择 DeepSeek 时默认使用官方 `deepseek-v4-flash` 模型和 `DEEPSEEK_API_KEY`。密钥只发送给应用自身绑定在 `127.0.0.1` 的本地服务，并以仅当前用户可读的方式写入用户数据目录。已经通过旧版 `config.env` 配置过密钥的用户会直接进入工作台，不会被重复拦截。
 
 桌面版默认配置为：
 
