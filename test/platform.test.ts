@@ -18,6 +18,7 @@ import type {
 } from "../src/core/types.js";
 import type {
   AgentRuntime,
+  ReviewAssignment,
   RuntimeRequest,
   RuntimeResult,
 } from "../src/runtime/runtime.js";
@@ -550,7 +551,7 @@ test("declaring a completion opens a verify review carrying the evidence", async
   );
   assert.match(brief?.content ?? "", /修好了解析器/);
   assert.match(brief?.content ?? "", /src\/parser\.ts/);
-  assert.match(brief?.content ?? "", /not evidence that it is true/);
+  assert.match(brief?.content ?? "", /they prove nothing by themselves/);
   assert.equal(single(events, "review.resolved").outcome, "approved");
 });
 
@@ -587,6 +588,7 @@ test("a critique that requests changes reworks the plan as a critique round", as
         verdict: verdicts.shift() ?? "approved",
         summary: "第二步风险没交代",
         findings: ["补上回滚方案"],
+        checks: ["逐条对照了原始任务与方案步骤"],
       });
       return emitOutput(request, "审毕");
     },
@@ -665,7 +667,7 @@ test("a reviewer cannot declare a deliverable of its own", async () => {
     },
     pi: async (request) => {
       results.push(await request.declareDeliverable({ kind: "completion", summary: "我也交付" }));
-      await request.submitReview?.({ verdict: "approved", summary: "没问题" });
+      await request.submitReview?.({ verdict: "approved", summary: "没问题", checks: ["读过改动"] });
       return emitOutput(request, "审毕");
     },
   });
@@ -934,6 +936,140 @@ test("an offline configured reviewer falls back to another routable peer", async
   assert.equal(single(events, "review.requested").reviewerAgentId, "codex");
 });
 
+test("a peer that co-authored this chain loses the review to an uninvolved peer", async () => {
+  const author = { ...agent("pi"), reviewerAgentId: "codex" };
+  const seen: string[] = [];
+  const platform = createReviewPlatform([author, agent("codex"), agent("research")], {
+    pi: async (request) => {
+      await request.postMessage({
+        content: "@codex 帮我把解析那段写了",
+        idempotencyKey: "handoff-1",
+      });
+      return emitOutput(request, "交付");
+    },
+    codex: async (request) => emitOutput(request, "解析写好了"),
+    research: approving(seen),
+  });
+
+  await platform.postUserMessage({ content: "@pi 实现" });
+  const events = await platform.getEvents();
+
+  // codex is the configured reviewer, but it produced part of this very work.
+  assert.equal(single(events, "review.requested").reviewerAgentId, "research");
+  assert.deepEqual(seen, ["research"]);
+  assert.equal(single(events, "review.resolved").outcome, "approved");
+});
+
+test("the last remaining reviewer is used even after co-authoring, and told it is not neutral", async () => {
+  let assignment: ReviewAssignment | undefined;
+  const platform = createReviewPlatform([agent("pi"), agent("codex")], {
+    pi: async (request) => {
+      await request.postMessage({
+        content: "@codex 你先写一版",
+        idempotencyKey: "handoff-1",
+      });
+      return emitOutput(request, "交付");
+    },
+    codex: async (request) => {
+      if (!request.reviewOf) return emitOutput(request, "写好了");
+      assignment = request.reviewOf;
+      await request.submitReview?.({
+        verdict: "approved",
+        summary: "连我自己那段一起核对过",
+        checks: ["重新读了一遍改动"],
+      });
+      return emitOutput(request, "审毕");
+    },
+  });
+
+  const result = await platform.postUserMessage({ content: "@pi 实现" });
+  const events = await platform.getEvents();
+
+  // A compromised reviewer still beats nobody looking at the work at all.
+  assert.equal(single(events, "review.requested").reviewerAgentId, "codex");
+  assert.equal(assignment?.independent, false);
+  const messages = await platform.getThreadMessages(result.threadId);
+  const brief = messages.find((message) => message.kind === "review-request");
+  assert.match(brief?.content ?? "", /not a neutral party/);
+});
+
+test("the review brief tells the reviewer to disbelieve the claim and check for itself", async () => {
+  let assignment: ReviewAssignment | undefined;
+  const platform = createReviewPlatform([agent("pi"), agent("codex")], {
+    pi: async (request) => emitOutput(request, "交付"),
+    codex: async (request) => {
+      assignment = request.reviewOf;
+      await request.submitReview?.({
+        verdict: "approved",
+        summary: "核对过了",
+        checks: ["自己跑了测试"],
+      });
+      return emitOutput(request, "审毕");
+    },
+  });
+
+  const result = await platform.postUserMessage({ content: "@pi 实现" });
+  const messages = await platform.getThreadMessages(result.threadId);
+  const brief = messages.find((message) => message.kind === "review-request");
+
+  assert.equal(assignment?.independent, true);
+  assert.match(brief?.content ?? "", /default position is not-approved/);
+  assert.match(brief?.content ?? "", /primary sources/);
+  assert.doesNotMatch(brief?.content ?? "", /not a neutral party/);
+});
+
+test("approved without a check the reviewer ran itself is rejected", async () => {
+  const attempts: Array<{ accepted: boolean; reason?: string }> = [];
+  const platform = createReviewPlatform([agent("pi"), agent("codex")], {
+    pi: async (request) => emitOutput(request, "交付"),
+    codex: async (request) => {
+      attempts.push(await request.submitReview!({ verdict: "approved", summary: "看着没问题" }));
+      attempts.push(
+        await request.submitReview!({ verdict: "approved", summary: "看着没问题", checks: ["   "] }),
+      );
+      attempts.push(
+        await request.submitReview!({
+          verdict: "approved",
+          summary: "核对过了",
+          checks: ["自己跑了一遍解析用例"],
+        }),
+      );
+      return emitOutput(request, "审毕");
+    },
+  });
+
+  await platform.postUserMessage({ content: "@pi 实现" });
+  const events = await platform.getEvents();
+
+  // Repeating the author's word is not a review, so it cannot close the gate.
+  assert.deepEqual(attempts.map((attempt) => attempt.accepted), [false, false, true]);
+  assert.match(attempts[0]?.reason ?? "", /check/i);
+  const submitted = single(events, "review.submitted");
+  assert.deepEqual(submitted.checks, ["自己跑了一遍解析用例"]);
+  assert.equal(single(events, "review.resolved").outcome, "approved");
+});
+
+test("changes-requested needs no check, so doubt is never harder than approval", async () => {
+  const platform = createReviewPlatform([agent("pi"), agent("codex")], {
+    pi: async (request) => emitOutput(request, "交付"),
+    codex: async (request) => {
+      await request.submitReview?.({
+        verdict: "changes-requested",
+        summary: "证据对不上",
+        findings: ["声称改了的文件里没有这段代码"],
+      });
+      return emitOutput(request, "审毕");
+    },
+  }, { maxReviewRounds: 1 });
+
+  await platform.postUserMessage({ content: "@pi 实现" });
+  const events = await platform.getEvents();
+
+  assert.equal(single(events, "review.submitted").verdict, "changes-requested");
+  assert.equal(single(events, "review.submitted").checks, undefined);
+  assert.equal(single(events, "review.resolved").escalation, "max-rounds");
+});
+
 test("a task with no eligible reviewer escalates instead of passing", async () => {
   const platform = createReviewPlatform([agent("pi")], {
     pi: async (request) => emitOutput(request, "只有我一个人"),
@@ -964,6 +1100,7 @@ test("changes-requested hands feedback back to the author and re-reviews the rew
         verdict: verdicts.shift() ?? "approved",
         summary: "缺少错误处理",
         findings: ["为解析失败补一个分支"],
+        checks: ["自己读了改动文件的解析分支"],
       });
       return emitOutput(request, "审毕");
     },
@@ -1152,6 +1289,7 @@ test("review and rework runs do not consume the per-chain run budget", async () 
         verdict: verdicts.shift() ?? "approved",
         summary: "补一下",
         findings: ["补一下"],
+        checks: ["自己跑了一遍验证命令"],
       });
       return emitOutput(request, "审毕");
     },
@@ -1176,6 +1314,7 @@ test("review and rework runs keep the author's causal depth", async () => {
         verdict: verdicts.shift() ?? "approved",
         summary: "补一下",
         findings: ["补一下"],
+        checks: ["自己跑了一遍验证命令"],
       });
       return emitOutput(request, "审毕");
     },
@@ -1340,7 +1479,11 @@ function createSmartPlatform(
 function approving(order: string[]): (request: RuntimeRequest) => Promise<RuntimeResult> {
   return async (request) => {
     order.push(request.agent.id);
-    await request.submitReview?.({ verdict: "approved", summary: "看过了，可以交付" });
+    await request.submitReview?.({
+      verdict: "approved",
+      summary: "看过了，可以交付",
+      checks: ["自己读了产出的文件"],
+    });
     return emitOutput(request, "审毕");
   };
 }

@@ -75,11 +75,11 @@ server.registerTool(
   "submit_review",
   {
     description:
-      "Record your verdict on work you were asked to review. Only available while reviewing another Agent's deliverable. Call it exactly once.",
+      "Record your verdict on work you were asked to review. Only available while reviewing another Agent's deliverable. Call it exactly once. You are an independent skeptic: approve only what you checked yourself.",
     inputSchema: {
       verdict: z
         .enum(["approved", "changes-requested"])
-        .describe("approved when the work can ship as is"),
+        .describe("approved only when your own checks show the work can ship as is"),
       summary: z
         .string()
         .min(1)
@@ -89,9 +89,15 @@ server.registerTool(
         .array(z.string())
         .optional()
         .describe("Concrete, actionable changes. Required for changes-requested."),
+      checks: z
+        .array(z.string())
+        .optional()
+        .describe(
+          "What you verified yourself: files read, commands run, output observed. Required for approved — the author's own evidence does not count.",
+        ),
     },
   },
-  async ({ verdict, summary, findings }) => {
+  async ({ verdict, summary, findings, checks }) => {
     const response = await fetch(reviewCallbackUrl, {
       method: "POST",
       headers: {
@@ -105,6 +111,7 @@ server.registerTool(
         verdict,
         summary,
         ...(findings ? { findings } : {}),
+        ...(checks ? { checks } : {}),
       }),
     });
     const result = (await response.json()) as SubmitReviewResult & { error?: string };

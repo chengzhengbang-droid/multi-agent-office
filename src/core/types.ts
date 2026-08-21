@@ -156,6 +156,13 @@ export interface ReviewSubmission {
   verdict: ReviewVerdict;
   summary: string;
   findings?: string[];
+  /**
+   * What the reviewer checked for itself, and how — the files it read, the
+   * commands it ran, the outputs it saw. Required to approve: an approval that
+   * cannot name an independent check is the author's word repeated back.
+   * Absent in pre-skeptical-review event logs, which replay unchanged.
+   */
+  checks?: string[];
 }
 
 export type RunStatus =
@@ -335,6 +342,8 @@ export type PlatformEventPayload =
       verdict: ReviewVerdict;
       summary: string;
       findings?: string[];
+      /** What the reviewer verified itself. Absent in pre-skeptical-review logs. */
+      checks?: string[];
     }
   | {
       type: "review.rework";

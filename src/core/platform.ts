@@ -901,6 +901,7 @@ export class MultiAgentPlatform {
       round: run.reviewRound ?? 1,
       maxRounds: this.maxReviewRounds,
       reviewType: run.reviewType ?? this.taskReviewTypes.get(run.taskRunId) ?? "verify",
+      independent: this.isIndependentReviewer(run.causal.chainId, run.agentId),
       ...(declaration ? { declaration } : {}),
     };
   }
@@ -923,7 +924,7 @@ export class MultiAgentPlatform {
     const reviewType = this.reviewTypeFor(run, taskRunId);
     const declaration = this.runDeliverables.get(run.id);
 
-    const reviewerAgentId = this.resolveReviewer(run.agentId);
+    const reviewerAgentId = this.resolveReviewer(run.agentId, run.causal.chainId);
     const reviewer = reviewerAgentId ? this.agents.get(reviewerAgentId) : undefined;
     if (!reviewerAgentId || !reviewer) {
       await this.resolveReview(
@@ -955,6 +956,7 @@ export class MultiAgentPlatform {
         round,
         maxRounds: this.maxReviewRounds,
         reviewType,
+        independent: this.isIndependentReviewer(run.causal.chainId, reviewerAgentId),
         ...(declaration ? { declaration } : {}),
       }),
       intent: "review-request",
@@ -1002,15 +1004,45 @@ export class MultiAgentPlatform {
     this.startScheduler();
   }
 
-  private resolveReviewer(authorAgentId: Id): Id | undefined {
-    const preferred = this.agents.get(authorAgentId)?.reviewerAgentId;
-    if (preferred && preferred !== authorAgentId && this.isRoutable(preferred)) {
-      return preferred;
-    }
-    // Roster order, so the fallback is deterministic and assertable.
-    return [...this.agents.keys()].find(
+  /**
+   * Picks the most independent peer available. An Agent that already produced
+   * work in this chain has its own judgment invested in the result: asking it
+   * to review is asking it to find fault with a plan it helped make, so a peer
+   * that touched nothing here outranks even the configured reviewer. A
+   * compromised reviewer still beats no reviewer — the last fallback keeps the
+   * old behaviour rather than escalating a task nobody looked at.
+   */
+  private resolveReviewer(authorAgentId: Id, chainId: Id): Id | undefined {
+    // Roster order throughout, so every fallback stays deterministic.
+    const candidates = [...this.agents.keys()].filter(
       (id) => id !== authorAgentId && this.isRoutable(id),
     );
+    const contributors = this.chainContributors(chainId);
+    const independent = candidates.filter((id) => !contributors.has(id));
+    const preferred = this.agents.get(authorAgentId)?.reviewerAgentId;
+    if (preferred && independent.includes(preferred)) return preferred;
+    if (independent.length > 0) return independent[0];
+    if (preferred && candidates.includes(preferred)) return preferred;
+    return candidates[0];
+  }
+
+  /** True when the reviewer produced no work of its own in this chain. */
+  private isIndependentReviewer(chainId: Id, reviewerAgentId: Id): boolean {
+    return !this.chainContributors(chainId).has(reviewerAgentId);
+  }
+
+  /**
+   * Agents that produced work in this collaboration chain. Review runs are not
+   * counted: a reviewer that already rejected round 1 is exactly who should
+   * judge the rework, and counting its own review would disqualify it.
+   */
+  private chainContributors(chainId: Id): Set<Id> {
+    const contributors = new Set<Id>();
+    for (const run of this.runs.values()) {
+      if (run.causal.chainId !== chainId || run.purpose === "review") continue;
+      contributors.add(run.agentId);
+    }
+    return contributors;
   }
 
   private async settleReview(reviewRun: AgentRun): Promise<void> {
@@ -1260,10 +1292,26 @@ export class MultiAgentPlatform {
         reason: "changes-requested must list at least one concrete finding",
       };
     }
+    const checks = (input.checks ?? [])
+      .map((check) => check.trim())
+      .filter(Boolean)
+      .slice(0, 20);
+    // The burden of proof sits with the approval, not with the rejection. A
+    // reviewer that cannot name one thing it checked for itself has only
+    // relayed the author's claim, which is exactly what the gate exists to
+    // stop; rejecting here sends it back to verify rather than passing.
+    if (input.verdict === "approved" && checks.length === 0) {
+      return {
+        accepted: false,
+        reason:
+          "approved must list at least one check you ran yourself (file read, command executed, output observed)",
+      };
+    }
     const submission: ReviewSubmission = {
       verdict: input.verdict,
       summary,
       ...(findings.length > 0 ? { findings } : {}),
+      ...(checks.length > 0 ? { checks } : {}),
     };
     this.reviewSubmissions.set(run.id, submission);
     await this.record({
@@ -1705,6 +1753,8 @@ function buildReviewRequestContent(input: {
   round: number;
   maxRounds: number;
   reviewType: ReviewType;
+  /** False when no peer outside this chain was available to review. */
+  independent: boolean;
   declaration?: DeliverableDeclaration;
 }): string {
   const evidence = input.declaration?.evidence ?? [];
@@ -1721,24 +1771,35 @@ function buildReviewRequestContent(input: {
     : [];
   const header =
     input.reviewType === "critique"
-      ? `@${input.reviewerAgentId} Critique @${input.authorAgentId}'s plan — round ${input.round} of ${input.maxRounds}.`
-      : `@${input.reviewerAgentId} Verify @${input.authorAgentId}'s completed work — round ${input.round} of ${input.maxRounds}.`;
+      ? `@${input.reviewerAgentId} Independently critique @${input.authorAgentId}'s plan — round ${input.round} of ${input.maxRounds}.`
+      : `@${input.reviewerAgentId} Independently verify @${input.authorAgentId}'s completed work — round ${input.round} of ${input.maxRounds}.`;
   // The two briefs differ in what counts as doing the job: a plan is judged on
   // its reasoning, finished work on the artifacts it claims to have produced.
-  // An author's "done" is a claim to check, never a fact to take on trust.
+  // Both start from disbelief: an author's "done" is a claim to test, never a
+  // fact to take on trust, and agreement is what has to be earned here.
   const brief =
     input.reviewType === "critique"
       ? [
-          "This is a plan, not finished work. Pressure-test it before anyone builds it.",
-          "Give structured feedback: what is sound, what is risky or missing, and concrete improvements.",
-          "approved means the plan is ready to execute. changes-requested returns concrete suggestions for one revision round.",
+          "Your default position is not-ready. The author has to convince you, not the other way round.",
+          "This is a plan, not finished work. Try to break it before anyone builds it.",
+          "Judge it against the human's original task above, not against the author's framing of that task.",
+          "Attack the assumptions it never argues for, the failure modes it skips, and the work it hides behind one line.",
+          "approved means you would put your own name on executing it as written. changes-requested returns concrete suggestions for one revision round.",
         ]
       : [
-          "The author says this is done. That claim is what you are checking, not evidence that it is true.",
-          "Verify against the artifacts: read the files it says it changed, run the verification it states.",
-          "Approve only what you actually verified. Say plainly what you could not check with the access you have.",
+          "Your default position is not-approved. The burden of proof is on the author's claim, not on your doubt.",
+          "The summary and the evidence above are assertions. They are what you test; they prove nothing by themselves.",
+          "Go to the primary sources yourself: open the files it says it changed, run the commands it says it ran, read the real output.",
+          "Look for what the claim would hide: dropped requirements from the original task, untouched edge cases, error paths, tests that assert nothing, changes it never mentioned.",
+          "Anything you could not check with the access you have is unverified. Say so plainly, and never approve on it.",
           "Do not redo the work yourself. Say concretely what must change.",
         ];
+  const independence = input.independent
+    ? []
+    : [
+        "You already worked in this chain, so you are not a neutral party here — no uninvolved peer was available.",
+        "Hold your own contribution to the same standard you would apply to anyone else's.",
+      ];
   return [
     header,
     "",
@@ -1752,8 +1813,10 @@ function buildReviewRequestContent(input: {
     "</deliverable>",
     "",
     ...brief,
+    ...independence,
     "Finish by calling submit_review exactly once: approved, or changes-requested with concrete findings.",
-    "Do not manufacture agreement to close the loop.",
+    "approved requires listing at least one check you ran yourself; an approval that cannot name one is rejected.",
+    "Do not manufacture agreement to close the loop. A review that finds nothing has usually not looked.",
     "Ending without submit_review is not an approval — it escalates the task to the human.",
   ].join("\n");
 }
