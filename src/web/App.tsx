@@ -131,6 +131,8 @@ interface ReviewState {
   round: number;
   summary?: string;
   findings?: string[];
+  /** What the reviewer verified for itself. Present on approvals. */
+  checks?: string[];
   escalation?: ReviewEscalation;
   detail?: string;
 }
@@ -1307,6 +1309,12 @@ function ReviewCard({ review, agents }: { review: ReviewState; agents: AgentSumm
       {review.findings && review.findings.length > 0 && (
         <ul>{review.findings.map((finding, index) => <li key={`${index}-${finding}`}>{finding}</li>)}</ul>
       )}
+      {review.checks && review.checks.length > 0 && (
+        <>
+          <p className="review-card-checks-title">审核者自己验证过的：</p>
+          <ul>{review.checks.map((check, index) => <li key={`${index}-${check}`}>{check}</li>)}</ul>
+        </>
+      )}
     </div>
   );
 }
@@ -1441,6 +1449,7 @@ function applyReviewEvent(run: Extract<TranscriptItem, { type: "agent" }> | unde
       status: event.verdict === "approved" ? "approved" : "changes-requested",
       summary: event.summary,
       ...(event.findings ? { findings: event.findings } : {}),
+      ...(event.checks ? { checks: event.checks } : {}),
     };
     return;
   }

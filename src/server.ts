@@ -779,6 +779,9 @@ function parseReviewCallbackRequest(body: Record<string, unknown>): ReviewCallba
   const findings = Array.isArray(body.findings)
     ? body.findings.filter((finding): finding is string => typeof finding === "string")
     : undefined;
+  const checks = Array.isArray(body.checks)
+    ? body.checks.filter((check): check is string => typeof check === "string")
+    : undefined;
   return {
     runId: body.runId as string,
     threadId: body.threadId as string,
@@ -786,6 +789,7 @@ function parseReviewCallbackRequest(body: Record<string, unknown>): ReviewCallba
     verdict: body.verdict,
     summary: body.summary as string,
     ...(findings && findings.length > 0 ? { findings } : {}),
+    ...(checks && checks.length > 0 ? { checks } : {}),
   };
 }
 

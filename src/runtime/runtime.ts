@@ -81,6 +81,12 @@ export interface ReviewAssignment {
   maxRounds: number;
   /** Verifying a completion claim, or critiquing a plan. */
   reviewType: ReviewType;
+  /**
+   * False when the reviewer already produced work in this collaboration chain,
+   * so its judgment is not neutral. The platform still runs the review — a
+   * compromised reviewer beats none — but says so in the brief.
+   */
+  independent: boolean;
   /** The author's own claim, for a reviewer to check rather than trust. */
   declaration?: DeliverableDeclaration;
 }

@@ -43,6 +43,9 @@ export class DeterministicRuntime implements AgentRuntime {
         const review = await request.submitReview({
           verdict: "approved",
           summary: `Deterministic review of @${request.reviewOf.authorAgentId}'s work.`,
+          // Approval requires naming an independent check; the demo runtime
+          // states plainly that its "check" is a stub rather than faking one.
+          checks: ["Deterministic runtime: no real verification performed."],
         });
         await request.emit({
           type: "tool_end",
