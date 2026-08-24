@@ -18,6 +18,7 @@ import {
   EyeOff,
   Folder,
   KeyRound,
+  ListChecks,
   Menu,
   MessageSquare,
   Moon,
@@ -29,6 +30,8 @@ import {
   SendHorizontal,
   Settings2,
   ShieldCheck,
+  ThumbsDown,
+  ThumbsUp,
   Sparkles,
   Square,
   Sun,
@@ -60,6 +63,8 @@ import type {
   AgentCatalogV1,
   AgentDefinition,
   AgentSummary,
+  PlanDecision,
+  PlanPeerOutcome,
   ReviewEscalation,
   ReviewType,
   RunPurpose,
@@ -122,6 +127,10 @@ type TranscriptItem =
       purpose: RunPurpose;
       reviewRound?: number;
       review?: ReviewState;
+      /** Set on the plan task run this plan belongs to, across every round. */
+      plan?: PlanState;
+      /** True while this run itself was asked for a plan rather than the work. */
+      planMode?: boolean;
     };
 
 interface ReviewState {
@@ -135,6 +144,20 @@ interface ReviewState {
   checks?: string[];
   escalation?: ReviewEscalation;
   detail?: string;
+}
+
+interface PlanState {
+  taskRunId: string;
+  authorAgentId: string;
+  plan: string;
+  peerOutcome: PlanPeerOutcome;
+  rounds: number;
+  reviewerAgentId?: string;
+  peerSummary?: string;
+  escalation?: ReviewEscalation;
+  /** Absent while the plan is still waiting on the human. */
+  decision?: PlanDecision;
+  note?: string;
 }
 
 interface ToolActivity {
@@ -171,6 +194,8 @@ export function App() {
   const [updateActionError, setUpdateActionError] = useState("");
   const [mentionAgent, setMentionAgent] = useState("codex");
   const [draft, setDraft] = useState("");
+  const [planMode, setPlanMode] = useState(false);
+  const [decidingPlan, setDecidingPlan] = useState<string>();
   const [attachments, setAttachments] = useState<ComposerAttachment[]>([]);
   const [sending, setSending] = useState(false);
   const [cancelling, setCancelling] = useState(false);
@@ -310,6 +335,7 @@ export function App() {
             ? { attachments: attachments.map(({ mediaType, dataBase64 }) => ({ mediaType, dataBase64 })) }
             : {}),
           ...(steer ? { steer: true } : {}),
+          ...(planMode ? { planMode: true } : {}),
         }),
       });
       const result = (await response.json()) as { threadId?: string; error?: string };
@@ -321,6 +347,28 @@ export function App() {
       setActionError(errorMessage(error));
     } finally {
       setSending(false);
+    }
+  };
+
+  const decidePlan = async (taskRunId: string, decision: PlanDecision, note: string) => {
+    if (decidingPlan) return;
+    setDecidingPlan(taskRunId);
+    setActionError("");
+    try {
+      const response = await fetch(`/api/plans/${encodeURIComponent(taskRunId)}/decision`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ decision, ...(note ? { note } : {}) }),
+      });
+      const result = (await response.json()) as { error?: string };
+      if (!response.ok) throw new Error(result.error ?? "计划确认失败");
+      // Approving a plan means the building starts now, so the next message
+      // the composer sends is ordinary work, not another planning round.
+      if (decision === "approved") setPlanMode(false);
+    } catch (error) {
+      setActionError(errorMessage(error));
+    } finally {
+      setDecidingPlan(undefined);
     }
   };
 
@@ -451,11 +499,12 @@ export function App() {
                 const agent = data.agents.find((candidate) => candidate.id === item.agentId);
                 return (
                   <article className="agent-message" key={item.id}>
-                    <div className="agent-message-meta"><AgentAvatar agentId={item.agentId} variant={item.purpose === "review" ? "reviewer" : undefined} /><span>{agentName(data.agents, item.agentId)}</span><small>{runtimeLabel(agent)}</small>{item.purpose === "review" && <span className="status-label status-label--review">审核 · 第 {item.reviewRound ?? 1} 轮</span>}<span className={`status-label status-label--${item.status}`}>{statusLabel(item.status, agent?.accessMode)}</span></div>
+                    <div className="agent-message-meta"><AgentAvatar agentId={item.agentId} variant={item.purpose === "review" ? "reviewer" : undefined} /><span>{agentName(data.agents, item.agentId)}</span><small>{runtimeLabel(agent)}</small>{item.purpose === "review" && <span className="status-label status-label--review">审核 · 第 {item.reviewRound ?? 1} 轮</span>}{item.planMode && <span className="status-label status-label--plan"><ListChecks size={11} />计划模式</span>}<span className={`status-label status-label--${item.status}`}>{statusLabel(item.status, agent?.accessMode)}</span></div>
                     <RunActivity item={item} />
                     <div className={`markdown-body ${item.status === "running" ? "markdown-body--streaming" : ""}`}>{item.content ? <ReactMarkdown remarkPlugins={[remarkGfm]}>{item.content}</ReactMarkdown> : <div className="thinking-line"><span /><span /><span /></div>}</div>
                     {item.usage && <RunUsageBar usage={item.usage} />}
                     {item.review && <ReviewCard review={item.review} agents={data.agents} />}
+                    {item.plan && <PlanCard plan={item.plan} agents={data.agents} busy={decidingPlan === item.plan.taskRunId} onDecide={decidePlan} />}
                   </article>
                 );
               })}
@@ -465,7 +514,7 @@ export function App() {
         </section>
 
         {actionError && <div className="action-error" role="alert"><XCircle size={14} />{actionError}<button type="button" onClick={() => setActionError("")} aria-label="关闭错误"><X size={13} /></button></div>}
-        <Composer agents={data?.agents ?? []} mentionAgent={mentionAgent} onMentionAgentChange={setMentionAgent} fallbackAgent={fallbackAgent} configured={configured} value={draft} onChange={setDraft} onSend={sendTask} onCancel={cancelTask} attachments={attachments} onAttachmentsChange={setAttachments} sending={sending} cancelling={cancelling} active={Boolean(activeChainId)} workspace={activeWorkspace} onWorkspaceClick={() => setWorkspacePickerOpen(true)} />
+        <Composer planMode={planMode} onPlanModeChange={setPlanMode} agents={data?.agents ?? []} mentionAgent={mentionAgent} onMentionAgentChange={setMentionAgent} fallbackAgent={fallbackAgent} configured={configured} value={draft} onChange={setDraft} onSend={sendTask} onCancel={cancelTask} attachments={attachments} onAttachmentsChange={setAttachments} sending={sending} cancelling={cancelling} active={Boolean(activeChainId)} workspace={activeWorkspace} onWorkspaceClick={() => setWorkspacePickerOpen(true)} />
       </main>
 
       <DetailsDrawer open={drawerOpen} onClose={() => setDrawerOpen(false)} thread={selectedThread} agents={data?.agents ?? []} workspace={activeWorkspace} events={data?.events ?? []} />
@@ -740,6 +789,8 @@ interface ComposerProps {
   active: boolean;
   workspace?: WorkspaceSummary;
   onWorkspaceClick(): void;
+  planMode: boolean;
+  onPlanModeChange(value: boolean): void;
 }
 
 function Composer(props: ComposerProps) {
@@ -766,7 +817,7 @@ function Composer(props: ComposerProps) {
     setCursor(nextCursor);
     window.setTimeout(() => { element?.focus(); element?.setSelectionRange(nextCursor, nextCursor); }, 0);
   };
-  const onKeyDown = (event: ReactKeyboardEvent<HTMLTextAreaElement>) => { if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); props.onSend(props.active); } };
+  const onKeyDown = (event: ReactKeyboardEvent<HTMLTextAreaElement>) => { if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); props.onSend(props.active && !props.planMode); } };
   const disabled = !props.configured || !props.value.trim() || props.sending;
   const addFiles = async (files: FileList | null) => {
     if (!files || files.length === 0) return;
@@ -781,8 +832,8 @@ function Composer(props: ComposerProps) {
   return <div className="composer-wrap">{!props.configured && <div className="credential-warning">当前没有可用 Agent；请打开花名册检查 Pi 密钥或 Codex 登录状态。</div>}<div className="composer">
     {suggestions.length > 0 && <div className="mention-menu">{suggestions.map((agent) => <button type="button" key={agent.id} onMouseDown={(event) => { event.preventDefault(); insertMention(agent.id, true); }}><AgentAvatar agentId={agent.id} /><span><strong>@{agent.id}</strong><small>{agent.displayName} · {agent.availability.available ? "在线" : "离线"}</small></span></button>)}</div>}
     {props.attachments.length > 0 && <div className="composer-attachments">{props.attachments.map((attachment) => <span key={attachment.id}><Paperclip size={11} />{attachment.name}<button type="button" onClick={() => props.onAttachmentsChange(props.attachments.filter((item) => item.id !== attachment.id))} aria-label={`移除 ${attachment.name}`}><X size={11} /></button></span>)}</div>}
-    <textarea ref={textareaRef} value={props.value} onChange={(event) => { props.onChange(event.target.value); setCursor(event.target.selectionStart); }} onClick={(event) => setCursor(event.currentTarget.selectionStart)} onKeyUp={(event) => setCursor(event.currentTarget.selectionStart)} onKeyDown={onKeyDown} placeholder="描述任务；输入 @ 可指定最多两个 Agent…" rows={2} disabled={!props.configured} aria-label="任务内容" />
-    <div className="composer-toolbar"><button className="composer-workspace" type="button" onClick={props.onWorkspaceClick} title={props.workspace?.path} aria-label="选择工作目录"><Folder size={14} /><span>{props.workspace?.name ?? "选择目录"}</span></button><label className="agent-select" title="选择后插入 @mention"><AgentAvatar agentId={props.mentionAgent} /><select value={props.mentionAgent} onChange={(event) => { props.onMentionAgentChange(event.target.value); insertMention(event.target.value); }} disabled={!props.configured} aria-label="插入 Agent mention">{props.agents.filter((agent) => agent.enabled).map((agent) => <option value={agent.id} key={agent.id} disabled={!agent.availability.available}>@{agent.id}{agent.availability.available ? "" : "（离线）"}</option>)}</select><ChevronDown size={14} /></label><span className="fallback-hint">无 @ → @{props.fallbackAgent?.id ?? "—"}</span><span className="composer-hint">{props.active ? "Enter 插话 · Shift Enter 换行" : "Enter 发送 · Shift Enter 换行"}</span><label className="composer-attach" title="添加图片（仅 Pi 运行时可直接读取）"><Paperclip size={14} /><input type="file" accept={ALLOWED_IMAGE_TYPES.join(",")} multiple disabled={!props.configured || props.attachments.length >= MAX_COMPOSER_ATTACHMENTS} onChange={(event) => { void addFiles(event.target.files); event.target.value = ""; }} aria-label="添加图片" /></label>{props.active && <button className="steer-button" type="button" onClick={() => props.onSend(true)} disabled={disabled} aria-label="插话到正在运行的 Agent">{props.sending ? <span className="button-spinner" /> : <SendHorizontal size={16} />}插话</button>}{props.active ? <button className="stop-button" type="button" onClick={props.onCancel} disabled={props.cancelling} aria-label="停止整个协作链"><Square size={11} fill="currentColor" /></button> : <button className="send-button" type="button" onClick={() => props.onSend()} disabled={disabled} aria-label="发送任务">{props.sending ? <span className="button-spinner" /> : <SendHorizontal size={17} />}</button>}</div>
+    <textarea ref={textareaRef} value={props.value} onChange={(event) => { props.onChange(event.target.value); setCursor(event.target.selectionStart); }} onClick={(event) => setCursor(event.currentTarget.selectionStart)} onKeyUp={(event) => setCursor(event.currentTarget.selectionStart)} onKeyDown={onKeyDown} placeholder={props.planMode ? "描述你想让 Agent 先规划的事；它只读代码、先出方案，交由同伴评审、你来拍板…" : "描述任务；输入 @ 可指定最多两个 Agent…"} rows={2} disabled={!props.configured} aria-label="任务内容" />
+    <div className="composer-toolbar"><button className={`plan-toggle ${props.planMode ? "plan-toggle--on" : ""}`} type="button" onClick={() => props.onPlanModeChange(!props.planMode)} disabled={!props.configured} aria-pressed={props.planMode} title="计划模式：Agent 只读不改，先出方案，交同伴评审后由你拍板"><ListChecks size={14} />计划模式</button><button className="composer-workspace" type="button" onClick={props.onWorkspaceClick} title={props.workspace?.path} aria-label="选择工作目录"><Folder size={14} /><span>{props.workspace?.name ?? "选择目录"}</span></button><label className="agent-select" title="选择后插入 @mention"><AgentAvatar agentId={props.mentionAgent} /><select value={props.mentionAgent} onChange={(event) => { props.onMentionAgentChange(event.target.value); insertMention(event.target.value); }} disabled={!props.configured} aria-label="插入 Agent mention">{props.agents.filter((agent) => agent.enabled).map((agent) => <option value={agent.id} key={agent.id} disabled={!agent.availability.available}>@{agent.id}{agent.availability.available ? "" : "（离线）"}</option>)}</select><ChevronDown size={14} /></label><span className="fallback-hint">无 @ → @{props.fallbackAgent?.id ?? "—"}</span><span className="composer-hint">{props.active ? "Enter 插话 · Shift Enter 换行" : "Enter 发送 · Shift Enter 换行"}</span><label className="composer-attach" title="添加图片（仅 Pi 运行时可直接读取）"><Paperclip size={14} /><input type="file" accept={ALLOWED_IMAGE_TYPES.join(",")} multiple disabled={!props.configured || props.attachments.length >= MAX_COMPOSER_ATTACHMENTS} onChange={(event) => { void addFiles(event.target.files); event.target.value = ""; }} aria-label="添加图片" /></label>{props.active && !props.planMode && <button className="steer-button" type="button" onClick={() => props.onSend(true)} disabled={disabled} aria-label="插话到正在运行的 Agent">{props.sending ? <span className="button-spinner" /> : <SendHorizontal size={16} />}插话</button>}{props.active ? <button className="stop-button" type="button" onClick={props.onCancel} disabled={props.cancelling} aria-label="停止整个协作链"><Square size={11} fill="currentColor" /></button> : <button className="send-button" type="button" onClick={() => props.onSend()} disabled={disabled} aria-label="发送任务">{props.sending ? <span className="button-spinner" /> : <SendHorizontal size={17} />}</button>}</div>
   </div></div>;
 }
 
@@ -1257,6 +1308,8 @@ function describeEvent(event: StoredPlatformEvent, agents: AgentSummary[]) {
   if (event.type === "review.submitted") return { title: event.verdict === "approved" ? `${agentName(agents, event.reviewerAgentId)} 审核通过` : `${agentName(agents, event.reviewerAgentId)} 要求修改`, detail: event.summary, icon: event.verdict === "approved" ? Check : RefreshCw, tone: event.verdict === "approved" ? "success" : "danger" };
   if (event.type === "review.rework") return { title: `已打回 ${agentName(agents, event.authorAgentId)} 返工`, detail: `第 ${event.round} 轮审核未通过`, icon: RefreshCw, tone: "active" };
   if (event.type === "review.resolved") return { title: reviewOutcomeTitle(event.outcome), detail: event.detail ?? `共 ${event.rounds} 轮审核`, icon: event.outcome === "approved" ? Check : XCircle, tone: event.outcome === "approved" ? "success" : event.outcome === "cancelled" ? "neutral" : "danger" };
+  if (event.type === "plan.awaiting-approval") return { title: `${agentName(agents, event.authorAgentId)} 的计划等待你确认`, detail: PLAN_PEER_LABELS[event.peerOutcome], icon: ListChecks, tone: "active" };
+  if (event.type === "plan.decided") return { title: event.decision === "approved" ? "你通过了计划，开始执行" : "你打回了计划，重新规划", detail: event.note ?? shortId(event.taskRunId), icon: event.decision === "approved" ? ThumbsUp : ThumbsDown, tone: event.decision === "approved" ? "success" : "active" };
   if (event.type === "run.completed") return { title: `${agentName(agents, event.agentId)} 已完成`, detail: shortId(event.runId), icon: Check, tone: "success" };
   if (event.type === "run.failed") return { title: `${agentName(agents, event.agentId)} 运行失败`, detail: event.error, icon: XCircle, tone: "danger" };
   if (event.type === "run.cancelled") return { title: `${agentName(agents, event.agentId)} 已取消`, detail: event.reason, icon: Square, tone: "danger" };
@@ -1315,6 +1368,90 @@ function ReviewCard({ review, agents }: { review: ReviewState; agents: AgentSumm
           <ul>{review.checks.map((check, index) => <li key={`${index}-${check}`}>{check}</li>)}</ul>
         </>
       )}
+    </div>
+  );
+}
+
+const PLAN_PEER_LABELS: Record<PlanPeerOutcome, string> = {
+  approved: "同伴评审已通过",
+  escalated: "同伴评审没有通过",
+  skipped: "没有同伴评审（评审开关已关闭）",
+};
+
+/**
+ * The last gate before anything gets built. Peers advise; this card is where a
+ * person decides, so it keeps the plan itself in view rather than a summary of
+ * it — approving what you cannot read is not approving.
+ */
+function PlanCard({
+  plan,
+  agents,
+  busy,
+  onDecide,
+}: {
+  plan: PlanState;
+  agents: AgentSummary[];
+  busy: boolean;
+  onDecide(taskRunId: string, decision: PlanDecision, note: string): void;
+}) {
+  const [note, setNote] = useState("");
+  const author = agentName(agents, plan.authorAgentId);
+  const reviewer = plan.reviewerAgentId ? agentName(agents, plan.reviewerAgentId) : undefined;
+  if (plan.decision) {
+    return (
+      <div className={`plan-card plan-card--${plan.decision}`}>
+        <div className="plan-card-title">
+          {plan.decision === "approved" ? <ThumbsUp size={13} /> : <ThumbsDown size={13} />}
+          <strong>{plan.decision === "approved" ? `你已通过该计划，${author} 开始执行` : `你已打回该计划，${author} 正在修订`}</strong>
+        </div>
+        {plan.note && <p className="plan-card-note">{plan.note}</p>}
+      </div>
+    );
+  }
+  return (
+    <div className="plan-card plan-card--pending">
+      <div className="plan-card-title">
+        <ListChecks size={13} />
+        <strong>{author} 的计划等待你确认</strong>
+      </div>
+      <p className="plan-card-peer">
+        {PLAN_PEER_LABELS[plan.peerOutcome]}
+        {reviewer ? ` · ${reviewer}` : ""}
+        {plan.rounds > 0 ? ` · ${plan.rounds} 轮` : ""}
+        {plan.escalation ? ` · ${REVIEW_ESCALATION_LABELS[plan.escalation]}` : ""}
+      </p>
+      {plan.peerSummary && <p className="plan-card-summary">{plan.peerSummary}</p>}
+      <div className="plan-card-body markdown-body">
+        <ReactMarkdown remarkPlugins={[remarkGfm]}>{plan.plan}</ReactMarkdown>
+      </div>
+      <textarea
+        className="plan-card-input"
+        value={note}
+        onChange={(event) => setNote(event.target.value)}
+        rows={2}
+        placeholder="批注：通过时可留空；打回时必须说明要改什么"
+        aria-label="计划批注"
+        disabled={busy}
+      />
+      <div className="plan-card-actions">
+        <button
+          type="button"
+          className="plan-approve"
+          disabled={busy}
+          onClick={() => onDecide(plan.taskRunId, "approved", note.trim())}
+        >
+          <ThumbsUp size={13} />通过并执行
+        </button>
+        <button
+          type="button"
+          className="plan-reject"
+          disabled={busy || !note.trim()}
+          title={note.trim() ? undefined : "打回前请先写明要改什么"}
+          onClick={() => onDecide(plan.taskRunId, "rejected", note.trim())}
+        >
+          <ThumbsDown size={13} />打回重做
+        </button>
+      </div>
     </div>
   );
 }
@@ -1394,7 +1531,7 @@ function buildTranscript(events: StoredPlatformEvent[], threadId?: string): Tran
       continue;
     }
     if (event.type === "run.queued" && event.run.threadId === threadId) {
-      const item: Extract<TranscriptItem, { type: "agent" }> = { id: event.run.id, type: "agent", agentId: event.run.agentId, content: "", createdAt: event.recordedAt, status: "queued", thinking: "", tools: [], notices: [], purpose: event.run.purpose ?? "task", ...(event.run.reviewRound ? { reviewRound: event.run.reviewRound } : {}) };
+      const item: Extract<TranscriptItem, { type: "agent" }> = { id: event.run.id, type: "agent", agentId: event.run.agentId, content: "", createdAt: event.recordedAt, status: "queued", thinking: "", tools: [], notices: [], purpose: event.run.purpose ?? "task", ...(event.run.reviewRound ? { reviewRound: event.run.reviewRound } : {}), ...(event.run.mode === "plan" ? { planMode: true } : {}) };
       items.push(item);
       runs.set(event.run.id, item);
       continue;
@@ -1402,6 +1539,11 @@ function buildTranscript(events: StoredPlatformEvent[], threadId?: string): Tran
     if (event.type === "review.requested" || event.type === "review.submitted" || event.type === "review.rework" || event.type === "review.resolved") {
       if (event.threadId !== threadId) continue;
       applyReviewEvent(runs.get(event.taskRunId), event);
+      continue;
+    }
+    if (event.type === "plan.awaiting-approval" || event.type === "plan.decided") {
+      if (event.threadId !== threadId) continue;
+      applyPlanEvent(runs.get(event.taskRunId), event);
       continue;
     }
     if (!("runId" in event) || event.threadId !== threadId) continue;
@@ -1423,6 +1565,29 @@ function buildTranscript(events: StoredPlatformEvent[], threadId?: string): Tran
     else if (event.type === "run.interrupted") { run.content = event.reason; run.status = "interrupted"; }
   }
   return items.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+}
+
+/** Plan state lives on the plan task run, across critique and human rounds. */
+function applyPlanEvent(
+  run: Extract<TranscriptItem, { type: "agent" }> | undefined,
+  event: Extract<StoredPlatformEvent, { type: "plan.awaiting-approval" | "plan.decided" }>,
+): void {
+  if (!run) return;
+  if (event.type === "plan.awaiting-approval") {
+    run.plan = {
+      taskRunId: event.taskRunId,
+      authorAgentId: event.authorAgentId,
+      plan: event.plan,
+      peerOutcome: event.peerOutcome,
+      rounds: event.rounds,
+      ...(event.reviewerAgentId ? { reviewerAgentId: event.reviewerAgentId } : {}),
+      ...(event.peerSummary ? { peerSummary: event.peerSummary } : {}),
+      ...(event.escalation ? { escalation: event.escalation } : {}),
+    };
+    return;
+  }
+  if (!run.plan) return;
+  run.plan = { ...run.plan, decision: event.decision, ...(event.note ? { note: event.note } : {}) };
 }
 
 type ReviewEvent = Extract<

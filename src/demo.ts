@@ -6,8 +6,15 @@ import { MultiAgentPlatform } from "./core/platform.js";
 import type { StoredPlatformEvent } from "./core/types.js";
 import { DeterministicRuntime } from "./runtime/deterministic-runtime.js";
 
-const prompt = process.argv.slice(2).join(" ").trim() ||
-  "@pi @codex Independently assess the safest peer multi-Agent MVP.";
+const argv = process.argv.slice(2);
+// --plan runs the demo through the plan gate, and answers it the way a human
+// would, so the whole pipeline is visible in one command.
+const planMode = argv.includes("--plan");
+const planDecision = argv.includes("--reject") ? "rejected" : "approved";
+const prompt = argv.filter((value) => !value.startsWith("--")).join(" ").trim() ||
+  (planMode
+    ? "@codex Plan the safest peer multi-Agent MVP."
+    : "@pi @codex Independently assess the safest peer multi-Agent MVP.");
 const agents = createDemoAgents();
 const runtimes = new Map([
   ["pi", new DeterministicRuntime({ id: "pi" })],
@@ -30,7 +37,15 @@ const platform = new MultiAgentPlatform({
 
 platform.subscribe(renderEvent);
 console.log(`Input: ${prompt}\n`);
-const result = await platform.postUserMessage({ content: prompt });
+const result = await platform.postUserMessage({ content: prompt, ...(planMode ? { planMode: true } : {}) });
+for (const approval of await platform.getPendingPlanApprovals(result.threadId)) {
+  process.stdout.write(`\n  answering the plan gate as the human: ${planDecision}\n`);
+  await platform.decidePlan({
+    taskRunId: approval.taskRunId,
+    decision: planDecision,
+    ...(planDecision === "rejected" ? { note: "Demo rejection: say how this rolls back." } : {}),
+  });
+}
 const messages = await platform.getThreadMessages(result.threadId);
 
 console.log("\nFinal transcript");
@@ -79,6 +94,12 @@ function renderEvent(event: StoredPlatformEvent): void {
       break;
     case "review.resolved":
       process.stdout.write(`\n★ review ${event.outcome}${event.escalation ? ` (${event.escalation})` : ""} after ${event.rounds} round(s)\n`);
+      break;
+    case "plan.awaiting-approval":
+      process.stdout.write(`\n⏸ plan from @${event.authorAgentId} awaits the human (peer: ${event.peerOutcome})\n`);
+      break;
+    case "plan.decided":
+      process.stdout.write(`\n★ human ${event.decision} the plan\n`);
       break;
     default:
       break;

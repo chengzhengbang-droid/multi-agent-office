@@ -111,6 +111,13 @@ export interface RuntimeRequest {
   attachments?: MessageAttachment[];
   signal: AbortSignal;
   /**
+   * The human asked for a plan, not the work. The Agent's access is already
+   * narrowed to read-only on the definition above; this tells the runtime to
+   * say so in the brief, because a model that knows why its tools are missing
+   * writes a plan instead of fighting the sandbox.
+   */
+  planMode?: boolean;
+  /**
    * Set only on review runs. Runtimes expose the submit_review tool exactly
    * when this is present, so an Agent can never approve its own work.
    */

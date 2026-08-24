@@ -18,6 +18,10 @@ export interface CodexRuntimeAdapterOptions {
   id: string;
   cwd: string;
   spec: CodexRuntimeSpec;
+  /**
+   * The Agent's configured access. Only a default: each run carries its own
+   * access mode, which plan mode narrows to read-only for that run alone.
+   */
   accessMode: AccessMode;
   fingerprint: string;
   sessionStore: RuntimeSessionStore;
@@ -55,7 +59,13 @@ export class CodexRuntimeAdapter implements AgentRuntime {
       declareDeliverable: request.declareDeliverable,
       ...(request.submitReview ? { submitReview: request.submitReview } : {}),
     });
-    const args = this.buildArgs(cwd, resumeSessionId);
+    // The run's access mode, not the Agent's: plan mode narrows one run to
+    // read-only, and the CLI sandbox is where that is actually enforced.
+    const args = this.buildArgs(
+      cwd,
+      request.agent.accessMode ?? this.options.accessMode,
+      resumeSessionId,
+    );
     const environment = codexEnvironment({
       callbackUrl: this.options.callbackUrl,
       reviewCallbackUrl: this.options.reviewCallbackUrl,
@@ -179,12 +189,12 @@ export class CodexRuntimeAdapter implements AgentRuntime {
     if (child) terminate(child);
   }
 
-  private buildArgs(cwd: string, resumeSessionId?: string): string[] {
+  private buildArgs(cwd: string, accessMode: AccessMode, resumeSessionId?: string): string[] {
     const config = [
       "-c",
       `approval_policy=${tomlString("never")}`,
       "-c",
-      `sandbox_mode=${tomlString(accessSandbox(this.options.accessMode))}`,
+      `sandbox_mode=${tomlString(accessSandbox(accessMode))}`,
       "-c",
       `mcp_servers.multi_agent.command=${tomlString(this.options.mcpCommand)}`,
       "-c",
