@@ -329,6 +329,7 @@ const server = createServer(async (request, response) => {
           ...(workspace ? { workingDirectory: workspace.path } : {}),
           ...(attachments.length > 0 ? { attachments } : {}),
           ...(body.steer === true ? { steer: true } : {}),
+          ...(body.planMode === true ? { planMode: true } : {}),
         });
         void started.completion.catch((error: unknown) => {
           console.error("Background Agent chain failed", error);
@@ -480,6 +481,40 @@ const server = createServer(async (request, response) => {
         sendJson(response, 400, { error: errorMessage(error) });
         return;
       }
+    }
+
+    if (url.pathname === "/api/plans" && request.method === "GET") {
+      const threadId = url.searchParams.get("threadId");
+      sendJson(response, 200, {
+        plans: await platform.getPendingPlanApprovals(threadId ?? undefined),
+      });
+      return;
+    }
+
+    const planMatch = url.pathname.match(/^\/api\/plans\/([^/]+)\/decision$/);
+    if (planMatch && request.method === "POST") {
+      const taskRunId = decodeURIComponent(planMatch[1] ?? "");
+      const body = await readJson(request);
+      const decision = body.decision;
+      if (decision !== "approved" && decision !== "rejected") {
+        sendJson(response, 400, { error: "decision 必须是 approved 或 rejected" });
+        return;
+      }
+      const note = typeof body.note === "string" ? body.note.trim() : "";
+      try {
+        sendJson(
+          response,
+          202,
+          await platform.decidePlan({
+            taskRunId,
+            decision,
+            ...(note ? { note } : {}),
+          }),
+        );
+      } catch (error) {
+        sendJson(response, 400, { error: errorMessage(error) });
+      }
+      return;
     }
 
     const cancelMatch = url.pathname.match(/^\/api\/chains\/([^/]+)\/cancel$/);

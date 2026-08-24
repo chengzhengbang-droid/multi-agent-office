@@ -70,6 +70,23 @@ Agent 正在运行时，用户可以直接插话：消息会送进当前这一�
 
 消息可以附带图片。Pi 直接把图片交给模型；Codex CLI 不接受内联图片，因此改为在 prompt 里给出附件的绝对路径。图片保存在数据目录的 `attachments/`，事件日志里只记录引用。
 
+## 计划模式
+
+计划模式是一条流水线上的两道闸门：**同侪先评审，人类最后拍板**。在输入框点亮"计划模式"再发任务即可进入。
+
+- **只读是构造出来的，不是约定出来的**：计划模式下的 run 一律以 `read-only` 执行，Pi 摘掉 `bash`/`edit`/`write`，Codex 的 sandbox 降为 `read-only`——哪怕这个 Agent 在花名册里是可写的。被要求出方案的 Agent 没有"顺手先改一点"这个选项。
+- **忘了调工具也算方案**：计划模式的 run 必定进审核门，走 `critique`；即使 Agent 没调 `submit_plan`，它也不会被当成闲聊放过去。反过来，计划模式下调 `complete_task` 会被拒绝——什么都还没做，谈不上完成。
+- **同侪评审照旧**：`critique` 与普通审核共用一套返工机器和轮数上限，审核者仍是独立的怀疑者，`changes-requested` 会退回作者修订。**返工轮依然是计划**：修订 run 同样只读、同样是计划模式，"按意见改"不会变成"那就开工吧"。
+- **同侪意见不等于放行**：评审结束（无论 `approved` 还是升级）后，平台记录 `plan.awaiting-approval` 并**停在这里**，不排任何 run。同侪给建议，人拍板。评审没通过的方案也照样送到人面前，并附上审核者的疑虑和升级原因——需要人判断的时刻，正是最不该把方案丢掉的时刻。
+- **人类的两个选择**：
+  - **通过并执行**：以人类消息的形式把定稿方案回送给作者，恢复其原本的写权限开始执行；这一轮按普通任务处理，交付时走 `verify` 核对。批注可留空。
+  - **打回重做**：必须写明要改什么——不说理由的打回只会让下一轮重复上一轮。打回同样以人类消息回送，仍然是只读的计划模式，修订后再次评审、再次送到人面前。
+- 决定先于派发落盘：`plan.decided` 在后续消息创建之前记录，进程在两者之间崩溃也不会让一个已经拍过板的方案看起来还在等人。同一个方案只能拍板一次。
+- 关掉审核门（`MAO_REVIEW_GATE=off`）撤掉的是同侪，不是人：计划模式下的方案仍然停在人这里，`peerOutcome` 记为 `skipped`，界面上明说"没有同伴评审"。
+- 计划模式的消息不会插话进正在运行的 run——插话进的那一轮是可写的，模式和权限都改不了，所以它总是另起一轮只读的 run。
+
+整个过程在 Thread 里可见：`plan.awaiting-approval` / `plan.decided` 事件，界面上是方案原文加通过/打回按钮的确认卡片——看不到的方案谈不上批准。
+
 ## 会话、并发与恢复
 
 - 每个 `{threadId, agentId}` 都有独立的持久 session。
@@ -189,11 +206,20 @@ pnpm start
 pnpm demo -- "@pi @codex 请独立评估这个方案"
 ```
 
+走一遍计划模式的完整流水线（出方案 → 同侪评审 → 人工拍板 → 执行），`--reject` 改为打回重做：
+
+```bash
+pnpm demo -- --plan
+pnpm demo -- --plan --reject
+```
+
 ## 本地 API
 
 - `GET /api/agents`：安全花名册、revision、运行时在线/认证状态。
 - `PUT /api/agents`：用 revision 乐观锁原子替换花名册；不接受或返回密钥。
-- `POST /api/messages`：接收 `content`、可选 `threadId`、新 Thread 的 `workspacePath`、`attachments`（PNG/JPEG/WebP/GIF，最多 4 张、每张 5 MB）和 `steer`。
+- `POST /api/messages`：接收 `content`、可选 `threadId`、新 Thread 的 `workspacePath`、`attachments`（PNG/JPEG/WebP/GIF，最多 4 张、每张 5 MB）、`steer` 和 `planMode`。
+- `GET /api/plans?threadId=`：正在等待人工拍板的方案。
+- `POST /api/plans/:taskRunId/decision`：人工拍板，接收 `decision`（`approved` / `rejected`）与 `note`；打回时 `note` 必填。
 - `POST /api/chains/:chainId/cancel`：取消整条协作链。
 - `GET /api/events`：SSE 事件投影。
 - `GET /api/models`：Pi 可用的 provider 与模型目录，以及每个 provider 是否已配置凭据；不返回密钥。
@@ -214,6 +240,8 @@ pnpm build
 测试覆盖花名册、mention 解析、对等路由、A2A、幂等与乒乓限制、读写调度、整链取消、上下文游标、session 隔离、Codex JSONL 首次执行与 resume、MCP token、Pi 凭据判定、多 provider 凭据互不覆盖、Agent 头像标识去重、可观测性事件投影、运行中插话与回退、图片附件，以及现有历史事件的完整兼容回放。
 
 审核相关覆盖：强制送审与审核者选取（配置优先、离线回退、同链共作者让位给未参与的同侪、无人可让时仍然送审并标记为不中立）、怀疑立场（审核简报要求自己查一手材料、`approved` 缺少自查项被拒、`changes-requested` 不要求自查项）、通过后终结、不通过返工并复审、轮数上限升级、无结论/无审核者/审核失败一律不通过、审核中取消、重启后中断的审核升级、审核 run 不占用链额度与深度、审核者不会变成 Thread 的默认应答者，以及旧日志回放不补发审核。smart 门另有覆盖：闲聊不送审、声明完成走 verify 且证据进入审核简报、提交方案走 critique 且返工仍是 critique、改文件不声明也送审、只读运行与 shell 读命令不触发、审核者不能自我声明、声明不能改口径、`required` 模式语义不变，以及带声明的日志回放。
+
+计划模式覆盖：可写 Agent 在计划模式下仍以只读执行、计划模式拒绝 `complete_task`、不调 `submit_plan` 也走 critique、评审通过后停在人这里不排 run、通过后以普通可写 run 执行并走 verify、打回后仍是只读的计划返工、不写理由的打回被拒、同一方案只能拍板一次、评审升级与无审核者时方案照样送到人面前、关掉审核门后仍停在人这里、计划模式不插话、以及等待中与已拍板的方案在重启后分别恢复为待办与已办。
 
 ## 安全边界
 

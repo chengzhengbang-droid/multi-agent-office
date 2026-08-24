@@ -54,6 +54,19 @@ export class DeterministicRuntime implements AgentRuntime {
         });
         return { output };
       }
+      if (request.planMode) {
+        await request.emit({ type: "tool_start", toolName: "submit_plan" });
+        const declared = await request.declareDeliverable({
+          kind: "plan",
+          summary: `Deterministic plan for: ${request.incoming.content}`,
+        });
+        await request.emit({
+          type: "tool_end",
+          toolName: "submit_plan",
+          isError: !declared.accepted,
+        });
+        return { output };
+      }
       if (this.handoffTo && request.incoming.sender.type === "human") {
         await request.emit({ type: "tool_start", toolName: "post_message" });
         const result = await request.postMessage({

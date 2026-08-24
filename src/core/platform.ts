@@ -12,6 +12,9 @@ import type {
   DeliverableDeclaration,
   Id,
   MessageAttachment,
+  PlanApproval,
+  PlanDecision,
+  PlanPeerOutcome,
   PlatformEventPayload,
   ReviewEscalation,
   ReviewOutcome,
@@ -78,13 +81,59 @@ export interface PostUserMessageInput {
    * Targets whose runtime cannot steer fall back to a queued run.
    */
   steer?: boolean;
+  /**
+   * Ask for a plan instead of the work. Runs start read-only, their deliverable
+   * is a plan a peer critiques, and the plan reaches the human for approval
+   * before anything is built.
+   */
+  planMode?: boolean;
+  /**
+   * Pre-assigned id for the message this call creates. The plan gate uses it to
+   * record its decision before starting the follow-up, so a crash between the
+   * two cannot leave a decided plan looking like it is still awaiting one.
+   */
+  messageId?: Id;
+  /**
+   * Route to these Agents instead of reading @handles out of the content. The
+   * plan gate needs it because the message it sends quotes a plan an Agent
+   * wrote: a handle inside that plan must not choose who runs next, and an
+   * unknown one must not fail the send.
+   */
+  targets?: Id[];
 }
 
 export interface PostUserMessageResult {
   threadId: Id;
   chainId: Id;
+  messageId: Id;
   /** Agents that received the message mid-run rather than through a new run. */
   steered: Id[];
+}
+
+export interface DecidePlanInput {
+  taskRunId: Id;
+  decision: PlanDecision;
+  /** What the human said. Required to reject: a rejection has to say why. */
+  note?: string;
+  humanId?: string;
+}
+
+export interface DecidePlanResult {
+  threadId: Id;
+  taskRunId: Id;
+  decision: PlanDecision;
+  /** The Agent that now executes the plan, or revises it. */
+  authorAgentId: Id;
+  chainId: Id;
+  messageId: Id;
+}
+
+/** A plan whose text is known but whose review has not settled yet. */
+interface PlanDraft {
+  planRunId: Id;
+  authorAgentId: Id;
+  plan: string;
+  declaration?: DeliverableDeclaration;
 }
 
 export interface StartedUserMessage extends PostUserMessageResult {
@@ -157,6 +206,10 @@ export class MultiAgentPlatform {
   private readonly taskReviewTypes = new Map<Id, ReviewType>();
   /** reviewRunId -> the claim that review is checking, if the author made one. */
   private readonly reviewDeclarations = new Map<Id, DeliverableDeclaration>();
+  /** taskRunId -> the newest plan text, until its critique settles. */
+  private readonly planDrafts = new Map<Id, PlanDraft>();
+  /** taskRunId -> a plan parked in front of the human. Cleared when decided. */
+  private readonly planApprovals = new Map<Id, PlanApproval>();
   private readonly maxA2ADepth: number;
   private readonly maxAgentRunsPerChain: number;
   private readonly maxMentionTargets: number;
@@ -273,17 +326,13 @@ export class MultiAgentPlatform {
     if (input.threadId && !this.threads.has(input.threadId)) {
       throw new Error(`Unknown thread: ${input.threadId}`);
     }
-    const parsed = parseUserMentions(content, [...this.agents.values()], this.maxMentionTargets);
-    if (parsed.unknown.length > 0) {
-      throw new Error(`Unknown Agent handle: @${parsed.unknown.join(", @")}`);
-    }
-    if (parsed.overflow) {
+    const targets = input.targets
+      ? [...new Set(input.targets)]
+      : this.parseMessageTargets(content, threadId);
+    if (targets.length === 0) throw new Error("No enabled and available Agent can receive this message");
+    if (targets.length > this.maxMentionTargets) {
       throw new Error(`A message can target at most ${this.maxMentionTargets} Agents`);
     }
-    const targets = parsed.targets.length > 0
-      ? parsed.targets
-      : [this.resolveFallbackAgent(threadId)].filter((id): id is string => Boolean(id));
-    if (targets.length === 0) throw new Error("No enabled and available Agent can receive this message");
     for (const target of targets) this.assertRoutable(target);
 
     if (!input.threadId) {
@@ -299,8 +348,9 @@ export class MultiAgentPlatform {
 
     const chainId = createId("chain");
     const causal: CausalMetadata = { chainId, depth: 0 };
+    const planMode = input.planMode === true;
     const message: ThreadMessage = {
-      id: createId("msg"),
+      id: input.messageId ?? createId("msg"),
       threadId,
       sender: { type: "human", id: input.humanId ?? "operator" },
       kind: "chat",
@@ -318,7 +368,10 @@ export class MultiAgentPlatform {
     for (const target of targets) {
       const agent = this.agents.get(target);
       if (!agent) continue;
-      if (input.steer && (await this.trySteer(threadId, target, message))) {
+      // Steering drops a message into a run that is already executing, so it
+      // cannot change that run's mode or its access. A plan-mode message must
+      // start its own read-only run rather than land inside a writing one.
+      if (input.steer && !planMode && (await this.trySteer(threadId, target, message))) {
         steered.push(target);
         continue;
       }
@@ -328,15 +381,32 @@ export class MultiAgentPlatform {
         agentId: target,
         incomingMessageId: message.id,
         status: "queued",
-        accessMode: agent.accessMode,
+        // Plan mode is read-only by construction, not by convention: an Agent
+        // asked for a proposal is denied the tools that would let it skip
+        // ahead and build the thing instead.
+        accessMode: planMode ? "read-only" : agent.accessMode,
         causal,
         createdAt: now(),
         purpose: "task",
+        ...(planMode ? { mode: "plan" as const } : {}),
       });
     }
     this.startScheduler();
     const completion = this.waitForChain(chainId);
-    return { threadId, chainId, steered, completion };
+    return { threadId, chainId, messageId: message.id, steered, completion };
+  }
+
+  /** Who a human message wakes, read off its @handles. */
+  private parseMessageTargets(content: string, threadId: Id): Id[] {
+    const parsed = parseUserMentions(content, [...this.agents.values()], this.maxMentionTargets);
+    if (parsed.unknown.length > 0) {
+      throw new Error(`Unknown Agent handle: @${parsed.unknown.join(", @")}`);
+    }
+    if (parsed.overflow) {
+      throw new Error(`A message can target at most ${this.maxMentionTargets} Agents`);
+    }
+    if (parsed.targets.length > 0) return parsed.targets;
+    return [this.resolveFallbackAgent(threadId)].filter((id): id is string => Boolean(id));
   }
 
   /**
@@ -499,6 +569,31 @@ export class MultiAgentPlatform {
       } else if (event.type === "review.resolved") {
         this.resolvedTaskRuns.add(event.taskRunId);
         this.forgetReviewState(event.taskRunId);
+      } else if (event.type === "plan.awaiting-approval") {
+        this.planApprovals.set(event.taskRunId, {
+          threadId: event.threadId,
+          taskRunId: event.taskRunId,
+          planRunId: event.planRunId,
+          authorAgentId: event.authorAgentId,
+          plan: event.plan,
+          ...(event.kind && event.summary
+            ? {
+                declaration: {
+                  kind: event.kind,
+                  summary: event.summary,
+                  ...(event.evidence ? { evidence: event.evidence } : {}),
+                },
+              }
+            : {}),
+          peerOutcome: event.peerOutcome,
+          rounds: event.rounds,
+          ...(event.reviewerAgentId ? { reviewerAgentId: event.reviewerAgentId } : {}),
+          ...(event.peerSummary ? { peerSummary: event.peerSummary } : {}),
+          ...(event.escalation ? { escalation: event.escalation } : {}),
+          requestedAt: event.recordedAt,
+        });
+      } else if (event.type === "plan.decided") {
+        this.planApprovals.delete(event.taskRunId);
       }
     }
     this.hydrated = true;
@@ -648,10 +743,13 @@ export class MultiAgentPlatform {
         runId: run.id,
         threadId: run.threadId,
         ...(workingDirectory ? { workingDirectory } : {}),
-        agent,
+        // run.accessMode, not agent.accessMode: a plan-mode run is read-only
+        // for this run only, and the runtime is what enforces that.
+        agent: { ...agent, accessMode: run.accessMode },
         roster: [...this.agents.values()].filter((candidate) => candidate.enabled),
         incoming,
         context,
+        ...(run.mode === "plan" ? { planMode: true as const } : {}),
         ...(attachments.length > 0 ? { attachments } : {}),
         ...(images.length > 0 ? { images } : {}),
         signal: controller.signal,
@@ -877,6 +975,9 @@ export class MultiAgentPlatform {
     if (!humanAsked) return false;
     if (this.reviewMode === "required") return true;
     return (
+      // A plan-mode run was asked for a plan, so a plan is what it produced.
+      // Forgetting to call submit_plan does not turn it into conversation.
+      run.mode === "plan" ||
       this.runDeliverables.has(run.id) ||
       this.runWriteEffects.has(run.id) ||
       (run.reviewRound ?? 0) > 0
@@ -887,6 +988,7 @@ export class MultiAgentPlatform {
   private reviewTypeFor(run: AgentRun, taskRunId: Id): ReviewType {
     const settled = this.taskReviewTypes.get(taskRunId);
     if (settled) return settled;
+    if (run.mode === "plan") return "critique";
     return this.runDeliverables.get(run.id)?.kind === "plan" ? "critique" : "verify";
   }
 
@@ -912,7 +1014,26 @@ export class MultiAgentPlatform {
       await this.settleReview(run);
       return;
     }
-    if (!this.isReviewGated(run)) return;
+    const taskRunId = this.taskRunIdOf(run);
+    // A critique judges a plan, so this run's output is the plan under review.
+    // Recorded before the gate opens because the no-reviewer path settles the
+    // task inside requestReview, and the human still has to see the plan.
+    if (this.reviewTypeFor(run, taskRunId) === "critique") {
+      this.planDrafts.set(taskRunId, {
+        planRunId: run.id,
+        authorAgentId: run.agentId,
+        plan: output,
+        ...(this.runDeliverables.get(run.id)
+          ? { declaration: this.runDeliverables.get(run.id) as DeliverableDeclaration }
+          : {}),
+      });
+    }
+    if (!this.isReviewGated(run)) {
+      // The gate is off, but plan mode is something the human asked for by
+      // name. Nobody critiques the plan; it still stops here for approval.
+      if (run.mode === "plan") await this.awaitPlanApproval(run.threadId, taskRunId, "skipped", 0);
+      return;
+    }
     await this.requestReview(run, output);
   }
 
@@ -922,6 +1043,10 @@ export class MultiAgentPlatform {
     if (this.cancelledChains.has(run.causal.chainId)) return;
     const round = (this.reviewRounds.get(taskRunId) ?? 0) + 1;
     const reviewType = this.reviewTypeFor(run, taskRunId);
+    // Settled before the reviewer is resolved: the no-reviewer branch below
+    // ends the task through resolveReview, which has to know it was judging a
+    // plan in order to hand that plan to the human.
+    this.taskReviewTypes.set(taskRunId, reviewType);
     const declaration = this.runDeliverables.get(run.id);
 
     const reviewerAgentId = this.resolveReviewer(run.agentId, run.causal.chainId);
@@ -987,7 +1112,6 @@ export class MultiAgentPlatform {
     };
     this.reviewRounds.set(taskRunId, round);
     this.reviewAuthors.set(reviewRun.id, run.agentId);
-    this.taskReviewTypes.set(taskRunId, reviewType);
     if (declaration) this.reviewDeclarations.set(reviewRun.id, declaration);
     await this.record({
       type: "review.requested",
@@ -1002,6 +1126,85 @@ export class MultiAgentPlatform {
     });
     await this.enqueueRun(reviewRun);
     this.startScheduler();
+  }
+
+  /** Plans waiting on a human, newest last. */
+  public async getPendingPlanApprovals(threadId?: Id): Promise<PlanApproval[]> {
+    await this.ensureHydrated();
+    return [...this.planApprovals.values()]
+      .filter((approval) => !threadId || approval.threadId === threadId)
+      .map((approval) => structuredClone(approval));
+  }
+
+  /**
+   * The human's answer on a plan, and the only way past the plan gate. An
+   * approval starts the work as its own task, reviewed on delivery like any
+   * other; a rejection starts another planning round carrying what the human
+   * said. Either way the answer is recorded before the follow-up starts, so a
+   * crash in between cannot leave a decided plan looking undecided.
+   */
+  public async decidePlan(input: DecidePlanInput): Promise<DecidePlanResult> {
+    await this.ensureHydrated();
+    if (input.decision !== "approved" && input.decision !== "rejected") {
+      throw new Error("decision must be approved or rejected");
+    }
+    const approval = this.planApprovals.get(input.taskRunId);
+    if (!approval) throw new Error("这个计划不在等待人工确认，可能已经处理过了");
+    const note = input.note?.trim() ?? "";
+    // A rejection that says nothing sends the Agent back to guess what the
+    // human disliked, which is how a second round repeats the first.
+    if (input.decision === "rejected" && !note) {
+      throw new Error("打回计划时必须说明需要改什么");
+    }
+    if (note.length > 20_000) throw new Error("批注不能超过 20,000 字符");
+    if (this.rosterUpdateInProgress) throw new Error("The Agent catalog is being updated; retry the decision");
+    if (!this.threads.has(approval.threadId)) throw new Error("任务不存在或已无法恢复");
+    if (!this.isRoutable(approval.authorAgentId)) {
+      throw new Error(`@${approval.authorAgentId} 当前不可用，无法继续这份计划`);
+    }
+    const content = buildPlanDecisionContent(approval, input.decision, note);
+    const messageId = createId("msg");
+    const decidedBy = input.humanId ?? "operator";
+
+    // Consumed here so a double-click cannot start the work twice.
+    this.planApprovals.delete(input.taskRunId);
+    await this.record({
+      type: "plan.decided",
+      threadId: approval.threadId,
+      taskRunId: input.taskRunId,
+      decision: input.decision,
+      decidedBy,
+      ...(note ? { note } : {}),
+      followUpMessageId: messageId,
+    });
+
+    let started: StartedUserMessage;
+    try {
+      started = await this.startUserMessage({
+        threadId: approval.threadId,
+        content,
+        humanId: decidedBy,
+        messageId,
+        // The message quotes the Agent's own plan; only the author runs next.
+        targets: [approval.authorAgentId],
+        // A rejection is another planning round, so it stays read-only. An
+        // approval is the point where building becomes allowed.
+        ...(input.decision === "rejected" ? { planMode: true } : {}),
+      });
+    } catch (error) {
+      // The decision stands — it is what the human said — but nothing picked
+      // it up, so say that plainly instead of reporting a started run.
+      throw new Error(`计划决定已记录，但没能派发给 @${approval.authorAgentId}：${errorMessage(error)}`);
+    }
+    void started.completion.catch(() => {});
+    return {
+      threadId: approval.threadId,
+      taskRunId: input.taskRunId,
+      decision: input.decision,
+      authorAgentId: approval.authorAgentId,
+      chainId: started.chainId,
+      messageId: started.messageId,
+    };
   }
 
   /**
@@ -1124,13 +1327,16 @@ export class MultiAgentPlatform {
       agentId: authorAgentId,
       incomingMessageId: feedback.id,
       status: "queued",
-      accessMode: author.accessMode,
+      // Revising a plan is still planning. A critique round that handed back
+      // write access would let "address these findings" become "build it".
+      accessMode: reviewType === "critique" ? "read-only" : author.accessMode,
       causal: feedback.causal as CausalMetadata,
       createdAt: now(),
       purpose: "task",
       taskRunId,
       reviewRound: round,
       reviewType,
+      ...(reviewType === "critique" ? { mode: "plan" as const } : {}),
     };
     await this.record({
       type: "review.rework",
@@ -1167,7 +1373,79 @@ export class MultiAgentPlatform {
       ...(detail ? { detail } : {}),
       ...(reviewType ? { reviewType } : {}),
     });
+    // A critique settling is not the end of a plan, only the end of the peer
+    // round. Approved or escalated, the plan now goes to the human — the peers
+    // advise, the human decides. Cancellation is the operator's own doing and
+    // asks nothing of them.
+    if (reviewType === "critique" && outcome !== "cancelled") {
+      await this.awaitPlanApproval(
+        run.threadId,
+        taskRunId,
+        outcome === "approved" ? "approved" : "escalated",
+        rounds,
+        run.purpose === "review" ? run.agentId : undefined,
+        run.purpose === "review" ? this.reviewSubmissions.get(run.id)?.summary : undefined,
+        escalation,
+      );
+    }
     this.forgetReviewState(taskRunId);
+  }
+
+  /**
+   * Parks a finalized plan in front of the human. No run is queued here on
+   * purpose: plan mode exists so that nothing is built until a person says so,
+   * and an auto-started execution would quietly delete that guarantee.
+   */
+  private async awaitPlanApproval(
+    threadId: Id,
+    taskRunId: Id,
+    peerOutcome: PlanPeerOutcome,
+    rounds: number,
+    reviewerAgentId?: Id,
+    peerSummary?: string,
+    escalation?: ReviewEscalation,
+  ): Promise<void> {
+    const draft = this.planDrafts.get(taskRunId);
+    // No draft means no plan text was ever captured for this task, which only
+    // happens on a replayed log from before plan mode. Nothing to approve.
+    if (!draft) return;
+    if (this.planApprovals.has(taskRunId)) return;
+    this.planDrafts.delete(taskRunId);
+    const approval: PlanApproval = {
+      threadId,
+      taskRunId,
+      planRunId: draft.planRunId,
+      authorAgentId: draft.authorAgentId,
+      plan: draft.plan,
+      ...(draft.declaration ? { declaration: draft.declaration } : {}),
+      peerOutcome,
+      rounds,
+      ...(reviewerAgentId ? { reviewerAgentId } : {}),
+      ...(peerSummary ? { peerSummary } : {}),
+      ...(escalation ? { escalation } : {}),
+      requestedAt: now(),
+    };
+    this.planApprovals.set(taskRunId, approval);
+    await this.record({
+      type: "plan.awaiting-approval",
+      threadId,
+      taskRunId,
+      planRunId: approval.planRunId,
+      authorAgentId: approval.authorAgentId,
+      plan: approval.plan,
+      ...(draft.declaration
+        ? {
+            kind: draft.declaration.kind,
+            summary: draft.declaration.summary,
+            ...(draft.declaration.evidence ? { evidence: draft.declaration.evidence } : {}),
+          }
+        : {}),
+      peerOutcome,
+      rounds,
+      ...(reviewerAgentId ? { reviewerAgentId } : {}),
+      ...(peerSummary ? { peerSummary } : {}),
+      ...(escalation ? { escalation } : {}),
+    });
   }
 
   /**
@@ -1189,6 +1467,9 @@ export class MultiAgentPlatform {
    */
   private forgetReviewState(taskRunId: Id): void {
     this.taskReviewTypes.delete(taskRunId);
+    // Normally consumed by awaitPlanApproval; a cancelled critique never gets
+    // there, and a draft nobody will read is just a leak.
+    this.planDrafts.delete(taskRunId);
     // Per-run state is dropped as each run leaves the scheduler; the
     // originating run keys itself, so replay reaches it here too.
     this.forgetRunGateState(taskRunId);
@@ -1223,6 +1504,13 @@ export class MultiAgentPlatform {
     }
     if (input.kind !== "completion" && input.kind !== "plan") {
       return { accepted: false, reason: "kind must be completion or plan" };
+    }
+    if (run.mode === "plan" && input.kind === "completion") {
+      return {
+        accepted: false,
+        reason:
+          "this run is in plan mode: nothing has been built yet, so call submit_plan instead of complete_task",
+      };
     }
     if (this.resolvedTaskRuns.has(this.taskRunIdOf(run))) {
       return { accepted: false, reason: "this task has already been resolved" };
@@ -1818,6 +2106,54 @@ function buildReviewRequestContent(input: {
     "approved requires listing at least one check you ran yourself; an approval that cannot name one is rejected.",
     "Do not manufacture agreement to close the loop. A review that finds nothing has usually not looked.",
     "Ending without submit_review is not an approval — it escalates the task to the human.",
+  ].join("\n");
+}
+
+/**
+ * The message a human decision sends back into the thread. It is a human
+ * message like any other, so the Agent picks it up through the ordinary path
+ * — the only special thing about it is that the platform wrote the words.
+ */
+function buildPlanDecisionContent(
+  approval: PlanApproval,
+  decision: PlanDecision,
+  note: string,
+): string {
+  const peer =
+    approval.peerOutcome === "approved"
+      ? `Peer critique: @${approval.reviewerAgentId ?? "unknown"} approved this plan after ${approval.rounds} round(s).`
+      : approval.peerOutcome === "escalated"
+        ? `Peer critique did not approve this plan (${approval.escalation ?? "escalated"}); the human read it anyway.`
+        : "No peer critiqued this plan; the review gate is off.";
+  const humanNote = note ? ["", "<human-note>", note, "</human-note>"] : [];
+  if (decision === "approved") {
+    return [
+      `@${approval.authorAgentId} The human approved your plan. Build it.`,
+      "",
+      peer,
+      "",
+      "<approved-plan>",
+      excerpt(approval.plan),
+      "</approved-plan>",
+      ...humanNote,
+      "",
+      "Execute the plan as approved. It is what the human agreed to, so a departure from it needs saying out loud, not doing quietly.",
+      "If you find the plan cannot work as written, stop and say why instead of substituting your own.",
+      "Call complete_task when the work is done, with evidence a reviewer can check.",
+    ].join("\n");
+  }
+  return [
+    `@${approval.authorAgentId} The human did not approve your plan. Revise it.`,
+    "",
+    peer,
+    "",
+    "<rejected-plan>",
+    excerpt(approval.plan),
+    "</rejected-plan>",
+    ...humanNote,
+    "",
+    "The note above is the human's own judgment and outranks the peer critique. Address it directly rather than restating the plan.",
+    "You are still planning: do not start building. Call submit_plan when the revision is ready.",
   ].join("\n");
 }
 
