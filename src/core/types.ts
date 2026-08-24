@@ -115,6 +115,14 @@ export interface Thread {
 export type RunPurpose = "task" | "review";
 
 /**
+ * How a run is allowed to work. "plan" is the human asking for a proposal
+ * instead of an edit: the run is read-only, its deliverable is a plan, and the
+ * plan is critiqued by a peer and then put to the human before anything is
+ * built. Absent in pre-plan-mode event logs, where every run was "normal".
+ */
+export type RunMode = "normal" | "plan";
+
+/**
  * What a review round is for. "verify" checks a completion claim against the
  * artifacts it claims to have produced; "critique" pressure-tests a plan before
  * anyone executes it. Absent in pre-smart-gate event logs, where every review
@@ -165,6 +173,43 @@ export interface ReviewSubmission {
   checks?: string[];
 }
 
+/**
+ * How far the peer critique got before a plan reached the human. "skipped" is
+ * a plan produced with the review gate off: nobody critiqued it, and saying so
+ * is what stops the approval card implying a review that never happened.
+ */
+export type PlanPeerOutcome = "approved" | "escalated" | "skipped";
+
+/** The human's answer on a plan. Only a human can record one. */
+export type PlanDecision = "approved" | "rejected";
+
+/**
+ * A finalized plan parked in front of the human. Peers have already critiqued
+ * it; nothing is built until the human answers, and the answer is what turns
+ * the plan into either an execution run or another planning round.
+ */
+export interface PlanApproval {
+  threadId: Id;
+  /** The plan task run this approval belongs to. */
+  taskRunId: Id;
+  /** The run that produced the plan text below — the last revision round. */
+  planRunId: Id;
+  authorAgentId: Id;
+  /** The plan as the author last wrote it. */
+  plan: string;
+  /** The author's own submit_plan claim, when it made one. */
+  declaration?: DeliverableDeclaration;
+  peerOutcome: PlanPeerOutcome;
+  /** Critique rounds spent. 0 when no peer reviewed the plan. */
+  rounds: number;
+  reviewerAgentId?: Id;
+  /** The reviewer's closing words, approving or not. */
+  peerSummary?: string;
+  /** Why the critique stopped short of an approval, when it did. */
+  escalation?: ReviewEscalation;
+  requestedAt: string;
+}
+
 export type RunStatus =
   | "queued"
   | "running"
@@ -194,6 +239,8 @@ export interface AgentRun {
   reviewRound?: number;
   /** What this review round judges. Set on review runs and on rework runs. */
   reviewType?: ReviewType;
+  /** Absent in pre-plan-mode event logs, where every run was a "normal" run. */
+  mode?: RunMode;
 }
 
 export type PlatformEventPayload =
@@ -364,6 +411,39 @@ export type PlatformEventPayload =
       escalation?: ReviewEscalation;
       detail?: string;
       reviewType?: ReviewType;
+    }
+  | {
+      /**
+       * A plan cleared its peer critique and now waits on the human. No run is
+       * queued while this stands: plan mode's whole point is that nothing is
+       * built until a person says so.
+       */
+      type: "plan.awaiting-approval";
+      threadId: Id;
+      taskRunId: Id;
+      planRunId: Id;
+      authorAgentId: Id;
+      plan: string;
+      kind?: DeliverableKind;
+      summary?: string;
+      evidence?: string[];
+      peerOutcome: PlanPeerOutcome;
+      rounds: number;
+      reviewerAgentId?: Id;
+      peerSummary?: string;
+      escalation?: ReviewEscalation;
+    }
+  | {
+      /** The human's answer on a plan. Approval executes it; rejection replans. */
+      type: "plan.decided";
+      threadId: Id;
+      taskRunId: Id;
+      decision: PlanDecision;
+      decidedBy: string;
+      /** What the human said, verbatim. Required to reject. */
+      note?: string;
+      /** The message that carries the plan into execution or into revision. */
+      followUpMessageId?: Id;
     }
   | {
       type: "routing.accepted";

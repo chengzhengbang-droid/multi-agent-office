@@ -99,6 +99,12 @@ export class PiRuntimeAdapter implements AgentRuntime {
             description: "Concrete, actionable changes. Required for changes-requested.",
           }),
         ),
+        checks: Type.Optional(
+          Type.Array(Type.String(), {
+            description:
+              "What you verified yourself: files you opened, commands you ran, output you read. Required for approved.",
+          }),
+        ),
       }),
       execute: async (_toolCallId, params) => {
         const submit = request.submitReview;
@@ -117,6 +123,7 @@ export class PiRuntimeAdapter implements AgentRuntime {
           verdict: params.verdict,
           summary: params.summary,
           ...(params.findings ? { findings: params.findings } : {}),
+          ...(params.checks ? { checks: params.checks } : {}),
         });
         return {
           content: [
@@ -181,7 +188,7 @@ export class PiRuntimeAdapter implements AgentRuntime {
       name: "submit_plan",
       label: "Submit a plan for peer critique",
       description:
-        "Call when your output is a plan, design, or proposal that should be pressure-tested by a peer before anyone executes it. A teammate will critique it and you get one revision round. Do not call it for conversation or for work already finished — use complete_task for that.",
+        "Call when your output is a plan, design, or proposal that should be pressure-tested before anyone executes it. A teammate critiques it, then the human decides whether it gets built — nothing is executed on your say-so. Do not call it for conversation or for work already finished — use complete_task for that.",
       parameters: Type.Object({
         summary: Type.String({ description: "The plan you are proposing, in your own words" }),
         evidence: Type.Optional(
@@ -616,7 +623,7 @@ export function buildSystemPrompt(request: RuntimeRequest): string {
     "- You are a peer. There is no boss Agent and no fixed handoff pipeline.",
     "- Judge for yourself what your output is. Conversation, questions, and explanations are just answers: declare nothing, and nobody reviews them.",
     "- Finished work a human asked for is a deliverable: call complete_task with evidence a reviewer can check (files changed, commands run, how to verify).",
-    "- A plan, design, or proposal is a deliverable too: call submit_plan so a peer pressure-tests it before anyone builds it.",
+    "- A plan, design, or proposal is a deliverable too: call submit_plan so a peer pressure-tests it and the human decides before anyone builds it.",
     "- What you declare is reviewed by a different peer before it counts as delivered. The reviewer is a peer, not a supervisor.",
     "- Your own word that the work is done does not settle it. Neither does a teammate's: when you review, disbelieve first and check the artifacts yourself.",
     "- Accept work you can own; challenge weak assumptions with evidence.",
@@ -625,11 +632,30 @@ export function buildSystemPrompt(request: RuntimeRequest): string {
     "- Ordinary assistant output, including @handles, never routes to another Agent.",
     "- Do not retry a rejected post_message with a new idempotency key.",
     "- Ask the human directly when a value judgment or irreversible decision is required.",
+    ...(request.planMode ? planBrief() : []),
     ...(request.reviewOf ? reviewBrief(request.reviewOf) : []),
     "",
     "Available peers:",
     roster || "(none)",
   ].join("\n");
+}
+
+/**
+ * Plan mode: the human asked what you would do, not for you to do it. Read-only
+ * is enforced by the tool surface, so the brief spends its words on what makes
+ * a plan worth approving rather than on repeating the prohibition.
+ */
+function planBrief(): string[] {
+  return [
+    "",
+    "Plan mode is on for this run — the human asked for a plan, not the work:",
+    "- You are read-only here. Editing and shell tools are withheld deliberately, not by accident.",
+    "- Investigate first. Read the code, the tests, and the configuration you would touch, and plan against what is actually there.",
+    "- Write the plan so someone else could execute it: the files to change, the order to change them in, and how each step is verified.",
+    "- Name what you are unsure about, the assumptions you are making, and what would make you abandon the approach.",
+    "- Finish by calling submit_plan with the plan. A peer critiques it, then the human decides whether it is built.",
+    "- Nothing here is executed until the human approves it, so do not promise progress you have not made.",
+  ];
 }
 
 function reviewBrief(assignment: ReviewAssignment): string[] {

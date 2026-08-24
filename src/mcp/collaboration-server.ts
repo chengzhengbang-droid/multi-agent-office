@@ -154,7 +154,7 @@ for (const tool of [
     name: "submit_plan",
     kind: "plan" as const,
     description:
-      "Call when your output is a plan, design, or proposal that should be pressure-tested by a peer before anyone executes it. A teammate will critique it and you get one revision round. Do not call it for conversation or for work already finished — use complete_task for that.",
+      "Call when your output is a plan, design, or proposal that should be pressure-tested before anyone executes it. A teammate critiques it, then the human decides whether it gets built — nothing is executed on your say-so. Do not call it for conversation or for work already finished — use complete_task for that.",
     summaryHint: "The plan you are proposing, in your own words",
     evidenceHint: "Assumptions, constraints, or open questions a reviewer should weigh.",
     accepted: "Plan submitted for peer critique.",
