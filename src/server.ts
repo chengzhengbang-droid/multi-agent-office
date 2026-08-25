@@ -23,11 +23,11 @@ import {
   saveProviderCredential,
 } from "./config/first-run.js";
 import {
-  FileCustomProviderStore,
   customProviderEnvKey,
   findCustomProvider,
   type CustomProviderCatalogV1,
 } from "./config/custom-providers.js";
+import { FileCustomProviderStore } from "./config/custom-provider-store.js";
 import { findApiProvider } from "./config/provider-presets.js";
 import {
   parseAttachmentInputs,

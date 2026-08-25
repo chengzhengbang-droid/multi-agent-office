@@ -8,6 +8,7 @@ import {
 import {
   Activity,
   ArrowRight,
+  AtSign,
   Bot,
   Check,
   ChevronDown,
@@ -103,7 +104,14 @@ interface ThreadSummary extends Thread {
 type ViewRunStatus = "queued" | "running" | "completed" | "failed" | "cancelled" | "interrupted";
 
 type TranscriptItem =
-  | { id: string; type: "human"; content: string; createdAt: string }
+  | {
+      id: string;
+      type: "human";
+      content: string;
+      createdAt: string;
+      targets: string[];
+      explicitlyDirected: boolean;
+    }
   | {
       id: string;
       type: "collaboration";
@@ -131,6 +139,10 @@ type TranscriptItem =
       plan?: PlanState;
       /** True while this run itself was asked for a plan rather than the work. */
       planMode?: boolean;
+      /** The incoming message is retained as a compact, human-readable reply relation. */
+      replyToHuman?: boolean;
+      replyToAgentId?: string;
+      incomingKind?: ThreadMessageKind;
     };
 
 interface ReviewState {
@@ -192,7 +204,6 @@ export function App() {
   const [desktopUpdate, setDesktopUpdate] = useState<DesktopUpdateSnapshot>();
   const [updateActionRunning, setUpdateActionRunning] = useState(false);
   const [updateActionError, setUpdateActionError] = useState("");
-  const [mentionAgent, setMentionAgent] = useState("codex");
   const [draft, setDraft] = useState("");
   const [planMode, setPlanMode] = useState(false);
   const [decidingPlan, setDecidingPlan] = useState<string>();
@@ -240,7 +251,6 @@ export function App() {
       })
       .then((next) => {
         setData(next);
-        setMentionAgent(next.catalog.defaultAgentId);
         const firstThread = buildThreads(next.events)[0];
         setSelectedThreadId(firstThread?.id);
         const firstPath = firstThread?.workingDirectory ?? next.workspace.path;
@@ -402,12 +412,10 @@ export function App() {
     const result = (await response.json()) as AgentsResponse;
     if (!response.ok || !result.catalog) throw new Error(result.error ?? "花名册保存失败");
     setData((current) => current ? { ...current, catalog: result.catalog, agents: mergeHistoricalAgents(result.agents, current.agents) } : current);
-    setMentionAgent(result.catalog.defaultAgentId);
   };
 
   const finishSetup = (next: BootstrapData) => {
     setData(next);
-    setMentionAgent(next.catalog.defaultAgentId);
     const firstThread = buildThreads(next.events)[0];
     setSelectedThreadId(firstThread?.id);
     const firstPath = firstThread?.workingDirectory ?? next.workspace.path;
@@ -489,17 +497,31 @@ export function App() {
             <div className="transcript">
               <div className="conversation-intro"><div className="intro-icon"><Bot size={18} /></div><span>{transcript.filter((item) => item.type === "agent").length} 次 Agent 运行</span>{activeChainId && <span className="live-indicator"><i />实时运行中</span>}</div>
               {transcript.map((item) => {
-                if (item.type === "human") return <article className="human-message" key={item.id}><div>{item.content}</div></article>;
+                if (item.type === "human") return (
+                  <article className="human-message" key={item.id}>
+                    <div className="human-message-bubble">
+                      <div className="message-route message-route--human">
+                        <strong>你</strong><ArrowRight size={12} />
+                        {item.targets.length > 0 ? item.targets.map((id) => <AgentRouteChip agentId={id} agents={data.agents} key={id} />) : <span className="route-fallback">自动选择 Agent</span>}
+                        {item.explicitlyDirected && <small>已指定</small>}
+                      </div>
+                      <div className="human-message-content">{item.content}</div>
+                    </div>
+                  </article>
+                );
                 if (item.type === "collaboration") return (
                   <article className="collaboration-message" key={item.id}>
-                    <div className="collaboration-meta"><ArrowRight size={13} /><span>{agentName(data.agents, item.agentId)}</span><strong>{collaborationLabel(item.kind)}</strong>{item.mentions.map((id) => <i key={id}>@{id}</i>)}</div>
-                    <ReactMarkdown remarkPlugins={[remarkGfm]}>{item.content}</ReactMarkdown>
+                    <div className="collaboration-meta"><AgentRouteChip agentId={item.agentId} agents={data.agents} /><ArrowRight size={13} />{item.mentions.map((id) => <AgentRouteChip agentId={id} agents={data.agents} key={id} />)}<strong>{collaborationLabel(item.kind)}</strong></div>
+                    <p className="collaboration-preview">{compactMessagePreview(item.content)}</p>
+                    {item.content.length > 180 && <details className="collaboration-details"><summary>查看完整转交内容</summary><div className="markdown-body"><ReactMarkdown remarkPlugins={[remarkGfm]}>{item.content}</ReactMarkdown></div></details>}
                   </article>
                 );
                 const agent = data.agents.find((candidate) => candidate.id === item.agentId);
+                const name = agentName(data.agents, item.agentId);
+                const runtime = runtimeDetail(agent, name);
                 return (
-                  <article className="agent-message" key={item.id}>
-                    <div className="agent-message-meta"><AgentAvatar agentId={item.agentId} variant={item.purpose === "review" ? "reviewer" : undefined} /><span>{agentName(data.agents, item.agentId)}</span><small>{runtimeLabel(agent)}</small>{item.purpose === "review" && <span className="status-label status-label--review">审核 · 第 {item.reviewRound ?? 1} 轮</span>}{item.planMode && <span className="status-label status-label--plan"><ListChecks size={11} />计划模式</span>}<span className={`status-label status-label--${item.status}`}>{statusLabel(item.status, agent?.accessMode)}</span></div>
+                  <article className={`agent-message ${item.replyToAgentId ? "agent-message--peer-reply" : ""}`} key={item.id}>
+                    <div className="agent-message-meta"><AgentAvatar agentId={item.agentId} variant={item.purpose === "review" ? "reviewer" : undefined} /><span>{name}</span>{runtime && <small>{runtime}</small>}<span className="agent-reply-context"><ArrowRight size={11} />{agentReplyLabel(item, data.agents)}</span>{item.purpose === "review" && <span className="status-label status-label--review">审核 · 第 {item.reviewRound ?? 1} 轮</span>}{item.planMode && <span className="status-label status-label--plan"><ListChecks size={11} />计划模式</span>}<span className={`status-label status-label--${item.status}`}>{statusLabel(item.status, agent?.accessMode)}</span></div>
                     <RunActivity item={item} />
                     <div className={`markdown-body ${item.status === "running" ? "markdown-body--streaming" : ""}`}>{item.content ? <ReactMarkdown remarkPlugins={[remarkGfm]}>{item.content}</ReactMarkdown> : <div className="thinking-line"><span /><span /><span /></div>}</div>
                     {item.usage && <RunUsageBar usage={item.usage} />}
@@ -514,7 +536,7 @@ export function App() {
         </section>
 
         {actionError && <div className="action-error" role="alert"><XCircle size={14} />{actionError}<button type="button" onClick={() => setActionError("")} aria-label="关闭错误"><X size={13} /></button></div>}
-        <Composer planMode={planMode} onPlanModeChange={setPlanMode} agents={data?.agents ?? []} mentionAgent={mentionAgent} onMentionAgentChange={setMentionAgent} fallbackAgent={fallbackAgent} configured={configured} value={draft} onChange={setDraft} onSend={sendTask} onCancel={cancelTask} attachments={attachments} onAttachmentsChange={setAttachments} sending={sending} cancelling={cancelling} active={Boolean(activeChainId)} workspace={activeWorkspace} onWorkspaceClick={() => setWorkspacePickerOpen(true)} />
+        <Composer planMode={planMode} onPlanModeChange={setPlanMode} agents={data?.agents ?? []} fallbackAgent={fallbackAgent} configured={configured} value={draft} onChange={setDraft} onSend={sendTask} onCancel={cancelTask} attachments={attachments} onAttachmentsChange={setAttachments} sending={sending} cancelling={cancelling} active={Boolean(activeChainId)} workspace={activeWorkspace} onWorkspaceClick={() => setWorkspacePickerOpen(true)} />
       </main>
 
       <DetailsDrawer open={drawerOpen} onClose={() => setDrawerOpen(false)} thread={selectedThread} agents={data?.agents ?? []} workspace={activeWorkspace} events={data?.events ?? []} />
@@ -774,8 +796,6 @@ interface ComposerAttachment {
 
 interface ComposerProps {
   agents: AgentSummary[];
-  mentionAgent: string;
-  onMentionAgentChange(value: string): void;
   fallbackAgent?: AgentSummary;
   configured: boolean;
   value: string;
@@ -832,8 +852,8 @@ function Composer(props: ComposerProps) {
   return <div className="composer-wrap">{!props.configured && <div className="credential-warning">当前没有可用 Agent；请打开花名册检查 Pi 密钥或 Codex 登录状态。</div>}<div className="composer">
     {suggestions.length > 0 && <div className="mention-menu">{suggestions.map((agent) => <button type="button" key={agent.id} onMouseDown={(event) => { event.preventDefault(); insertMention(agent.id, true); }}><AgentAvatar agentId={agent.id} /><span><strong>@{agent.id}</strong><small>{agent.displayName} · {agent.availability.available ? "在线" : "离线"}</small></span></button>)}</div>}
     {props.attachments.length > 0 && <div className="composer-attachments">{props.attachments.map((attachment) => <span key={attachment.id}><Paperclip size={11} />{attachment.name}<button type="button" onClick={() => props.onAttachmentsChange(props.attachments.filter((item) => item.id !== attachment.id))} aria-label={`移除 ${attachment.name}`}><X size={11} /></button></span>)}</div>}
-    <textarea ref={textareaRef} value={props.value} onChange={(event) => { props.onChange(event.target.value); setCursor(event.target.selectionStart); }} onClick={(event) => setCursor(event.currentTarget.selectionStart)} onKeyUp={(event) => setCursor(event.currentTarget.selectionStart)} onKeyDown={onKeyDown} placeholder={props.planMode ? "描述你想让 Agent 先规划的事；它只读代码、先出方案，交由同伴评审、你来拍板…" : "描述任务；输入 @ 可指定最多两个 Agent…"} rows={2} disabled={!props.configured} aria-label="任务内容" />
-    <div className="composer-toolbar"><button className={`plan-toggle ${props.planMode ? "plan-toggle--on" : ""}`} type="button" onClick={() => props.onPlanModeChange(!props.planMode)} disabled={!props.configured} aria-pressed={props.planMode} title="计划模式：Agent 只读不改，先出方案，交同伴评审后由你拍板"><ListChecks size={14} />计划模式</button><button className="composer-workspace" type="button" onClick={props.onWorkspaceClick} title={props.workspace?.path} aria-label="选择工作目录"><Folder size={14} /><span>{props.workspace?.name ?? "选择目录"}</span></button><label className="agent-select" title="选择后插入 @mention"><AgentAvatar agentId={props.mentionAgent} /><select value={props.mentionAgent} onChange={(event) => { props.onMentionAgentChange(event.target.value); insertMention(event.target.value); }} disabled={!props.configured} aria-label="插入 Agent mention">{props.agents.filter((agent) => agent.enabled).map((agent) => <option value={agent.id} key={agent.id} disabled={!agent.availability.available}>@{agent.id}{agent.availability.available ? "" : "（离线）"}</option>)}</select><ChevronDown size={14} /></label><span className="fallback-hint">无 @ → @{props.fallbackAgent?.id ?? "—"}</span><span className="composer-hint">{props.active ? "Enter 插话 · Shift Enter 换行" : "Enter 发送 · Shift Enter 换行"}</span><label className="composer-attach" title="添加图片（仅 Pi 运行时可直接读取）"><Paperclip size={14} /><input type="file" accept={ALLOWED_IMAGE_TYPES.join(",")} multiple disabled={!props.configured || props.attachments.length >= MAX_COMPOSER_ATTACHMENTS} onChange={(event) => { void addFiles(event.target.files); event.target.value = ""; }} aria-label="添加图片" /></label>{props.active && !props.planMode && <button className="steer-button" type="button" onClick={() => props.onSend(true)} disabled={disabled} aria-label="插话到正在运行的 Agent">{props.sending ? <span className="button-spinner" /> : <SendHorizontal size={16} />}插话</button>}{props.active ? <button className="stop-button" type="button" onClick={props.onCancel} disabled={props.cancelling} aria-label="停止整个协作链"><Square size={11} fill="currentColor" /></button> : <button className="send-button" type="button" onClick={() => props.onSend()} disabled={disabled} aria-label="发送任务">{props.sending ? <span className="button-spinner" /> : <SendHorizontal size={17} />}</button>}</div>
+    <textarea ref={textareaRef} value={props.value} onChange={(event) => { props.onChange(event.target.value); setCursor(event.target.selectionStart); }} onClick={(event) => setCursor(event.currentTarget.selectionStart)} onKeyUp={(event) => setCursor(event.currentTarget.selectionStart)} onKeyDown={onKeyDown} placeholder={props.planMode ? "描述你想让 Agent 先规划的事；它只读代码、先出方案，交由同伴评审、你来拍板…" : "描述任务；输入 @ 或点“添加接收人”，最多指定两个 Agent…"} rows={2} disabled={!props.configured} aria-label="任务内容" />
+    <div className="composer-toolbar"><button className={`plan-toggle ${props.planMode ? "plan-toggle--on" : ""}`} type="button" onClick={() => props.onPlanModeChange(!props.planMode)} disabled={!props.configured} aria-pressed={props.planMode} title="计划模式：Agent 只读不改，先出方案，交同伴评审后由你拍板"><ListChecks size={14} />计划模式</button><button className="composer-workspace" type="button" onClick={props.onWorkspaceClick} title={props.workspace?.path} aria-label="选择工作目录"><Folder size={14} /><span>{props.workspace?.name ?? "选择目录"}</span></button><label className="agent-select" title="在光标处添加接收人"><AtSign size={14} /><select value="" onChange={(event) => { if (event.target.value) insertMention(event.target.value); }} disabled={!props.configured} aria-label="添加接收人"><option value="">添加接收人</option>{props.agents.filter((agent) => agent.enabled).map((agent) => <option value={agent.id} key={agent.id} disabled={!agent.availability.available}>{agent.displayName}（@{agent.id}）{agent.availability.available ? "" : "· 离线"}</option>)}</select><ChevronDown size={14} /></label><span className="fallback-hint">未指定时交给 {props.fallbackAgent?.displayName ?? "可用 Agent"}</span><span className="composer-hint">{props.active ? "Enter 插话 · Shift Enter 换行" : "Enter 发送 · Shift Enter 换行"}</span><label className="composer-attach" title="添加图片（仅 Pi 运行时可直接读取）"><Paperclip size={14} /><input type="file" accept={ALLOWED_IMAGE_TYPES.join(",")} multiple disabled={!props.configured || props.attachments.length >= MAX_COMPOSER_ATTACHMENTS} onChange={(event) => { void addFiles(event.target.files); event.target.value = ""; }} aria-label="添加图片" /></label>{props.active && !props.planMode && <button className="steer-button" type="button" onClick={() => props.onSend(true)} disabled={disabled} aria-label="插话到正在运行的 Agent">{props.sending ? <span className="button-spinner" /> : <SendHorizontal size={16} />}插话</button>}{props.active ? <button className="stop-button" type="button" onClick={props.onCancel} disabled={props.cancelling} aria-label="停止整个协作链"><Square size={11} fill="currentColor" /></button> : <button className="send-button" type="button" onClick={() => props.onSend()} disabled={disabled} aria-label="发送任务">{props.sending ? <span className="button-spinner" /> : <SendHorizontal size={17} />}</button>}</div>
   </div></div>;
 }
 
@@ -1513,6 +1533,45 @@ function AgentAvatar({ agentId, variant }: { agentId: string; variant?: "reviewe
   return <span className={`agent-avatar ${tone}`} title={`@${agentId}`}>{agentInitials(agentId)}</span>;
 }
 
+function AgentRouteChip({ agentId, agents }: { agentId: string; agents: AgentSummary[] }) {
+  return <span className="agent-route-chip" title={`@${agentId}`}><AgentAvatar agentId={agentId} /><span>{agentName(agents, agentId)}</span></span>;
+}
+
+function agentReplyLabel(item: Extract<TranscriptItem, { type: "agent" }>, agents: AgentSummary[]): string {
+  if (item.purpose === "review") return item.replyToAgentId ? `审核 ${agentName(agents, item.replyToAgentId)} 的交付` : "同行审核";
+  if (item.replyToAgentId && item.incomingKind === "review-feedback") return `根据 ${agentName(agents, item.replyToAgentId)} 的审核意见返工`;
+  if (item.replyToAgentId && item.incomingKind === "collaboration") return `回应 ${agentName(agents, item.replyToAgentId)} 的转交`;
+  if (item.replyToAgentId) return `回复 ${agentName(agents, item.replyToAgentId)}`;
+  return item.replyToHuman ? "回复你" : "独立运行";
+}
+
+function stripLeadingMentions(content: string, mentions: string[]): string {
+  if (mentions.length === 0) return content;
+  const targetIds = new Set(mentions.map((id) => id.toLocaleLowerCase()));
+  let rest = content.trimStart();
+  let removed = false;
+  while (true) {
+    const match = rest.match(/^@([a-z][a-z0-9-]*)(?:\s+|$)/i);
+    if (!match || !targetIds.has(match[1]!.toLocaleLowerCase())) break;
+    rest = rest.slice(match[0].length);
+    removed = true;
+  }
+  return removed && rest.trim() ? rest.trimStart() : content;
+}
+
+function compactMessagePreview(content: string): string {
+  const clean = content
+    .replace(/^(?:@[a-z][a-z0-9-]*\s*)+/i, "")
+    .replace(/[`*_>#]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  return clean.length > 180 ? `${clean.slice(0, 180).trimEnd()}…` : clean;
+}
+
+function addUnique(values: string[] | undefined, value: string): void {
+  if (values && !values.includes(value)) values.push(value);
+}
+
 function buildThreads(events: StoredPlatformEvent[]): ThreadSummary[] {
   const threads = new Map<string, ThreadSummary>(); const activeRuns = new Map<string, { threadId: string; active: boolean }>();
   for (const event of events) { if (event.type === "thread.created") { threads.set(event.thread.id, { ...event.thread, updatedAt: event.recordedAt, hasActiveRun: false }); continue; } if (event.type === "run.queued") activeRuns.set(event.run.id, { threadId: event.run.threadId, active: true }); else if (isTerminalEvent(event)) { const run = activeRuns.get(event.runId); if (run) run.active = false; } const threadId = eventThreadId(event); const thread = threadId ? threads.get(threadId) : undefined; if (thread) thread.updatedAt = event.recordedAt; }
@@ -1520,20 +1579,39 @@ function buildThreads(events: StoredPlatformEvent[]): ThreadSummary[] {
   return [...threads.values()].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
 }
 
-function buildTranscript(events: StoredPlatformEvent[], threadId?: string): TranscriptItem[] {
+export function buildTranscript(events: StoredPlatformEvent[], threadId?: string): TranscriptItem[] {
   if (!threadId) return [];
   const items: TranscriptItem[] = [];
   const runs = new Map<string, Extract<TranscriptItem, { type: "agent" }>>();
+  const messages = new Map<string, Extract<StoredPlatformEvent, { type: "message.created" }>["message"]>();
+  const humanMessages = new Map<string, Extract<TranscriptItem, { type: "human" }>>();
   for (const event of events) {
     if (event.type === "message.created" && event.message.threadId === threadId) {
-      if (event.message.sender.type === "human") items.push({ id: event.message.id, type: "human", content: event.message.content, createdAt: event.message.createdAt });
-      else if (event.message.kind === "collaboration" || event.message.kind === "review-request" || event.message.kind === "review-feedback") items.push({ id: event.message.id, type: "collaboration", agentId: event.message.sender.id, content: event.message.content, mentions: event.message.mentions, createdAt: event.message.createdAt, kind: event.message.kind });
+      messages.set(event.message.id, event.message);
+      if (event.message.sender.type === "human") {
+        const item: Extract<TranscriptItem, { type: "human" }> = {
+          id: event.message.id,
+          type: "human",
+          content: stripLeadingMentions(event.message.content, event.message.mentions),
+          createdAt: event.message.createdAt,
+          targets: [...event.message.mentions],
+          explicitlyDirected: event.message.mentions.length > 0,
+        };
+        items.push(item);
+        humanMessages.set(event.message.id, item);
+      } else if (event.message.kind === "collaboration") {
+        items.push({ id: event.message.id, type: "collaboration", agentId: event.message.sender.id, content: event.message.content, mentions: event.message.mentions, createdAt: event.message.createdAt, kind: event.message.kind });
+      }
+      // review-request/review-feedback are internal transport prompts. Their
+      // state and outcome are already represented by the review run/card.
       continue;
     }
     if (event.type === "run.queued" && event.run.threadId === threadId) {
-      const item: Extract<TranscriptItem, { type: "agent" }> = { id: event.run.id, type: "agent", agentId: event.run.agentId, content: "", createdAt: event.recordedAt, status: "queued", thinking: "", tools: [], notices: [], purpose: event.run.purpose ?? "task", ...(event.run.reviewRound ? { reviewRound: event.run.reviewRound } : {}), ...(event.run.mode === "plan" ? { planMode: true } : {}) };
+      const incoming = messages.get(event.run.incomingMessageId);
+      const item: Extract<TranscriptItem, { type: "agent" }> = { id: event.run.id, type: "agent", agentId: event.run.agentId, content: "", createdAt: event.recordedAt, status: "queued", thinking: "", tools: [], notices: [], purpose: event.run.purpose ?? "task", ...(event.run.reviewRound ? { reviewRound: event.run.reviewRound } : {}), ...(event.run.mode === "plan" ? { planMode: true } : {}), ...(incoming?.sender.type === "human" ? { replyToHuman: true } : {}), ...(incoming?.sender.type === "agent" ? { replyToAgentId: incoming.sender.id } : {}), ...(incoming ? { incomingKind: incoming.kind } : {}) };
       items.push(item);
       runs.set(event.run.id, item);
+      if (incoming?.sender.type === "human") addUnique(humanMessages.get(incoming.id)?.targets, event.run.agentId);
       continue;
     }
     if (event.type === "review.requested" || event.type === "review.submitted" || event.type === "review.rework" || event.type === "review.resolved") {
@@ -1558,7 +1636,7 @@ function buildTranscript(events: StoredPlatformEvent[], threadId?: string): Tran
     else if (event.type === "run.usage") { const { type: _type, runId: _runId, threadId: _threadId, agentId: _agentId, eventId: _eventId, recordedAt: _recordedAt, ...usage } = event; run.usage = usage; }
     else if (event.type === "run.lifecycle") run.notices.push(lifecycleLabel(event.phase, event.detail));
     else if (event.type === "run.diagnostic") run.notices.push(`${event.source === "extension" ? "扩展" : "运行时"}：${event.message}`);
-    else if (event.type === "run.steered") run.notices.push("已插入新的用户消息");
+    else if (event.type === "run.steered") { run.notices.push("已插入新的用户消息"); addUnique(humanMessages.get(event.messageId)?.targets, event.agentId); }
     else if (event.type === "run.completed") { run.content = event.output; run.status = "completed"; }
     else if (event.type === "run.failed") { run.content = event.error; run.status = "failed"; }
     else if (event.type === "run.cancelled") { run.content = event.reason; run.status = "cancelled"; }
@@ -1667,6 +1745,7 @@ function workspaceName(path: string): string { const parts = path.split(/[\\/]/)
 function cleanTitle(title: string): string { return title.replace(/^(?:@[a-z][a-z0-9-]*\s*){1,2}/i, "") || title; }
 function agentName(agents: AgentSummary[], id: string): string { return agents.find((agent) => agent.id === id)?.displayName ?? id; }
 function runtimeLabel(agent?: AgentSummary): string { if (!agent || agent.availability.label === "Historical Agent") return "历史 Agent"; return agent.runtime.kind === "pi" ? `Pi · ${agent.runtime.provider} · ${agent.runtime.model}` : `Codex${agent.runtime.model ? ` · ${agent.runtime.model}` : ""}`; }
+function runtimeDetail(agent: AgentSummary | undefined, displayName: string): string | undefined { const label = runtimeLabel(agent); const family = agent?.runtime.kind === "pi" ? "Pi" : "Codex"; if (label.toLocaleLowerCase() === displayName.toLocaleLowerCase()) return undefined; if (displayName.toLocaleLowerCase() === family.toLocaleLowerCase() && label.startsWith(`${family} · `)) return label.slice(family.length + 3); return label; }
 function statusLabel(status: ViewRunStatus, access?: AccessMode): string { if (status === "queued") return access === "read-only" ? "并行队列" : "等待会话/写锁"; return { running: "运行中", completed: "已完成", failed: "失败", cancelled: "已取消", interrupted: "已中断" }[status]; }
 function connectionLabel(configured: boolean, connection: string): string { if (!configured) return "等待运行时配置"; if (connection === "connected") return "团队服务已连接"; return connection === "reconnecting" ? "正在重新连接" : "正在连接"; }
 function shortId(id: string): string { return id.split("_")[1]?.slice(0, 8) ?? id.slice(0, 8); }
