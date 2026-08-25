@@ -4,11 +4,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import {
-  FileCustomProviderStore,
   customProviderEnvKey,
   findCustomProvider,
   validateCustomProviderCatalog,
 } from "../src/config/custom-providers.js";
+import { FileCustomProviderStore } from "../src/config/custom-provider-store.js";
 import { toPiProviderConfig } from "../src/runtime/pi-shared.js";
 
 const vllm = {
