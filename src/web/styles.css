@@ -274,6 +274,13 @@ button, .thread-item, .provider-option, .runtime-choice, .suggestion-grid button
 .live-indicator { display: inline-flex; align-items: center; gap: 5px; margin-left: auto; color: var(--accent); font-weight: 560; }
 .live-indicator i { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); animation: pulse 1.4s ease-in-out infinite; }
 .conversation-state { display: inline-flex; align-items: center; gap: 4px; margin-left: auto; padding: 4px 7px; border: 1px solid var(--success-line); border-radius: 999px; background: color-mix(in srgb, var(--success-soft) 72%, transparent); color: var(--success); font-size: 9px; font-weight: 620; }
+.collaboration-state-badge { display: inline-flex; align-items: center; gap: 5px; margin-left: auto; padding: 4px 8px; border: 1px solid var(--border); border-radius: 999px; background: var(--surface-soft); color: var(--muted); font-size: 9px; font-weight: 650; white-space: nowrap; }
+.collaboration-state-badge i { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+.collaboration-state-badge--active, .collaboration-state-badge--queued { border-color: color-mix(in srgb, var(--accent) 30%, var(--border)); background: var(--accent-soft); color: var(--accent); }
+.collaboration-state-badge--active i { animation: pulse 1.4s ease-in-out infinite; }
+.collaboration-state-badge--waiting-external { border-color: color-mix(in srgb, var(--warning) 28%, var(--border)); background: var(--warning-soft); color: var(--warning); }
+.collaboration-state-badge--waiting-human, .collaboration-state-badge--needs-attention { border-color: color-mix(in srgb, var(--danger) 30%, var(--border)); background: var(--danger-soft); color: var(--danger); }
+.collaboration-state-badge--completed { border-color: var(--success-line); background: var(--success-soft); color: var(--success); }
 .human-message { display: flex; justify-content: flex-end; margin: 0 0 30px; animation: rise .3s var(--ease) both; }
 .human-message-bubble { max-width: min(650px, 86%); padding: 11px 14px 13px; border-radius: 17px 17px 5px 17px; background: color-mix(in srgb, var(--accent-soft) 74%, var(--surface)); border: 1px solid color-mix(in srgb, var(--accent) 19%, var(--border-soft)); box-shadow: var(--shadow-xs); }
 .human-message-content { white-space: pre-wrap; line-height: 1.6; font-size: 13.5px; }
@@ -352,6 +359,13 @@ button, .thread-item, .provider-option, .runtime-choice, .suggestion-grid button
 .collaboration-meta { display: flex; align-items: center; flex-wrap: wrap; gap: 5px; color: var(--accent); font-size: 10px; }
 .collaboration-meta strong { margin-left: auto; padding: 2px 6px; border-radius: 999px; background: var(--surface); color: var(--accent); letter-spacing: .03em; font-weight: 650; }
 .collaboration-preview { margin: 8px 0 0; color: var(--muted); }
+.collaboration-deliveries { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.delivery-state { display: inline-flex; align-items: center; gap: 4px; padding: 2px 7px; border-radius: 999px; background: var(--surface); color: var(--faint); font-size: 9px; font-weight: 620; }
+.delivery-state i { width: 5px; height: 5px; border-radius: 50%; background: currentColor; }
+.delivery-state--running { color: var(--accent); }
+.delivery-state--completed { color: var(--success); }
+.delivery-state--failed, .delivery-state--interrupted { color: var(--danger); }
+.delivery-state--queued, .delivery-state--accepted { color: var(--warning); }
 .collaboration-details { margin-top: 7px; }
 .collaboration-details summary { width: max-content; color: var(--accent); cursor: pointer; font-size: 10px; }
 .collaboration-details .markdown-body { margin-top: 9px; padding-top: 9px; border-top: 1px solid var(--border-soft); font-size: 12px; }
@@ -504,6 +518,21 @@ button, .thread-item, .provider-option, .runtime-choice, .suggestion-grid button
 .stat-grid > div { min-height: 62px; display: flex; flex-direction: column; justify-content: center; gap: 5px; padding: 11px; border: 1px solid var(--border-soft); border-radius: var(--radius-md); background: var(--surface-soft); }
 .stat-grid strong { font-size: 19px; line-height: 1; letter-spacing: -.03em; font-variant-numeric: tabular-nums; }
 .stat-grid span { color: var(--faint); font-size: 10px; }
+.custody-panel { padding: 12px; border: 1px solid var(--border-soft); border-radius: var(--radius-md); background: var(--surface-soft); }
+.custody-panel--waiting-human, .custody-panel--needs-attention { border-color: color-mix(in srgb, var(--danger) 28%, var(--border)); background: color-mix(in srgb, var(--danger-soft) 50%, var(--surface)); }
+.custody-panel-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.custody-panel-head .collaboration-state-badge { margin-left: 0; }
+.custody-panel-head code { color: var(--faint); font-family: "SFMono-Regular", Consolas, monospace; font-size: 9px; }
+.custody-panel > p { margin: 9px 1px 0; color: var(--muted); font-size: 10.5px; line-height: 1.55; }
+.custody-wait { display: flex; align-items: flex-start; gap: 8px; margin-top: 10px; padding: 9px; border-radius: var(--radius-sm); background: var(--surface); color: var(--warning); }
+.custody-wait > svg { flex: 0 0 auto; margin-top: 2px; }
+.custody-wait > span { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.custody-wait strong { color: var(--text); font-size: 10px; }
+.custody-wait small { color: var(--faint); font-size: 9px; line-height: 1.45; }
+.custody-participants { display: flex; flex-direction: column; gap: 6px; margin-top: 11px; }
+.custody-participants > span { display: flex; align-items: center; justify-content: space-between; gap: 7px; }
+.custody-participants small { color: var(--faint); font-size: 9px; }
+.custody-panel .custody-warning { display: flex; align-items: center; gap: 5px; color: var(--danger); font-weight: 620; }
 .agent-roster { display: flex; flex-direction: column; gap: 4px; }
 .roster-item { display: flex; align-items: center; gap: 10px; padding: 8px; border-radius: var(--radius-sm); }
 .roster-item:hover { background: var(--surface-soft); }

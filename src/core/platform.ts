@@ -228,8 +228,8 @@ export class MultiAgentPlatform {
   /** Durable, replayable external waits; timers are only a live projection. */
   private readonly pendingHolds = new Map<Id, PendingBallHold>();
   private readonly holdTimers = new Map<Id, ReturnType<typeof setTimeout>>();
-  /** A run must choose one next-action path: peer handoff, external hold, or human. */
-  private readonly runCustodyActions = new Map<Id, "handoff" | "hold" | "human">();
+  /** A run must choose one next-action path: peer handoff, external hold, human, or a visible void pass. */
+  private readonly runCustodyActions = new Map<Id, "handoff" | "hold" | "human" | "void">();
   private readonly maxA2ADepth: number;
   private readonly maxAgentRunsPerChain: number;
   private readonly maxMentionTargets: number;
@@ -700,13 +700,26 @@ export class MultiAgentPlatform {
       let started = false;
       for (let index = 0; index < this.queue.length; ) {
         const run = this.queue[index];
-        if (!run || !this.isEligible(run)) {
+        if (!run) {
+          index++;
+          continue;
+        }
+        const failedPredecessor = this.failedSerialPredecessor(run);
+        if (failedPredecessor) {
+          this.queue.splice(index, 1);
+          await this.recordDependencySuppressed(run, failedPredecessor);
+          await this.maybeResolveBall(run);
+          this.finishPendingRun(run);
+          continue;
+        }
+        if (!this.isEligible(run)) {
           index++;
           continue;
         }
         this.queue.splice(index, 1);
         const active = await this.reserveRun(run);
         if (!active) {
+          await this.maybeResolveBall(run);
           this.finishPendingRun(run);
           continue;
         }
@@ -911,6 +924,8 @@ export class MultiAgentPlatform {
     if (completedOutput !== undefined) {
       await this.advanceReview(run, completedOutput);
       await this.maybeResolveBall(run);
+    } else if (this.runStatuses.get(run.id) === "failed") {
+      await this.maybeResolveBall(run);
     }
   }
 
@@ -922,7 +937,6 @@ export class MultiAgentPlatform {
     const reject = async (
       reason: string,
       targetAgentId?: Id,
-      messageId?: Id,
     ): Promise<PostAgentMessageResult> => {
       await this.record({
         type: "routing.rejected",
@@ -936,7 +950,6 @@ export class MultiAgentPlatform {
         accepted: false,
         targets: [],
         reason,
-        ...(messageId ? { messageId } : {}),
       };
     };
 
@@ -949,7 +962,6 @@ export class MultiAgentPlatform {
     if (this.acceptedIdempotencyKeys.has(scopedKey)) {
       return reject("Duplicate idempotency key");
     }
-    this.acceptedIdempotencyKeys.add(scopedKey);
 
     const parsed = parseAgentMentions(content, [...this.agents.values()], this.maxMentionTargets);
     const targets = parsed.targets.filter((target) => target !== sourceRun.agentId);
@@ -976,19 +988,20 @@ export class MultiAgentPlatform {
       },
       ...(input.intent ? { intent: input.intent } : {}),
     };
-    await this.addMessage(message);
 
     if (parsed.unknown.length > 0) {
-      return reject(`Unknown Agent handle: @${parsed.unknown.join(", @")}`, undefined, message.id);
+      return reject(`Unknown Agent handle: @${parsed.unknown.join(", @")}`);
     }
     if (parsed.overflow) {
       return reject(
         `A collaboration message can target at most ${this.maxMentionTargets} Agents`,
-        undefined,
-        message.id,
       );
     }
     if (targets.length === 0) {
+      // A targetless FYI is still a valid visible message, and a targetless
+      // handoff is a visible void pass. Invalid target syntax above is neither.
+      this.acceptedIdempotencyKeys.add(scopedKey);
+      await this.addMessage(message);
       if (collaborationIntent === "handoff") {
         await this.record({
           type: "ball.void_pass",
@@ -997,6 +1010,10 @@ export class MultiAgentPlatform {
           runId: sourceRun.id,
           messageId: message.id,
         });
+        // Keep the chain in the explicit void state. Without this marker the
+        // normal run completion path would immediately overwrite the dropped
+        // pass with task.done, making a broken handoff look successful.
+        this.runCustodyActions.set(sourceRun.id, "void");
       }
       return { accepted: true, targets: [], messageId: message.id };
     }
@@ -1006,35 +1023,36 @@ export class MultiAgentPlatform {
     ) {
       return reject(
         `This run already chose ${this.runCustodyActions.get(sourceRun.id)} as its next custody action`,
-        undefined,
-        message.id,
       );
     }
     if (this.cancelledChains.has(sourceRun.causal.chainId)) {
-      return reject("Collaboration chain is cancelled", undefined, message.id);
+      return reject("Collaboration chain is cancelled");
     }
     if (depth > this.maxA2ADepth) {
-      return reject(`A2A depth limit exceeded (${this.maxA2ADepth})`, undefined, message.id);
+      return reject(`A2A depth limit exceeded (${this.maxA2ADepth})`);
     }
     const currentRunCount = this.groupRunCounts.get(sourceRun.causal.chainId) ?? 1;
     if (currentRunCount + targets.length > this.maxAgentRunsPerChain) {
-      return reject(`Agent run limit exceeded (${this.maxAgentRunsPerChain})`, undefined, message.id);
+      return reject(`Agent run limit exceeded (${this.maxAgentRunsPerChain})`);
     }
     const batchId = createId("batch");
     let predecessorRunId: Id | undefined = routingMode === "serial" ? sourceRun.id : undefined;
     for (const target of targets) {
       if (!this.isRoutable(target)) {
-        return reject(`Agent @${target} is disabled or unavailable`, target, message.id);
+        return reject(`Agent @${target} is disabled or unavailable`, target);
       }
       if (this.projectedPingPongHops(sourceRun, target) > this.maxPingPongHops) {
         return reject(
           `Ping-pong limit exceeded for @${sourceRun.agentId} and @${target}`,
           target,
-          message.id,
         );
       }
     }
 
+    // Admission is now fully validated. Reserve the idempotency key before the
+    // first awaited write so concurrent repeats cannot both publish.
+    this.acceptedIdempotencyKeys.add(scopedKey);
+    await this.addMessage(message);
     for (const [targetIndex, target] of targets.entries()) {
       await this.record({
         type: "routing.accepted",
@@ -1202,14 +1220,68 @@ export class MultiAgentPlatform {
 
   private async maybeResolveBall(run: AgentRun): Promise<void> {
     const action = this.runCustodyActions.get(run.id);
-    if (action === "hold" || action === "human") return;
+    if (action === "hold" || action === "human" || action === "void") return;
     if ((this.chainPendingCounts.get(run.causal.chainId) ?? 0) > 1) return;
+    const failedRun = this.failedTaskRunInChain(run.causal.chainId);
+    if (failedRun) {
+      await this.record({
+        type: "ball.handed_user",
+        threadId: failedRun.threadId,
+        chainId: failedRun.causal.chainId,
+        runId: failedRun.id,
+        reason: "runtime-failure",
+      });
+      return;
+    }
     await this.record({
       type: "task.done",
       threadId: run.threadId,
       chainId: run.causal.chainId,
       runId: run.id,
       agentId: run.agentId,
+    });
+  }
+
+  /**
+   * A serial leg consumes its predecessor's result. Terminal only means the
+   * predecessor stopped; it does not mean a usable result exists. Suppress the
+   * dependent leg after failure/cancellation/interruption instead of running it
+   * with missing context and presenting that as an honest serial worklist.
+   */
+  private failedSerialPredecessor(
+    run: AgentRun,
+  ): { runId: Id; status: AgentRun["status"] } | undefined {
+    const predecessorRunId = run.routing?.predecessorRunId;
+    if (!predecessorRunId) return undefined;
+    const status = this.runStatuses.get(predecessorRunId);
+    if (!status || status === "completed" || !isTerminal(status)) return undefined;
+    return { runId: predecessorRunId, status };
+  }
+
+  /** A dependency cancellation is not an operator cancellation of the chain. */
+  private async recordDependencySuppressed(
+    run: AgentRun,
+    predecessor: { runId: Id; status: AgentRun["status"] },
+  ): Promise<void> {
+    if (isTerminal(this.runStatuses.get(run.id))) return;
+    const reason =
+      `Serial predecessor ${predecessor.runId} ended as ${predecessor.status}; ` +
+      "this dependent leg was not started.";
+    await this.record({
+      type: "run.cancelled",
+      runId: run.id,
+      threadId: run.threadId,
+      agentId: run.agentId,
+      reason,
+    });
+    this.runStatuses.set(run.id, "cancelled");
+  }
+
+  private failedTaskRunInChain(chainId: Id): AgentRun | undefined {
+    return [...this.runs.values()].find((candidate) => {
+      if (candidate.causal.chainId !== chainId || candidate.purpose === "review") return false;
+      const status = this.runStatuses.get(candidate.id);
+      return status === "failed" || status === "interrupted";
     });
   }
 

@@ -407,7 +407,12 @@ export type PlatformEventPayload =
       threadId: Id;
       chainId: Id;
       runId: Id;
-      reason: "clarification" | "plan-approval" | "review-escalation";
+      reason:
+        | "clarification"
+        | "plan-approval"
+        | "review-escalation"
+        /** The collaboration chain exhausted runnable work after a task run failed. */
+        | "runtime-failure";
     }
   | {
       /** A handoff was claimed in structure but named no routable recipient. */
