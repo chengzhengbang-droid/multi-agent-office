@@ -1123,7 +1123,8 @@ export class MultiAgentPlatform {
     const timer = setTimeout(() => {
       void this.fireHold(hold.id);
     }, Math.min(delay, 2_147_000_000));
-    (timer as NodeJS.Timeout).unref?.();
+    // A hold is still live collaboration work. Keep its timer referenced so a
+    // quiet process cannot exit before the promised wake-up is enqueued.
     this.holdTimers.set(hold.id, timer);
   }
 
