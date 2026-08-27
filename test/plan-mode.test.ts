@@ -85,6 +85,59 @@ test("plan mode is reviewed as a critique even when the Agent declares nothing",
   assert.equal(single(events, "review.resolved").outcome, "approved");
 });
 
+test("plan mode asks the human before drafting or peer review", async () => {
+  const platform = createPlanPlatform([agent("codex"), agent("pi")], {
+    codex: async (request) => {
+      assert.equal(request.planMode, true);
+      await request.requestClarification({
+        questions: ["这个方案优先优化准确率还是运行成本？"],
+      });
+      return emitOutput(request, "请先确认：优先优化准确率还是运行成本？");
+    },
+  });
+
+  await platform.postUserMessage({ content: "@codex 出个方案", planMode: true });
+  const events = await platform.getEvents();
+
+  assert.equal(countEvents(events, "clarification.requested"), 1);
+  assert.equal(countEvents(events, "review.requested"), 0);
+  assert.equal(countEvents(events, "plan.awaiting-approval"), 0);
+  assert.equal(queuedRuns(events).length, 1);
+});
+
+test("a material question found during plan rework stops the review loop", async () => {
+  const platform = createPlanPlatform([agent("codex"), agent("pi")], {
+    codex: async (request) => {
+      if ((request.reviewOf?.round ?? 0) > 0) throw new Error("author runs are not reviewers");
+      if (request.incoming.kind === "review-feedback") {
+        await request.requestClarification({
+          questions: ["数据会跨项目复用吗？这会决定隔离键的设计。"],
+        });
+        return emitOutput(request, "继续修订前请确认：数据是否会跨项目复用？");
+      }
+      await request.declareDeliverable({ kind: "plan", summary: "按项目保存经验" });
+      return emitOutput(request, "方案：按项目保存经验");
+    },
+    pi: async (request) => {
+      await request.submitReview?.({
+        verdict: "changes-requested",
+        summary: "隔离范围没有依据",
+        findings: ["确认经验是否跨项目复用"],
+      });
+      return emitOutput(request, "需要修改");
+    },
+  });
+
+  await platform.postUserMessage({ content: "@codex 出个经验库方案", planMode: true });
+  const events = await platform.getEvents();
+
+  assert.equal(countEvents(events, "review.requested"), 1);
+  assert.equal(countEvents(events, "clarification.requested"), 1);
+  assert.equal(single(events, "review.resolved").escalation, "clarification-needed");
+  assert.equal(countEvents(events, "plan.awaiting-approval"), 0);
+  assert.equal(queuedRuns(events).length, 3);
+});
+
 test("a peer-approved plan waits for the human instead of being executed", async () => {
   const platform = createPlanPlatform([agent("codex"), agent("pi")], {
     codex: async (request) => {

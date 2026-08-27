@@ -520,6 +520,36 @@ test("smart gate leaves plain conversation unreviewed", async () => {
   assert.equal(single(events, "run.completed").output, "你好，有什么可以帮你的？");
 });
 
+test("material clarification stops before deliverable declaration and peer review", async () => {
+  let declarationRefusal: string | undefined;
+  const platform = createSmartPlatform([agent("codex"), agent("pi")], {
+    codex: async (request) => {
+      const clarification = await request.requestClarification({
+        questions: ["经验最终是给人阅读，还是给自动化系统消费？"],
+      });
+      assert.equal(clarification.accepted, true);
+      const declaration = await request.declareDeliverable({
+        kind: "plan",
+        summary: "带着未决问题的临时方案",
+      });
+      declarationRefusal = declaration.reason;
+      return emitOutput(request, "请先确认：经验最终给人阅读，还是给自动化系统消费？");
+    },
+  });
+
+  await platform.postUserMessage({ content: "@codex 设计经验提取算法" });
+  const events = await platform.getEvents();
+
+  assert.match(declarationRefusal ?? "", /requested human clarification/);
+  assert.deepEqual(single(events, "clarification.requested").questions, [
+    "经验最终是给人阅读，还是给自动化系统消费？",
+  ]);
+  assert.equal(countEvents(events, "deliverable.declared"), 0);
+  assert.equal(countEvents(events, "review.requested"), 0);
+  assert.equal(countEvents(events, "plan.awaiting-approval"), 0);
+  assert.equal(countEvents(events, "run.queued"), 1);
+});
+
 test("declaring a completion opens a verify review carrying the evidence", async () => {
   const order: string[] = [];
   const platform = createSmartPlatform([agent("codex"), agent("pi")], {
@@ -714,6 +744,22 @@ test("required mode still reviews a task that declares nothing", async () => {
 
   assert.equal(single(events, "review.requested").reviewType, "verify");
   assert.equal(single(events, "review.resolved").outcome, "approved");
+});
+
+test("an explicit clarification bypasses even the required review gate", async () => {
+  const platform = createReviewPlatform([agent("codex"), agent("pi")], {
+    codex: async (request) => {
+      await request.requestClarification({ questions: ["请选择必须兼容的测试框架。"] });
+      return emitOutput(request, "你需要兼容哪个测试框架？");
+    },
+  });
+
+  await platform.postUserMessage({ content: "@codex 设计解析器" });
+  const events = await platform.getEvents();
+
+  assert.equal(countEvents(events, "clarification.requested"), 1);
+  assert.equal(countEvents(events, "review.requested"), 0);
+  assert.equal(countEvents(events, "run.queued"), 1);
 });
 
 test("a smart-gate event log replays its declarations and review types", async () => {

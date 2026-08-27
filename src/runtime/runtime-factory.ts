@@ -1,8 +1,7 @@
 import { resolve } from "node:path";
 import { runtimeFingerprint } from "../config/agent-catalog.js";
 import type { AgentDefinition, Id } from "../core/types.js";
-import { CodexRuntimeAdapter } from "./codex-runtime.js";
-import type { RunCallbackRegistry } from "./callback-registry.js";
+import { CODEX_SESSION_PROTOCOL, CodexRuntimeAdapter } from "./codex-runtime.js";
 import { PiRuntimeAdapter, resolvePiAvailability } from "./pi-runtime.js";
 import { PiSharedRuntime } from "./pi-shared.js";
 import type { AgentRuntime } from "./runtime.js";
@@ -12,12 +11,6 @@ export interface RuntimeFactoryOptions {
   projectRoot: string;
   sessionRoot?: string;
   sessionStore: RuntimeSessionStore;
-  callbackRegistry: RunCallbackRegistry;
-  callbackUrl: string;
-  reviewCallbackUrl: string;
-  deliverableCallbackUrl: string;
-  mcpCommand: string;
-  mcpArgs: string[];
   /** Shared Pi state; created on demand so each caller may supply its own. */
   piShared?: PiSharedRuntime;
 }
@@ -59,14 +52,8 @@ export async function createAgentRuntimes(
           cwd: options.projectRoot,
           spec: agent.runtime,
           accessMode: agent.accessMode,
-          fingerprint,
+          fingerprint: `${fingerprint}:${CODEX_SESSION_PROTOCOL}`,
           sessionStore: options.sessionStore,
-          callbackRegistry: options.callbackRegistry,
-          callbackUrl: options.callbackUrl,
-          reviewCallbackUrl: options.reviewCallbackUrl,
-          deliverableCallbackUrl: options.deliverableCallbackUrl,
-          mcpCommand: options.mcpCommand,
-          mcpArgs: options.mcpArgs,
         }),
       );
     }

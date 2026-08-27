@@ -158,7 +158,9 @@ export type ReviewEscalation =
   /** The review run failed, was cancelled, or its reviewer became unavailable. */
   | "review-failed"
   /** maxReviewRounds rounds of rework still did not satisfy the reviewer. */
-  | "max-rounds";
+  | "max-rounds"
+  /** The author stopped rework because a material human decision is missing. */
+  | "clarification-needed";
 
 export interface ReviewSubmission {
   verdict: ReviewVerdict;
@@ -367,6 +369,14 @@ export type PlatformEventPayload =
       kind: DeliverableKind;
       summary: string;
       evidence?: string[];
+    }
+  | {
+      /** The Agent stopped before delivery because material human input is missing. */
+      type: "clarification.requested";
+      runId: Id;
+      threadId: Id;
+      agentId: Id;
+      questions: string[];
     }
   | {
       type: "review.requested";

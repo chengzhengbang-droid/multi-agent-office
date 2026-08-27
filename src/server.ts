@@ -43,12 +43,6 @@ import type {
   StoredPlatformEvent,
   ThinkingLevel,
 } from "./core/types.js";
-import {
-  RunCallbackRegistry,
-  type CallbackRequest,
-  type DeliverableCallbackRequest,
-  type ReviewCallbackRequest,
-} from "./runtime/callback-registry.js";
 import { PiSharedRuntime } from "./runtime/pi-shared.js";
 import { createAgentRuntimes, type RuntimeFactoryOptions } from "./runtime/runtime-factory.js";
 import { FileRuntimeSessionStore } from "./runtime/session-store.js";
@@ -79,7 +73,6 @@ let catalog = await catalogStore.load();
 const sessionStore = new FileRuntimeSessionStore(
   resolve(dataRoot, "runtime-sessions", "index.json"),
 );
-const callbackRegistry = new RunCallbackRegistry();
 const customProviderStore = new FileCustomProviderStore(
   resolve(dataRoot, "custom-providers.json"),
 );
@@ -89,14 +82,6 @@ const runtimeFactoryOptions: RuntimeFactoryOptions = {
   piShared,
   sessionRoot: resolve(dataRoot, "runtime-sessions"),
   sessionStore,
-  callbackRegistry,
-  callbackUrl: `http://127.0.0.1:${port}/internal/agent-message`,
-  reviewCallbackUrl: `http://127.0.0.1:${port}/internal/agent-review`,
-  deliverableCallbackUrl: `http://127.0.0.1:${port}/internal/agent-deliverable`,
-  mcpCommand: process.execPath,
-  mcpArgs: isDev
-    ? ["--import", "tsx", resolve(appRoot, "src", "mcp", "collaboration-server.ts")]
-    : [resolve(appRoot, "dist", "src", "mcp", "collaboration-server.js")],
 };
 let runtimes = await createAgentRuntimes(catalog.agents, runtimeFactoryOptions);
 const platform = new MultiAgentPlatform({
@@ -123,57 +108,6 @@ const vite = isDev
 const server = createServer(async (request, response) => {
   try {
     const url = new URL(request.url ?? "/", "http://localhost");
-
-    if (url.pathname === "/internal/agent-message" && request.method === "POST") {
-      const token = bearerToken(request);
-      if (!token) {
-        sendJson(response, 401, { error: "Missing callback token" });
-        return;
-      }
-      try {
-        const result = await callbackRegistry.invoke(token, parseCallbackRequest(await readJson(request)));
-        sendJson(response, 200, result);
-      } catch (error) {
-        sendJson(response, 403, { error: errorMessage(error) });
-      }
-      return;
-    }
-
-    if (url.pathname === "/internal/agent-review" && request.method === "POST") {
-      const token = bearerToken(request);
-      if (!token) {
-        sendJson(response, 401, { error: "Missing callback token" });
-        return;
-      }
-      try {
-        const result = await callbackRegistry.invokeReview(
-          token,
-          parseReviewCallbackRequest(await readJson(request)),
-        );
-        sendJson(response, 200, result);
-      } catch (error) {
-        sendJson(response, 403, { error: errorMessage(error) });
-      }
-      return;
-    }
-
-    if (url.pathname === "/internal/agent-deliverable" && request.method === "POST") {
-      const token = bearerToken(request);
-      if (!token) {
-        sendJson(response, 401, { error: "Missing callback token" });
-        return;
-      }
-      try {
-        const result = await callbackRegistry.invokeDeliverable(
-          token,
-          parseDeliverableCallbackRequest(await readJson(request)),
-        );
-        sendJson(response, 200, result);
-      } catch (error) {
-        sendJson(response, 403, { error: errorMessage(error) });
-      }
-      return;
-    }
 
     if (url.pathname === "/api/setup" && request.method === "POST") {
       if (!isTrustedLocalOrigin(request)) {
@@ -790,68 +724,6 @@ function assertCatalogContainsNoSecrets(value: unknown): void {
   }
 }
 
-function parseCallbackRequest(body: Record<string, unknown>): CallbackRequest {
-  for (const key of ["runId", "threadId", "agentId", "content", "idempotencyKey"] as const) {
-    if (typeof body[key] !== "string" || !body[key]) throw new Error(`Invalid callback field: ${key}`);
-  }
-  return {
-    runId: body.runId as string,
-    threadId: body.threadId as string,
-    agentId: body.agentId as string,
-    content: body.content as string,
-    idempotencyKey: body.idempotencyKey as string,
-    ...(typeof body.intent === "string" && body.intent ? { intent: body.intent } : {}),
-  };
-}
-
-function parseReviewCallbackRequest(body: Record<string, unknown>): ReviewCallbackRequest {
-  for (const key of ["runId", "threadId", "agentId", "summary"] as const) {
-    if (typeof body[key] !== "string" || !body[key]) throw new Error(`Invalid review callback field: ${key}`);
-  }
-  if (body.verdict !== "approved" && body.verdict !== "changes-requested") {
-    throw new Error("Invalid review callback field: verdict");
-  }
-  const findings = Array.isArray(body.findings)
-    ? body.findings.filter((finding): finding is string => typeof finding === "string")
-    : undefined;
-  const checks = Array.isArray(body.checks)
-    ? body.checks.filter((check): check is string => typeof check === "string")
-    : undefined;
-  return {
-    runId: body.runId as string,
-    threadId: body.threadId as string,
-    agentId: body.agentId as string,
-    verdict: body.verdict,
-    summary: body.summary as string,
-    ...(findings && findings.length > 0 ? { findings } : {}),
-    ...(checks && checks.length > 0 ? { checks } : {}),
-  };
-}
-
-function parseDeliverableCallbackRequest(
-  body: Record<string, unknown>,
-): DeliverableCallbackRequest {
-  for (const key of ["runId", "threadId", "agentId", "summary"] as const) {
-    if (typeof body[key] !== "string" || !body[key]) {
-      throw new Error(`Invalid deliverable callback field: ${key}`);
-    }
-  }
-  if (body.kind !== "completion" && body.kind !== "plan") {
-    throw new Error("Invalid deliverable callback field: kind");
-  }
-  const evidence = Array.isArray(body.evidence)
-    ? body.evidence.filter((item): item is string => typeof item === "string")
-    : undefined;
-  return {
-    runId: body.runId as string,
-    threadId: body.threadId as string,
-    agentId: body.agentId as string,
-    kind: body.kind,
-    summary: body.summary as string,
-    ...(evidence && evidence.length > 0 ? { evidence } : {}),
-  };
-}
-
 /**
  * "smart" is the default: an Agent's own judgment about whether it produced a
  * deliverable opens the gate, so conversation is not reviewed. "on"/"required"
@@ -861,11 +733,6 @@ function parseReviewMode(value: string | undefined): ReviewMode {
   if (value === "off") return "off";
   if (value === "on" || value === "required") return "required";
   return "smart";
-}
-
-function bearerToken(request: IncomingMessage): string | undefined {
-  const authorization = request.headers.authorization;
-  return authorization?.startsWith("Bearer ") ? authorization.slice(7) : undefined;
 }
 
 function isTrustedLocalOrigin(request: IncomingMessage): boolean {

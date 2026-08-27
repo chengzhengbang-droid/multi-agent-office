@@ -139,6 +139,34 @@ export class PiRuntimeAdapter implements AgentRuntime {
       },
     });
 
+    const requestClarificationTool = defineTool({
+      name: "request_clarification",
+      label: "Ask the human before planning or executing",
+      description:
+        "Call before submit_plan or complete_task when missing human input would materially change the goal, architecture, acceptance criteria, or implementation. Ask only the smallest focused set of questions, put the same questions in your assistant response, then stop and wait. Do not use this for details you can discover locally or resolve with a safe reversible assumption.",
+      parameters: Type.Object({
+        questions: Type.Array(Type.String(), {
+          minItems: 1,
+          maxItems: 5,
+          description: "The focused questions the human must answer before the task can continue",
+        }),
+      }),
+      execute: async (_toolCallId, params) => {
+        const result = await request.requestClarification({ questions: params.questions });
+        return {
+          content: [
+            {
+              type: "text",
+              text: result.accepted
+                ? "Clarification requested. Ask these questions in your response, do not submit a deliverable, and stop."
+                : `Clarification request rejected: ${result.reason ?? "unknown reason"}`,
+            },
+          ],
+          details: result,
+        };
+      },
+    });
+
     // Declaring a deliverable is how an Agent opens the review gate on itself.
     // Declared on every run so a resumed session keeps a stable tool surface;
     // the platform decides whether a declaration is admissible.
@@ -170,7 +198,7 @@ export class PiRuntimeAdapter implements AgentRuntime {
       name: "complete_task",
       label: "Declare the task finished and submit it for verification",
       description:
-        "Call when you have FINISHED work a human asked for and produced a real deliverable. Include evidence a reviewer can check: files you changed, commands you ran, how to verify it. This submits your work to a peer for verification — your own word that it is done is not enough. Do not call it for conversation, questions, or explanations.",
+        "Call when you have FINISHED work a human asked for and produced a real deliverable. Include evidence a reviewer can check: files you changed, commands you ran, how to verify it. This submits your work to a peer for verification — your own word that it is done is not enough. Do not call it for conversation, questions, explanations, or while material human questions remain unresolved; use request_clarification first.",
       parameters: Type.Object({
         summary: Type.String({ description: "What you delivered, in your own words" }),
         evidence: Type.Optional(
@@ -188,12 +216,13 @@ export class PiRuntimeAdapter implements AgentRuntime {
       name: "submit_plan",
       label: "Submit a plan for peer critique",
       description:
-        "Call when your output is a plan, design, or proposal that should be pressure-tested before anyone executes it. A teammate critiques it, then the human decides whether it gets built — nothing is executed on your say-so. Do not call it for conversation or for work already finished — use complete_task for that.",
+        "Call only when your plan, design, or proposal is ready to be pressure-tested as written. A teammate critiques it, then the human decides whether it gets built. Do not submit a plan that still contains blocking questions or choices for the human; call request_clarification first and wait. Do not call it for conversation or finished work.",
       parameters: Type.Object({
         summary: Type.String({ description: "The plan you are proposing, in your own words" }),
         evidence: Type.Optional(
           Type.Array(Type.String(), {
-            description: "Assumptions, constraints, or open questions a reviewer should weigh.",
+            description:
+              "Evidence, constraints, and non-blocking assumptions supporting the ready plan. Human choices that would change the plan must be resolved through request_clarification before submission.",
           }),
         ),
       }),
@@ -237,7 +266,13 @@ export class PiRuntimeAdapter implements AgentRuntime {
       sessionManager: manager,
       settingsManager,
       modelRuntime,
-      customTools: [postMessageTool, submitReviewTool, completeTaskTool, submitPlanTool],
+      customTools: [
+        postMessageTool,
+        submitReviewTool,
+        requestClarificationTool,
+        completeTaskTool,
+        submitPlanTool,
+      ],
       excludeTools: piExcludedTools(request.agent.accessMode),
       ...(selectedModel.model ? { model: selectedModel.model } : {}),
       ...(selectedModel.thinkingLevel
@@ -622,6 +657,8 @@ export function buildSystemPrompt(request: RuntimeRequest): string {
     "Peer collaboration protocol:",
     "- You are a peer. There is no boss Agent and no fixed handoff pipeline.",
     "- Judge for yourself what your output is. Conversation, questions, and explanations are just answers: declare nothing, and nobody reviews them.",
+    "- Before drafting a plan or starting execution, check whether missing human input would materially change the goal, architecture, acceptance criteria, or implementation. If so, call request_clarification, ask only the smallest necessary questions in your response, then stop. Do not create or submit a provisional deliverable and do not ask a peer to review it.",
+    "- After the human answers, generate or execute the work, resolve any remaining non-blocking uncertainty with explicit safe assumptions, and only then submit the deliverable for peer review.",
     "- Finished work a human asked for is a deliverable: call complete_task with evidence a reviewer can check (files changed, commands run, how to verify).",
     "- A plan, design, or proposal is a deliverable too: call submit_plan so a peer pressure-tests it and the human decides before anyone builds it.",
     "- What you declare is reviewed by a different peer before it counts as delivered. The reviewer is a peer, not a supervisor.",
@@ -631,7 +668,7 @@ export function buildSystemPrompt(request: RuntimeRequest): string {
     "- A post_message without a recognized teammate mention is visible to the human but wakes nobody.",
     "- Ordinary assistant output, including @handles, never routes to another Agent.",
     "- Do not retry a rejected post_message with a new idempotency key.",
-    "- Ask the human directly when a value judgment or irreversible decision is required.",
+    "- Do not request clarification for facts you can inspect yourself or details that a safe reversible assumption can settle.",
     ...(request.planMode ? planBrief() : []),
     ...(request.reviewOf ? reviewBrief(request.reviewOf) : []),
     "",
@@ -652,8 +689,8 @@ function planBrief(): string[] {
     "- You are read-only here. Editing and shell tools are withheld deliberately, not by accident.",
     "- Investigate first. Read the code, the tests, and the configuration you would touch, and plan against what is actually there.",
     "- Write the plan so someone else could execute it: the files to change, the order to change them in, and how each step is verified.",
-    "- Name what you are unsure about, the assumptions you are making, and what would make you abandon the approach.",
-    "- Finish by calling submit_plan with the plan. A peer critiques it, then the human decides whether it is built.",
+    "- Resolve uncertainty before submission: ask the human first when an answer would materially change the plan; otherwise state the safe non-blocking assumptions you made.",
+    "- Finish by calling submit_plan only when the plan is executable as written and contains no blocking questions. A peer critiques it, then the human decides whether it is built.",
     "- Nothing here is executed until the human approves it, so do not promise progress you have not made.",
   ];
 }

@@ -30,6 +30,8 @@ import type {
   DeclareDeliverableResult,
   PostAgentMessageInput,
   PostAgentMessageResult,
+  RequestClarificationInput,
+  RequestClarificationResult,
   ReviewAssignment,
   RuntimeEvent,
   RuntimeImage,
@@ -202,6 +204,8 @@ export class MultiAgentPlatform {
   private readonly runDeliverables = new Map<Id, DeliverableDeclaration>();
   /** runIds that changed the workspace, declared or not. */
   private readonly runWriteEffects = new Set<Id>();
+  /** runId -> material questions the Agent chose to ask before delivery. */
+  private readonly runClarifications = new Map<Id, string[]>();
   /** taskRunId -> what its review rounds judge, stable across rework. */
   private readonly taskReviewTypes = new Map<Id, ReviewType>();
   /** reviewRunId -> the claim that review is checking, if the author made one. */
@@ -552,6 +556,8 @@ export class MultiAgentPlatform {
           summary: event.summary,
           ...(event.evidence ? { evidence: event.evidence } : {}),
         });
+      } else if (event.type === "clarification.requested") {
+        this.runClarifications.set(event.runId, event.questions);
       } else if (event.type === "review.requested") {
         this.reviewRounds.set(event.taskRunId, event.round);
         this.reviewAuthors.set(event.reviewRunId, event.authorAgentId);
@@ -764,6 +770,7 @@ export class MultiAgentPlatform {
           : {}),
         emit: (event) => this.recordRuntimeEvent(active, event),
         postMessage: (message) => this.acceptAgentMessage(run, message),
+        requestClarification: (input) => this.acceptClarificationRequest(run, input),
         declareDeliverable: (input) => this.acceptDeliverableDeclaration(run, input),
       });
 
@@ -973,6 +980,10 @@ export class MultiAgentPlatform {
       this.messages.get(run.incomingMessageId)?.sender.type === "human" ||
       (run.reviewRound ?? 0) > 0;
     if (!humanAsked) return false;
+    // A clarification is conversation before delivery, not a deliverable to
+    // review. It only bypasses the gate while the run truly stayed read-only
+    // and made no competing deliverable declaration.
+    if (this.isClarificationOnly(run)) return false;
     if (this.reviewMode === "required") return true;
     return (
       // A plan-mode run was asked for a plan, so a plan is what it produced.
@@ -981,6 +992,14 @@ export class MultiAgentPlatform {
       this.runDeliverables.has(run.id) ||
       this.runWriteEffects.has(run.id) ||
       (run.reviewRound ?? 0) > 0
+    );
+  }
+
+  private isClarificationOnly(run: AgentRun): boolean {
+    return (
+      this.runClarifications.has(run.id) &&
+      !this.runDeliverables.has(run.id) &&
+      !this.runWriteEffects.has(run.id)
     );
   }
 
@@ -1015,6 +1034,15 @@ export class MultiAgentPlatform {
       return;
     }
     const taskRunId = this.taskRunIdOf(run);
+    if (this.isClarificationOnly(run)) {
+      // Initial questions simply end this conversational turn. If a material
+      // question surfaced during rework, close the old review task explicitly
+      // so it cannot keep cycling or leave a stale pending gate behind.
+      if ((run.reviewRound ?? 0) > 0) {
+        await this.resolveClarificationDuringRework(run);
+      }
+      return;
+    }
     // A critique judges a plan, so this run's output is the plan under review.
     // Recorded before the gate opens because the no-reviewer path settles the
     // task inside requestReview, and the human still has to see the plan.
@@ -1392,6 +1420,32 @@ export class MultiAgentPlatform {
   }
 
   /**
+   * Rework is still part of the original review task. If the author discovers
+   * that a human decision is required, end that review without pretending the
+   * unfinished plan is ready for the plan-approval gate. The human's reply is
+   * a fresh task turn with the missing facts in context.
+   */
+  private async resolveClarificationDuringRework(run: AgentRun): Promise<void> {
+    const taskRunId = this.taskRunIdOf(run);
+    if (this.resolvedTaskRuns.has(taskRunId)) return;
+    this.resolvedTaskRuns.add(taskRunId);
+    const questions = this.runClarifications.get(run.id) ?? [];
+    await this.record({
+      type: "review.resolved",
+      threadId: run.threadId,
+      taskRunId,
+      outcome: "escalated",
+      rounds: run.reviewRound ?? 0,
+      escalation: "clarification-needed",
+      detail: questions.length > 0
+        ? `执行者需要你先补充：${questions.join("；")}`
+        : "执行者需要你先补充关键信息，再继续方案或执行",
+      ...(run.reviewType ? { reviewType: run.reviewType } : {}),
+    });
+    this.forgetReviewState(taskRunId);
+  }
+
+  /**
    * Parks a finalized plan in front of the human. No run is queued here on
    * purpose: plan mode exists so that nothing is built until a person says so,
    * and an auto-started execution would quietly delete that guarantee.
@@ -1457,6 +1511,7 @@ export class MultiAgentPlatform {
   private forgetRunGateState(runId: Id): void {
     this.runDeliverables.delete(runId);
     this.runWriteEffects.delete(runId);
+    this.runClarifications.delete(runId);
     this.reviewDeclarations.delete(runId);
   }
 
@@ -1487,6 +1542,61 @@ export class MultiAgentPlatform {
   }
 
   /**
+   * Backs request_clarification. This is a mutually exclusive pre-delivery
+   * state: once selected, the run must stop and wait for a human answer.
+   */
+  private async acceptClarificationRequest(
+    run: AgentRun,
+    input: RequestClarificationInput,
+  ): Promise<RequestClarificationResult> {
+    if (run.purpose === "review") {
+      return {
+        accepted: false,
+        reason: "a reviewer must submit a verdict; the author asks the human for clarification",
+      };
+    }
+    if (this.resolvedTaskRuns.has(this.taskRunIdOf(run))) {
+      return { accepted: false, reason: "this task has already been resolved" };
+    }
+    if (this.runDeliverables.has(run.id)) {
+      return {
+        accepted: false,
+        reason: "this run already declared a deliverable; clarification must happen before submission",
+      };
+    }
+    if (this.runWriteEffects.has(run.id)) {
+      return {
+        accepted: false,
+        reason: "this run already changed the workspace; clarification must happen before execution",
+      };
+    }
+    const questions = (input.questions ?? [])
+      .map((question) => question.trim())
+      .filter(Boolean);
+    if (questions.length === 0) {
+      return { accepted: false, reason: "at least one clarification question is required" };
+    }
+    if (questions.length > 5) {
+      return { accepted: false, reason: "ask at most five focused clarification questions" };
+    }
+    if (questions.some((question) => question.length > 2_000)) {
+      return { accepted: false, reason: "each clarification question must be at most 2,000 characters" };
+    }
+    if (this.runClarifications.has(run.id)) {
+      return { accepted: false, reason: "this run already requested clarification" };
+    }
+    this.runClarifications.set(run.id, questions);
+    await this.record({
+      type: "clarification.requested",
+      runId: run.id,
+      threadId: run.threadId,
+      agentId: run.agentId,
+      questions,
+    });
+    return { accepted: true };
+  }
+
+  /**
    * Backs the complete_task and submit_plan tools. An Agent judges for itself
    * whether its output is a deliverable; this records that judgment. It is a
    * claim, not a conclusion — accepting it opens the review gate rather than
@@ -1514,6 +1624,13 @@ export class MultiAgentPlatform {
     }
     if (this.resolvedTaskRuns.has(this.taskRunIdOf(run))) {
       return { accepted: false, reason: "this task has already been resolved" };
+    }
+    if (this.runClarifications.has(run.id)) {
+      return {
+        accepted: false,
+        reason:
+          "this run already requested human clarification; stop and wait for the answer before declaring a deliverable",
+      };
     }
     const summary = input.summary?.trim() ?? "";
     if (!summary) return { accepted: false, reason: "summary is required" };

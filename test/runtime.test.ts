@@ -4,13 +4,17 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import type { AgentDefinition } from "../src/core/types.js";
-import { RunCallbackRegistry } from "../src/runtime/callback-registry.js";
 import {
   CodexRuntimeAdapter,
-  projectCodexJsonlEvent,
+  projectCodexAppServerEvent,
 } from "../src/runtime/codex-runtime.js";
-import type { RuntimeEvent, RuntimeRequest } from "../src/runtime/runtime.js";
+import type {
+  RuntimeEvent,
+  RuntimeRequest,
+  SubmitReviewInput,
+} from "../src/runtime/runtime.js";
 import {
+  buildSystemPrompt,
   piExcludedTools,
   resolvePiAvailability,
   summarizeToolPayload,
@@ -20,13 +24,11 @@ import {
   InMemoryRuntimeSessionStore,
 } from "../src/runtime/session-store.js";
 
-test("Codex JSONL projection separates messages, tools, errors, and sessions", () => {
-  assert.deepEqual(projectCodexJsonlEvent({ type: "thread.started", thread_id: "thread-1" }), { type: "session", sessionId: "thread-1" });
-  assert.deepEqual(projectCodexJsonlEvent({ type: "item.completed", item: { id: "m1", type: "agent_message", text: "hello" } }), { type: "text", text: "hello", itemId: "m1" });
-  assert.deepEqual(projectCodexJsonlEvent({ type: "item.started", item: { id: "c1", type: "command_execution" } }), { type: "tool_start", toolName: "command_execution", itemId: "c1" });
-  assert.deepEqual(projectCodexJsonlEvent({ type: "item.completed", item: { id: "c1", type: "command_execution", exit_code: 1 } }), { type: "tool_end", toolName: "command_execution", itemId: "c1", isError: true });
-  assert.equal(projectCodexJsonlEvent({ type: "item.completed", item: { id: "r1", type: "reasoning", text: "hidden" } }), undefined);
-  assert.deepEqual(projectCodexJsonlEvent({ type: "turn.failed", error: { message: "bad turn" } }), { type: "error", message: "bad turn" });
+test("Codex app-server projection separates messages, native tools, usage, and failures", () => {
+  assert.deepEqual(projectCodexAppServerEvent({ method: "item/completed", params: { item: { id: "m1", type: "agentMessage", text: "hello" } } }), { type: "text", text: "hello", itemId: "m1" });
+  assert.deepEqual(projectCodexAppServerEvent({ method: "item/started", params: { item: { id: "c1", type: "dynamicToolCall", tool: "submit_review", arguments: { verdict: "approved" } } } }), { type: "tool_start", toolName: "submit_review", itemId: "c1", args: '{"verdict":"approved"}' });
+  assert.deepEqual(projectCodexAppServerEvent({ method: "item/completed", params: { item: { id: "c1", type: "dynamicToolCall", tool: "submit_review", status: "failed", success: false } } }), { type: "tool_end", toolName: "submit_review", itemId: "c1", isError: true });
+  assert.deepEqual(projectCodexAppServerEvent({ method: "turn/completed", params: { turn: { id: "turn-1", status: "failed", error: { message: "bad turn" } } } }), { type: "turn_completed", turn: { id: "turn-1", status: "failed", error: { message: "bad turn" } } });
 });
 
 test("Pi access modes deny capabilities instead of allow-listing them", () => {
@@ -47,6 +49,14 @@ test("tool payload summaries are bounded so the event log stays small", () => {
   const cyclic: Record<string, unknown> = {};
   cyclic.self = cyclic;
   assert.equal(summarizeToolPayload(cyclic), undefined);
+});
+
+test("the collaboration prompt makes human clarification a pre-review gate", () => {
+  const prompt = buildSystemPrompt(request("run-prompt", []));
+  assert.match(prompt, /Before drafting a plan or starting execution/);
+  assert.match(prompt, /call request_clarification/);
+  assert.match(prompt, /Do not create or submit a provisional deliverable/);
+  assert.match(prompt, /only then submit the deliverable for peer review/);
 });
 
 test("DeepSeek runtime requires and recognizes its API key", () => {
@@ -115,7 +125,7 @@ test("a preset added since the first release is judged by its own key", () => {
   const kimi = {
     kind: "pi" as const,
     provider: "moonshotai-cn",
-    model: "kimi-k2.7-code",
+    model: "kimi-k3",
     thinkingLevel: "medium" as const,
   };
   assert.equal(resolvePiAvailability(kimi, {}).available, false);
@@ -125,55 +135,61 @@ test("a preset added since the first release is judged by its own key", () => {
   );
 });
 
-test("run callback tokens are scoped to one run identity and expire", async () => {
-  const registry = new RunCallbackRegistry();
-  const seen: string[] = [];
-  const token = registry.issue({
-    runId: "run-1",
-    threadId: "thread-1",
-    agentId: "codex",
-    postMessage: async (input) => {
-      seen.push(input.content);
-      return { accepted: true, targets: ["pi"], messageId: "message-1" };
-    },
-    declareDeliverable: async () => ({ accepted: true }),
-  });
-  const request = {
-    runId: "run-1",
-    threadId: "thread-1",
-    agentId: "codex",
-    content: "@pi review",
-    idempotencyKey: "once",
-  };
-  assert.deepEqual(await registry.invoke(token, request), { accepted: true, targets: ["pi"], messageId: "message-1" });
-  assert.deepEqual(seen, ["@pi review"]);
-  await assert.rejects(registry.invoke(token, { ...request, agentId: "pi" }), /identity does not match/);
-  registry.revoke(token);
-  await assert.rejects(registry.invoke(token, request), /invalid or expired/);
-});
-
-test("Codex adapter starts with exec JSONL and resumes the saved CLI thread", async () => {
+test("Codex adapter uses native dynamic tools and resumes its app-server thread", async () => {
   const directory = await mkdtemp(join(tmpdir(), "mao-codex-fixture-"));
-  const fixture = join(directory, "exec");
+  const fixture = join(directory, "app-server");
   const logPath = join(directory, "args.jsonl");
   const previousLog = process.env.FAKE_CODEX_LOG;
+  const previousTool = process.env.FAKE_CODEX_TOOL;
   process.env.FAKE_CODEX_LOG = logPath;
   try {
     await writeFile(fixture, `const { appendFileSync } = require("node:fs");
-const args = ["exec", ...process.argv.slice(2)];
-appendFileSync(process.env.FAKE_CODEX_LOG, JSON.stringify(args) + "\\n");
-const resumed = args.includes("resume");
-console.log(JSON.stringify({ type: "thread.started", thread_id: "codex-session-123" }));
-console.log(JSON.stringify({ type: "item.completed", item: { id: "reason", type: "reasoning", text: "hidden" } }));
-if (!resumed) {
-  console.log(JSON.stringify({ type: "item.started", item: { id: "tool", type: "command_execution" } }));
-  console.log(JSON.stringify({ type: "item.completed", item: { id: "tool", type: "command_execution", exit_code: 0 } }));
-}
-console.log(JSON.stringify({ type: "item.completed", item: { id: resumed ? "m2" : "m1", type: "agent_message", text: resumed ? "resumed answer" : "first answer" } }));
+const { createInterface } = require("node:readline");
+const send = (value) => process.stdout.write(JSON.stringify(value) + "\\n");
+const log = (value) => appendFileSync(process.env.FAKE_CODEX_LOG, JSON.stringify(value) + "\\n");
+log({ kind: "args", value: ["app-server", ...process.argv.slice(2)] });
+let currentTurn = "turn-1";
+let toolCall;
+createInterface({ input: process.stdin }).on("line", (line) => {
+  const message = JSON.parse(line);
+  log({ kind: "rpc", value: message });
+  if (message.method === "initialize") {
+    send({ id: message.id, result: { userAgent: "fixture" } });
+  } else if (message.method === "thread/start") {
+    send({ id: message.id, result: { thread: { id: "codex-session-123" } } });
+  } else if (message.method === "thread/resume") {
+    send({ id: message.id, result: { thread: { id: message.params.threadId } } });
+  } else if (message.method === "turn/start") {
+    currentTurn = process.env.FAKE_CODEX_TOOL === "submit_review"
+      ? "turn-2"
+      : process.env.FAKE_CODEX_TOOL === "request_clarification"
+        ? "turn-3"
+        : "turn-1";
+    send({ id: message.id, result: { turn: { id: currentTurn, status: "inProgress", items: [] } } });
+    toolCall = process.env.FAKE_CODEX_TOOL;
+    const args = toolCall === "submit_review"
+      ? { verdict: "changes-requested", summary: "needs revision", findings: ["define the input schema"], checks: ["read implementation", "ran tests"] }
+      : toolCall === "request_clarification"
+        ? { questions: ["Which target framework must be supported?"] }
+        : { summary: "implemented feature", evidence: ["test passed"] };
+    send({ method: "item/started", params: { turnId: currentTurn, item: { id: "tool-" + currentTurn, type: "dynamicToolCall", tool: toolCall, arguments: args, status: "inProgress" } } });
+    send({ id: 900, method: "item/tool/call", params: { turnId: currentTurn, callId: "tool-" + currentTurn, tool: toolCall, arguments: args } });
+  } else if (message.id === 900) {
+    send({ method: "item/completed", params: { turnId: currentTurn, item: { id: "tool-" + currentTurn, type: "dynamicToolCall", tool: toolCall, status: message.result.success ? "completed" : "failed", success: message.result.success, contentItems: message.result.contentItems } } });
+    const text = toolCall === "submit_review"
+      ? "resumed answer"
+      : toolCall === "request_clarification"
+        ? "clarification answer"
+        : "first answer";
+    send({ method: "item/completed", params: { turnId: currentTurn, item: { id: "message-" + currentTurn, type: "agentMessage", text } } });
+    send({ method: "thread/tokenUsage/updated", params: { turnId: currentTurn, tokenUsage: { last: { inputTokens: 10, outputTokens: 2, cachedInputTokens: 3, cacheWriteInputTokens: 0, totalTokens: 12 }, total: { totalTokens: 12 }, modelContextWindow: 1000 } } });
+    send({ method: "turn/completed", params: { turn: { id: currentTurn, status: "completed", items: [] } } });
+  }
+});
+process.on("SIGTERM", () => process.exit(0));
 `, "utf8");
 
     const sessions = new InMemoryRuntimeSessionStore();
-    const callbacks = new RunCallbackRegistry();
     const adapter = new CodexRuntimeAdapter({
       id: "codex",
       cwd: directory,
@@ -181,39 +197,82 @@ console.log(JSON.stringify({ type: "item.completed", item: { id: resumed ? "m2" 
       accessMode: "workspace-write",
       fingerprint: "fingerprint-1",
       sessionStore: sessions,
-      callbackRegistry: callbacks,
-      callbackUrl: "http://127.0.0.1:9/internal/agent-message",
-      reviewCallbackUrl: "http://127.0.0.1:9/internal/agent-review",
-      deliverableCallbackUrl: "http://127.0.0.1:9/internal/agent-deliverable",
-      mcpCommand: process.execPath,
-      mcpArgs: ["fake-mcp.js"],
       availability: { available: true, label: "fixture" },
     });
+    process.env.FAKE_CODEX_TOOL = "complete_task";
+    let declaredKind: string | undefined;
     const firstEvents: RuntimeEvent[] = [];
-    const first = await adapter.execute(request("run-1", firstEvents));
+    const firstRequest = request("run-1", firstEvents);
+    firstRequest.declareDeliverable = async (input) => {
+      declaredKind = input.kind;
+      return { accepted: true };
+    };
+    const first = await adapter.execute(firstRequest);
     assert.equal(first.output, "first answer");
+    assert.equal(declaredKind, "completion");
     assert.deepEqual(firstEvents.filter((event) => event.type === "tool_start" || event.type === "tool_end").map((event) => event.type), ["tool_start", "tool_end"]);
+    assert.equal(firstEvents.find((event) => event.type === "tool_start")?.toolName, "complete_task");
     assert.equal((await sessions.get("thread-1", "codex"))?.locator, "codex-session-123");
 
+    process.env.FAKE_CODEX_TOOL = "submit_review";
+    let review: SubmitReviewInput | undefined;
     const secondEvents: RuntimeEvent[] = [];
-    const second = await adapter.execute(request("run-2", secondEvents));
+    const secondRequest = request("run-2", secondEvents);
+    secondRequest.reviewOf = {
+      taskRunId: "run-1",
+      authorAgentId: "pi",
+      round: 1,
+      maxRounds: 2,
+      reviewType: "verify",
+      independent: true,
+    };
+    secondRequest.submitReview = async (input) => {
+      review = input;
+      return { accepted: true };
+    };
+    const second = await adapter.execute(secondRequest);
     assert.equal(second.output, "resumed answer");
-    assert.equal(secondEvents.find((event) => event.type === "session")?.type, "session");
-    const invocations = (await readFile(logPath, "utf8")).trim().split("\n").map((line) => JSON.parse(line) as string[]);
-    assert.deepEqual(invocations[0]?.slice(0, 2), ["exec", "--json"]);
-    assert.equal(invocations[0]?.includes("sandbox_mode=\"workspace-write\""), true);
-    assert.deepEqual(invocations[1]?.slice(0, 2), ["exec", "resume"]);
-    assert.equal(invocations[1]?.includes("codex-session-123"), true);
+    assert.equal(review?.verdict, "changes-requested");
+    assert.deepEqual(review?.findings, ["define the input schema"]);
+    assert.deepEqual(review?.checks, ["read implementation", "ran tests"]);
+    assert.equal(secondEvents.find((event) => event.type === "tool_start")?.toolName, "submit_review");
+
+    process.env.FAKE_CODEX_TOOL = "request_clarification";
+    let clarificationQuestions: string[] | undefined;
+    const thirdEvents: RuntimeEvent[] = [];
+    const thirdRequest = request("run-3", thirdEvents);
+    thirdRequest.requestClarification = async (input) => {
+      clarificationQuestions = input.questions;
+      return { accepted: true };
+    };
+    const third = await adapter.execute(thirdRequest);
+    assert.equal(third.output, "clarification answer");
+    assert.deepEqual(clarificationQuestions, ["Which target framework must be supported?"]);
+    assert.equal(thirdEvents.find((event) => event.type === "tool_start")?.toolName, "request_clarification");
+
+    const records = (await readFile(logPath, "utf8")).trim().split("\n").map((line) => JSON.parse(line) as { kind: string; value: Record<string, unknown> | string[] });
+    const invocations = records.filter((record) => record.kind === "args");
+    assert.deepEqual(invocations[0]?.value, ["app-server", "--stdio"]);
+    assert.deepEqual(invocations[1]?.value, ["app-server", "--stdio"]);
+    assert.deepEqual(invocations[2]?.value, ["app-server", "--stdio"]);
+    const rpc = records.filter((record) => record.kind === "rpc").map((record) => record.value as Record<string, unknown>);
+    const started = rpc.find((message) => message.method === "thread/start");
+    const startParams = started?.params as { dynamicTools?: Array<{ name: string }> };
+    assert.deepEqual(startParams.dynamicTools?.map((tool) => tool.name), ["post_message", "submit_review", "request_clarification", "complete_task", "submit_plan"]);
+    assert.equal(JSON.stringify(started).includes("mcp_servers"), false);
+    assert.equal(rpc.some((message) => message.method === "thread/resume" && (message.params as { threadId?: string }).threadId === "codex-session-123"), true);
   } finally {
     if (previousLog === undefined) delete process.env.FAKE_CODEX_LOG;
     else process.env.FAKE_CODEX_LOG = previousLog;
+    if (previousTool === undefined) delete process.env.FAKE_CODEX_TOOL;
+    else process.env.FAKE_CODEX_TOOL = previousTool;
     await rm(directory, { recursive: true, force: true });
   }
 });
 
 test("Codex adapter reports nonzero exits and cancels the child process", async () => {
   const directory = await mkdtemp(join(tmpdir(), "mao-codex-control-"));
-  const fixture = join(directory, "exec");
+  const fixture = join(directory, "app-server");
   const previousMode = process.env.FAKE_CODEX_MODE;
   try {
     await writeFile(fixture, `
@@ -231,12 +290,6 @@ setInterval(() => {}, 1000);
       accessMode: "read-only",
       fingerprint: "control",
       sessionStore: new InMemoryRuntimeSessionStore(),
-      callbackRegistry: new RunCallbackRegistry(),
-      callbackUrl: "http://127.0.0.1:9/internal/agent-message",
-      reviewCallbackUrl: "http://127.0.0.1:9/internal/agent-review",
-      deliverableCallbackUrl: "http://127.0.0.1:9/internal/agent-deliverable",
-      mcpCommand: process.execPath,
-      mcpArgs: ["fake-mcp.js"],
       availability: { available: true, label: "fixture" },
     });
     process.env.FAKE_CODEX_MODE = "fail";
@@ -325,6 +378,7 @@ function request(runId: string, events: RuntimeEvent[], signal = new AbortContro
     signal,
     emit: async (event) => { events.push(event); },
     postMessage: async () => ({ accepted: true, targets: [] }),
+    requestClarification: async () => ({ accepted: true }),
     declareDeliverable: async () => ({ accepted: true }),
   };
 }
