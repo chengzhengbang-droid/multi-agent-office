@@ -72,6 +72,16 @@ export interface DeclareDeliverableResult {
   reason?: string;
 }
 
+export interface RequestClarificationInput {
+  /** The smallest set of human answers needed before work or planning can continue. */
+  questions: string[];
+}
+
+export interface RequestClarificationResult {
+  accepted: boolean;
+  reason?: string;
+}
+
 /** What a review run is reviewing. Present only on review runs. */
 export interface ReviewAssignment {
   taskRunId: Id;
@@ -118,12 +128,18 @@ export interface RuntimeRequest {
    */
   planMode?: boolean;
   /**
-   * Set only on review runs. Runtimes expose the submit_review tool exactly
-   * when this is present, so an Agent can never approve its own work.
+   * Set only on review runs. Runtimes keep a stable submit_review tool surface
+   * for resumable sessions, but the platform supplies authority to accept a
+   * verdict only when this assignment and submitReview are present.
    */
   reviewOf?: ReviewAssignment;
   emit(event: RuntimeEvent): Promise<void>;
   postMessage(input: PostAgentMessageInput): Promise<PostAgentMessageResult>;
+  /**
+   * Pause before producing a deliverable when missing human input would
+   * materially change the goal, plan, acceptance criteria, or implementation.
+   */
+  requestClarification(input: RequestClarificationInput): Promise<RequestClarificationResult>;
   /** Present only alongside reviewOf. */
   submitReview?(input: SubmitReviewInput): Promise<SubmitReviewResult>;
   /**

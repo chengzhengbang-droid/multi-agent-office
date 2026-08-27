@@ -51,6 +51,7 @@ Agent 交付的成果要由**另一个** Agent 把关后才算完成：自称做
 审核门看的是这一轮**产出了什么**，不是"谁发起的"。默认 `MAO_REVIEW_GATE=smart`：
 
 - **Agent 自己判断**产出是不是交付物。完成人类交给的活，调 `complete_task({ summary, evidence? })`，`evidence` 写清改了哪些文件、跑了什么命令、怎么验证；产出的是方案、设计、计划，调 `submit_plan({ summary, evidence? })`。闲聊、回答问题、解释说明不声明，也就没人审。
+- **先澄清，再交付，再审核**：如果缺失信息会实质改变目标、架构、验收标准或实现，Agent 必须先调 `request_clarification({ questions })`，在回复中向人类提出最多 5 个必要问题，然后停下等待；这一轮不会送同伴审核，也不能再调 `submit_plan` / `complete_task`。能从代码或资料查到的事实，以及可用安全、可逆假设解决的细节，不应打断用户。人类补充后，Agent 才生成方案或执行，完成后照常送审。
 - **不声明也逃不掉**：depth-0 的用户任务只要动过工作区（`file_change` / `edit` / `write`），照样进审核门。自称完成不可信，不吭声就改文件更不可信。只读运行和纯 shell 读命令不触发——审核者自己读文件时不该把自己送审。
 - **审核者是独立的怀疑者，不是第二双友善的眼睛**：审核简报和审核者的系统提示都把默认立场设为"未通过"——举证责任在作者一方，怀疑不需要理由。作者的 summary 和 evidence 只是待检验的断言，审核者被要求自己去看一手材料（亲自打开它说改过的文件、亲自跑它说跑过的命令、亲自看真实输出），并主动去找一个自信的结论会掩盖什么：被悄悄丢掉的原始需求、没覆盖的边界、错误分支、什么都没断言的测试、只字未提的改动。凡是以自己的权限查不了的，一律算未验证，说清楚，且不得据此通过。
 - 两种审核类型走同一套返工机器：`verify` 核对完成声明；`critique` 评审方案——默认立场是"还不能执行"，要求正面攻击它没论证的假设、跳过的失败模式、被一句话带过的工作量，`approved` 表示审核者愿意为"照此执行"背书。两者都对照人类的原始任务判断，而不是对照作者对任务的转述。
@@ -75,7 +76,8 @@ Agent 正在运行时，用户可以直接插话：消息会送进当前这一�
 计划模式是一条流水线上的两道闸门：**同侪先评审，人类最后拍板**。在输入框点亮"计划模式"再发任务即可进入。
 
 - **只读是构造出来的，不是约定出来的**：计划模式下的 run 一律以 `read-only` 执行，Pi 摘掉 `bash`/`edit`/`write`，Codex 的 sandbox 降为 `read-only`——哪怕这个 Agent 在花名册里是可写的。被要求出方案的 Agent 没有"顺手先改一点"这个选项。
-- **忘了调工具也算方案**：计划模式的 run 必定进审核门，走 `critique`；即使 Agent 没调 `submit_plan`，它也不会被当成闲聊放过去。反过来，计划模式下调 `complete_task` 会被拒绝——什么都还没做，谈不上完成。
+- **忘了调工具也算方案**：除正式调用 `request_clarification` 的澄清轮外，计划模式的 run 必定进审核门，走 `critique`；即使 Agent 没调 `submit_plan`，它也不会被当成闲聊放过去。反过来，计划模式下调 `complete_task` 会被拒绝——什么都还没做，谈不上完成。
+- **澄清优先于计划门**：计划模式下如果 Agent 正式调用 `request_clarification` 且没有写入或声明交付物，本轮只等待人类补充，不会把带着未决问题的草案送审，也不会出现计划审批卡；收到回答后再形成可直接执行的计划并调用 `submit_plan`。
 - **同侪评审照旧**：`critique` 与普通审核共用一套返工机器和轮数上限，审核者仍是独立的怀疑者，`changes-requested` 会退回作者修订。**返工轮依然是计划**：修订 run 同样只读、同样是计划模式，"按意见改"不会变成"那就开工吧"。
 - **同侪意见不等于放行**：评审结束（无论 `approved` 还是升级）后，平台记录 `plan.awaiting-approval` 并**停在这里**，不排任何 run。同侪给建议，人拍板。评审没通过的方案也照样送到人面前，并附上审核者的疑虑和升级原因——需要人判断的时刻，正是最不该把方案丢掉的时刻。
 - **人类的两个选择**：
@@ -227,7 +229,7 @@ pnpm demo -- --plan --reject
 - `GET /api/agents/:agentId/session?threadId=`：该 Agent 在此 Thread 的 session 统计。
 - `POST /api/agents/:agentId/session?threadId=&action=compact|export&format=html|jsonl`：手动压缩上下文或导出 session。
 
-Codex 的 `post_message` 与 `submit_review` 通过本机 MCP stdio server 回调内部端点 `/internal/agent-message` 与 `/internal/agent-review`。每次 run 使用独立随机 token，并校验 run、Thread 和 Agent 身份；token 在 run 结束后立即失效。
+Codex 通过 app-server 的原生动态 tool 暴露 `post_message`、`submit_review`、`request_clarification`、`complete_task` 与 `submit_plan`，tool handler 在同一进程内直接调用平台能力，不再启动自建 MCP server，也不再经过本机 HTTP callback。Pi Agent 同样使用进程内 tool；所有澄清请求、verdict、checks、findings 与交付声明都直接交给平台校验。Codex 会话协议有独立版本标记，升级 tool contract 后不会误续接缺少新工具的旧会话。
 
 ## 验证
 
@@ -237,9 +239,9 @@ pnpm test
 pnpm build
 ```
 
-测试覆盖花名册、mention 解析、对等路由、A2A、幂等与乒乓限制、读写调度、整链取消、上下文游标、session 隔离、Codex JSONL 首次执行与 resume、MCP token、Pi 凭据判定、多 provider 凭据互不覆盖、Agent 头像标识去重、可观测性事件投影、运行中插话与回退、图片附件，以及现有历史事件的完整兼容回放。
+测试覆盖花名册、mention 解析、对等路由、A2A、幂等与乒乓限制、读写调度、整链取消、上下文游标、session 隔离、Codex app-server 首次执行与 resume、原生动态 tool 调用、Pi 凭据判定、多 provider 凭据互不覆盖、Agent 头像标识去重、可观测性事件投影、运行中插话与回退、图片附件，以及现有历史事件的完整兼容回放。
 
-审核相关覆盖：强制送审与审核者选取（配置优先、离线回退、同链共作者让位给未参与的同侪、无人可让时仍然送审并标记为不中立）、怀疑立场（审核简报要求自己查一手材料、`approved` 缺少自查项被拒、`changes-requested` 不要求自查项）、通过后终结、不通过返工并复审、轮数上限升级、无结论/无审核者/审核失败一律不通过、审核中取消、重启后中断的审核升级、审核 run 不占用链额度与深度、审核者不会变成 Thread 的默认应答者，以及旧日志回放不补发审核。smart 门另有覆盖：闲聊不送审、声明完成走 verify 且证据进入审核简报、提交方案走 critique 且返工仍是 critique、改文件不声明也送审、只读运行与 shell 读命令不触发、审核者不能自我声明、声明不能改口径、`required` 模式语义不变，以及带声明的日志回放。
+审核相关覆盖：强制送审与审核者选取（配置优先、离线回退、同链共作者让位给未参与的同侪、无人可让时仍然送审并标记为不中立）、怀疑立场（审核简报要求自己查一手材料、`approved` 缺少自查项被拒、`changes-requested` 不要求自查项）、通过后终结、不通过返工并复审、轮数上限升级、无结论/无审核者/审核失败一律不通过、审核中取消、重启后中断的审核升级、审核 run 不占用链额度与深度、审核者不会变成 Thread 的默认应答者，以及旧日志回放不补发审核。smart 门另有覆盖：闲聊不送审、阻塞性问题先澄清且不送审、计划模式与强制门同样尊重澄清、返工时发现人类决策会终止审核循环、声明完成走 verify 且证据进入审核简报、提交方案走 critique 且返工仍是 critique、改文件不声明也送审、只读运行与 shell 读命令不触发、审核者不能自我声明、声明不能改口径，以及带声明的日志回放。
 
 计划模式覆盖：可写 Agent 在计划模式下仍以只读执行、计划模式拒绝 `complete_task`、不调 `submit_plan` 也走 critique、评审通过后停在人这里不排 run、通过后以普通可写 run 执行并走 verify、打回后仍是只读的计划返工、不写理由的打回被拒、同一方案只能拍板一次、评审升级与无审核者时方案照样送到人面前、关掉审核门后仍停在人这里、计划模式不插话、以及等待中与已拍板的方案在重启后分别恢复为待办与已办。
 

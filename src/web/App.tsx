@@ -156,6 +156,8 @@ interface ReviewState {
   checks?: string[];
   escalation?: ReviewEscalation;
   detail?: string;
+  /** Reviewer text recovered when the run ended without submit_review. */
+  unstructured?: boolean;
 }
 
 interface PlanState {
@@ -307,6 +309,8 @@ export function App() {
   }, [data?.workspace.path, selectedThread?.workingDirectory, selectedWorkspace]);
   const recentWorkspaces = useMemo(() => buildWorkspaceOptions(threads, data?.workspace), [threads, data?.workspace]);
   const transcript = useMemo(() => buildTranscript(data?.events ?? [], selectedThreadId), [data?.events, selectedThreadId]);
+  const attentionRuns = useMemo(() => transcript.filter(isAttentionRun), [transcript]);
+  const attentionKey = attentionRuns.map((item) => `${item.id}:${item.review?.status ?? ""}:${item.plan?.decision ?? "pending"}`).join("|");
   const activeChainId = useMemo(() => findActiveChain(data?.events ?? [], selectedThreadId), [data?.events, selectedThreadId]);
   const fallbackAgent = useMemo(
     () => findFallbackAgent(data?.agents ?? [], data?.catalog.defaultAgentId, data?.events ?? [], selectedThreadId),
@@ -318,7 +322,7 @@ export function App() {
   const lastContent = transcript.at(-1)?.content ?? "";
   useEffect(() => {
     conversationEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
-  }, [transcript.length, lastContent]);
+  }, [transcript.length, lastContent, attentionKey]);
 
   const newTask = () => {
     setSelectedThreadId(undefined);
@@ -450,10 +454,10 @@ export function App() {
   return (
     <div className="app-shell">
       <aside className={`sidebar ${sidebarOpen ? "sidebar--open" : ""}`}>
-        <div className="brand-row"><div className="brand-mark"><Sparkles size={16} /></div><span>Multi-Agent Office</span></div>
+        <div className="brand-row"><div className="brand-mark"><Sparkles size={16} /></div><span className="brand-copy"><strong>Multi-Agent Office</strong><small>协作工作台</small></span></div>
         <button className="new-task-button" type="button" onClick={newTask}><CirclePlus size={17} />新建任务<span className="shortcut">⌘ N</span></button>
         <label className="search-box"><SearchIcon /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜索任务" aria-label="搜索任务" /></label>
-        <div className="sidebar-section-title">任务</div>
+        <div className="sidebar-section-title"><span>任务</span><i>{filteredThreads.length}</i></div>
         <nav className="thread-list" aria-label="任务列表">
           {filteredThreads.map((thread) => (
             <button className={`thread-item ${thread.id === selectedThreadId ? "thread-item--active" : ""}`} type="button" key={thread.id} onClick={() => {
@@ -489,13 +493,19 @@ export function App() {
             <button className="workspace-path" type="button" title="更换工作目录并开始新对话" onClick={() => setWorkspacePickerOpen(true)}><Folder size={10} />{activeWorkspace?.path ?? "正在读取工作目录"}</button>
             {activeChainId && <span className="topbar-running"><i />Agent 正在协作</span>}
           </div></div>
-          <button className={`details-button ${drawerOpen ? "details-button--active" : ""}`} type="button" onClick={() => setDrawerOpen(!drawerOpen)}><PanelRight size={16} />运行详情</button>
+          <div className="topbar-actions">
+            <div className="topbar-presence" aria-label={`${onlineCount} 个 Agent 在线`}>
+              <span className="presence-avatars">{(data?.agents ?? []).filter((agent) => agent.enabled && agent.availability.available).slice(0, 3).map((agent) => <AgentAvatar agentId={agent.id} key={agent.id} />)}</span>
+              <span className="presence-copy"><strong>{onlineCount} Agent</strong><small>{activeChainId ? "协作进行中" : "在线待命"}</small></span>
+            </div>
+            <button className={`details-button ${drawerOpen ? "details-button--active" : ""}`} type="button" onClick={() => setDrawerOpen(!drawerOpen)}><PanelRight size={16} />运行面板</button>
+          </div>
         </header>
 
         <section className="conversation">
           {loadError ? <div className="state-card state-card--error">{loadError}</div> : !data ? <div className="loading-state"><span />正在载入工作区…</div> : transcript.length > 0 ? (
             <div className="transcript">
-              <div className="conversation-intro"><div className="intro-icon"><Bot size={18} /></div><span>{transcript.filter((item) => item.type === "agent").length} 次 Agent 运行</span>{activeChainId && <span className="live-indicator"><i />实时运行中</span>}</div>
+              <div className="conversation-intro"><div className="intro-icon"><Bot size={18} /></div><div className="intro-copy"><strong>协作记录</strong><span>{transcript.filter((item) => item.type === "agent").length} 次 Agent 运行 · {transcript.filter((item) => item.type === "human").length} 条任务指令</span></div>{activeChainId ? <span className="live-indicator"><i />实时运行中</span> : <span className="conversation-state"><Check size={12} />已同步</span>}</div>
               {transcript.map((item) => {
                 if (item.type === "human") return (
                   <article className="human-message" key={item.id}>
@@ -519,17 +529,33 @@ export function App() {
                 const agent = data.agents.find((candidate) => candidate.id === item.agentId);
                 const name = agentName(data.agents, item.agentId);
                 const runtime = runtimeDetail(agent, name);
+                const reviewNeedsAttention = item.review?.status === "escalated" && !item.plan?.decision;
+                const planNeedsAttention = Boolean(item.plan && !item.plan.decision);
                 return (
                   <article className={`agent-message ${item.replyToAgentId ? "agent-message--peer-reply" : ""}`} key={item.id}>
                     <div className="agent-message-meta"><AgentAvatar agentId={item.agentId} variant={item.purpose === "review" ? "reviewer" : undefined} /><span>{name}</span>{runtime && <small>{runtime}</small>}<span className="agent-reply-context"><ArrowRight size={11} />{agentReplyLabel(item, data.agents)}</span>{item.purpose === "review" && <span className="status-label status-label--review">审核 · 第 {item.reviewRound ?? 1} 轮</span>}{item.planMode && <span className="status-label status-label--plan"><ListChecks size={11} />计划模式</span>}<span className={`status-label status-label--${item.status}`}>{statusLabel(item.status, agent?.accessMode)}</span></div>
                     <RunActivity item={item} />
                     <div className={`markdown-body ${item.status === "running" ? "markdown-body--streaming" : ""}`}>{item.content ? <ReactMarkdown remarkPlugins={[remarkGfm]}>{item.content}</ReactMarkdown> : <div className="thinking-line"><span /><span /><span /></div>}</div>
                     {item.usage && <RunUsageBar usage={item.usage} />}
-                    {item.review && <ReviewCard review={item.review} agents={data.agents} />}
-                    {item.plan && <PlanCard plan={item.plan} agents={data.agents} busy={decidingPlan === item.plan.taskRunId} onDecide={decidePlan} />}
+                    {item.review && !reviewNeedsAttention && <ReviewCard review={item.review} agents={data.agents} />}
+                    {item.plan && !planNeedsAttention && <PlanCard plan={item.plan} agents={data.agents} busy={decidingPlan === item.plan.taskRunId} onDecide={decidePlan} />}
                   </article>
                 );
               })}
+              {attentionRuns.length > 0 && (
+                <section className="thread-attention" aria-labelledby="thread-attention-title">
+                  <div className="thread-attention-title">
+                    <ShieldCheck size={15} />
+                    <div><strong id="thread-attention-title">需要你处理</strong><span>计划确认和人工介入事项始终显示在最新消息之后</span></div>
+                  </div>
+                  {attentionRuns.map((item) => (
+                    <div className="thread-attention-item" key={`attention-${item.id}`}>
+                      {item.review?.status === "escalated" && <ReviewCard review={item.review} agents={data.agents} />}
+                      {item.plan && !item.plan.decision && <PlanCard plan={item.plan} agents={data.agents} busy={decidingPlan === item.plan.taskRunId} onDecide={decidePlan} />}
+                    </div>
+                  ))}
+                </section>
+              )}
               <div ref={conversationEndRef} />
             </div>
           ) : <EmptyTask agents={data.agents} onSuggestion={setDraft} />}
@@ -765,11 +791,12 @@ function desktopPlatformLabel(platform: string): string {
 
 function EmptyTask({ agents, onSuggestion }: { agents: AgentSummary[]; onSuggestion(value: string): void }) {
   const enabled = agents.filter((agent) => agent.enabled);
+  const ready = enabled.filter((agent) => agent.availability.available);
   const handles = enabled.slice(0, 2).map((agent) => `@${agent.id}`);
   const directedPrompt = handles.length > 1
     ? `${handles.join(" ")} 请分别评估当前架构，并给出各自的改进建议。`
     : `${handles[0] ?? ""} 请评估当前架构，并给出改进建议。`.trim();
-  return <div className="empty-task"><div className="empty-task-mark"><Sparkles size={24} /></div><h1>让 Agent 帮你完成工作</h1><p>{handles.length > 1 ? `在正文中写 ${handles.join(" 或 ")} 可指定 Agent；` : handles.length === 1 ? `在正文中写 ${handles[0]} 可指定 Agent；` : ""}无 @ 时会交给最近成功回复且在线的默认 Agent。</p><div className="suggestion-grid"><button type="button" onClick={() => onSuggestion(directedPrompt)}>{handles.length > 1 ? "让两个 Agent 独立评估" : "让 Agent 评估当前架构"}</button><button type="button" onClick={() => onSuggestion("请实现这个需求，并在必要时通过 post_message 邀请队友。")}>由默认 Agent 自主完成</button></div></div>;
+  return <div className="empty-task"><div className="empty-task-mark"><Sparkles size={24} /></div><span className="empty-task-eyebrow">开启新的协作</span><h1>把想法交给你的 Agent 团队</h1><p>{handles.length > 1 ? `在正文中写 ${handles.join(" 或 ")} 可指定 Agent；` : handles.length === 1 ? `在正文中写 ${handles[0]} 可指定 Agent；` : ""}也可以直接描述目标，由默认 Agent 接手并按需邀请队友。</p>{ready.length > 0 && <div className="empty-agent-row"><span className="presence-avatars">{ready.slice(0, 4).map((agent) => <AgentAvatar agentId={agent.id} key={agent.id} />)}</span><span><strong>{ready.length} 位 Agent 已就绪</strong><small>可并行分析、实现与审核</small></span></div>}<div className="suggestion-grid"><button type="button" onClick={() => onSuggestion(directedPrompt)}><span><strong>{handles.length > 1 ? "让多个 Agent 独立评估" : "让 Agent 评估当前架构"}</strong><small>比较不同视角后汇总结论</small></span><ArrowRight size={15} /></button><button type="button" onClick={() => onSuggestion("请实现这个需求，并在必要时通过 post_message 邀请队友。")}><span><strong>由默认 Agent 自主完成</strong><small>分析、执行，并在需要时邀请队友</small></span><ArrowRight size={15} /></button></div></div>;
 }
 
 const ALLOWED_IMAGE_TYPES = ["image/png", "image/jpeg", "image/webp", "image/gif"];
@@ -853,7 +880,7 @@ function Composer(props: ComposerProps) {
     {suggestions.length > 0 && <div className="mention-menu">{suggestions.map((agent) => <button type="button" key={agent.id} onMouseDown={(event) => { event.preventDefault(); insertMention(agent.id, true); }}><AgentAvatar agentId={agent.id} /><span><strong>@{agent.id}</strong><small>{agent.displayName} · {agent.availability.available ? "在线" : "离线"}</small></span></button>)}</div>}
     {props.attachments.length > 0 && <div className="composer-attachments">{props.attachments.map((attachment) => <span key={attachment.id}><Paperclip size={11} />{attachment.name}<button type="button" onClick={() => props.onAttachmentsChange(props.attachments.filter((item) => item.id !== attachment.id))} aria-label={`移除 ${attachment.name}`}><X size={11} /></button></span>)}</div>}
     <textarea ref={textareaRef} value={props.value} onChange={(event) => { props.onChange(event.target.value); setCursor(event.target.selectionStart); }} onClick={(event) => setCursor(event.currentTarget.selectionStart)} onKeyUp={(event) => setCursor(event.currentTarget.selectionStart)} onKeyDown={onKeyDown} placeholder={props.planMode ? "描述你想让 Agent 先规划的事；它只读代码、先出方案，交由同伴评审、你来拍板…" : "描述任务；输入 @ 或点“添加接收人”，最多指定两个 Agent…"} rows={2} disabled={!props.configured} aria-label="任务内容" />
-    <div className="composer-toolbar"><button className={`plan-toggle ${props.planMode ? "plan-toggle--on" : ""}`} type="button" onClick={() => props.onPlanModeChange(!props.planMode)} disabled={!props.configured} aria-pressed={props.planMode} title="计划模式：Agent 只读不改，先出方案，交同伴评审后由你拍板"><ListChecks size={14} />计划模式</button><button className="composer-workspace" type="button" onClick={props.onWorkspaceClick} title={props.workspace?.path} aria-label="选择工作目录"><Folder size={14} /><span>{props.workspace?.name ?? "选择目录"}</span></button><label className="agent-select" title="在光标处添加接收人"><AtSign size={14} /><select value="" onChange={(event) => { if (event.target.value) insertMention(event.target.value); }} disabled={!props.configured} aria-label="添加接收人"><option value="">添加接收人</option>{props.agents.filter((agent) => agent.enabled).map((agent) => <option value={agent.id} key={agent.id} disabled={!agent.availability.available}>{agent.displayName}（@{agent.id}）{agent.availability.available ? "" : "· 离线"}</option>)}</select><ChevronDown size={14} /></label><span className="fallback-hint">未指定时交给 {props.fallbackAgent?.displayName ?? "可用 Agent"}</span><span className="composer-hint">{props.active ? "Enter 插话 · Shift Enter 换行" : "Enter 发送 · Shift Enter 换行"}</span><label className="composer-attach" title="添加图片（仅 Pi 运行时可直接读取）"><Paperclip size={14} /><input type="file" accept={ALLOWED_IMAGE_TYPES.join(",")} multiple disabled={!props.configured || props.attachments.length >= MAX_COMPOSER_ATTACHMENTS} onChange={(event) => { void addFiles(event.target.files); event.target.value = ""; }} aria-label="添加图片" /></label>{props.active && !props.planMode && <button className="steer-button" type="button" onClick={() => props.onSend(true)} disabled={disabled} aria-label="插话到正在运行的 Agent">{props.sending ? <span className="button-spinner" /> : <SendHorizontal size={16} />}插话</button>}{props.active ? <button className="stop-button" type="button" onClick={props.onCancel} disabled={props.cancelling} aria-label="停止整个协作链"><Square size={11} fill="currentColor" /></button> : <button className="send-button" type="button" onClick={() => props.onSend()} disabled={disabled} aria-label="发送任务">{props.sending ? <span className="button-spinner" /> : <SendHorizontal size={17} />}</button>}</div>
+    <div className="composer-toolbar"><div className="composer-controls"><button className={`plan-toggle ${props.planMode ? "plan-toggle--on" : ""}`} type="button" onClick={() => props.onPlanModeChange(!props.planMode)} disabled={!props.configured} aria-pressed={props.planMode} title="计划模式：Agent 只读不改，先出方案，交同伴评审后由你拍板"><ListChecks size={14} />计划模式</button><button className="composer-workspace" type="button" onClick={props.onWorkspaceClick} title={props.workspace?.path} aria-label="选择工作目录"><Folder size={14} /><span>{props.workspace?.name ?? "选择目录"}</span></button><label className="agent-select" title="在光标处添加接收人"><AtSign size={14} /><select value="" onChange={(event) => { if (event.target.value) insertMention(event.target.value); }} disabled={!props.configured} aria-label="添加接收人"><option value="">添加接收人</option>{props.agents.filter((agent) => agent.enabled).map((agent) => <option value={agent.id} key={agent.id} disabled={!agent.availability.available}>{agent.displayName}（@{agent.id}）{agent.availability.available ? "" : "· 离线"}</option>)}</select><ChevronDown size={14} /></label><span className="fallback-hint">默认交给 {props.fallbackAgent?.displayName ?? "可用 Agent"}</span></div><div className="composer-actions"><span className="composer-hint">{props.active ? "Enter 插话" : "Enter 发送"}</span><label className="composer-attach" title="添加图片（仅 Pi 运行时可直接读取）"><Paperclip size={14} /><input type="file" accept={ALLOWED_IMAGE_TYPES.join(",")} multiple disabled={!props.configured || props.attachments.length >= MAX_COMPOSER_ATTACHMENTS} onChange={(event) => { void addFiles(event.target.files); event.target.value = ""; }} aria-label="添加图片" /></label>{props.active && !props.planMode && <button className="steer-button" type="button" onClick={() => props.onSend(true)} disabled={disabled} aria-label="插话到正在运行的 Agent">{props.sending ? <span className="button-spinner" /> : <SendHorizontal size={16} />}插话</button>}{props.active ? <button className="stop-button" type="button" onClick={props.onCancel} disabled={props.cancelling} aria-label="停止整个协作链"><Square size={11} fill="currentColor" /></button> : <button className="send-button" type="button" onClick={() => props.onSend()} disabled={disabled} aria-label="发送任务">{props.sending ? <span className="button-spinner" /> : <SendHorizontal size={17} />}</button>}</div></div>
   </div></div>;
 }
 
@@ -1323,6 +1350,7 @@ function describeEvent(event: StoredPlatformEvent, agents: AgentSummary[]) {
   if (event.type === "run.steered") return { title: `已向 ${agentName(agents, event.agentId)} 插话`, detail: shortId(event.messageId), icon: SendHorizontal, tone: "active" };
   if (event.type === "routing.accepted") return { title: `结构化转交给 ${agentName(agents, event.targetAgentId)}`, detail: "post_message 已接受", icon: ArrowRight, tone: "active" };
   if (event.type === "routing.rejected") return { title: "Agent 路由被拒绝", detail: event.reason, icon: XCircle, tone: "danger" };
+  if (event.type === "clarification.requested") return { title: `${agentName(agents, event.agentId)} 先向你确认`, detail: event.questions.join("；").slice(0, 120), icon: MessageSquare, tone: "active" };
   if (event.type === "deliverable.declared") return { title: event.kind === "plan" ? `${agentName(agents, event.agentId)} 提交了方案` : `${agentName(agents, event.agentId)} 声明任务完成`, detail: event.summary.slice(0, 120), icon: SendHorizontal, tone: "active" };
   if (event.type === "review.requested") return { title: `已送${reviewTypeLabel(event.reviewType)} ${agentName(agents, event.reviewerAgentId)}`, detail: `${agentName(agents, event.authorAgentId)} 的交付 · 第 ${event.round} 轮`, icon: ArrowRight, tone: "active" };
   if (event.type === "review.submitted") return { title: event.verdict === "approved" ? `${agentName(agents, event.reviewerAgentId)} 审核通过` : `${agentName(agents, event.reviewerAgentId)} 要求修改`, detail: event.summary, icon: event.verdict === "approved" ? Check : RefreshCw, tone: event.verdict === "approved" ? "success" : "danger" };
@@ -1356,9 +1384,10 @@ function reviewTypeLabel(reviewType: ReviewType | undefined): string {
 
 const REVIEW_ESCALATION_LABELS: Record<ReviewEscalation, string> = {
   "no-reviewer": "没有可用于审核的其他 Agent",
-  inconclusive: "审核 Agent 没有给出结论",
+  inconclusive: "审核 Agent 未登记正式结论",
   "review-failed": "审核未能完成",
   "max-rounds": "返工轮数已用完，仍未通过",
+  "clarification-needed": "Agent 需要你先补充关键信息",
 };
 
 function ReviewCard({ review, agents }: { review: ReviewState; agents: AgentSummary[] }) {
@@ -1369,6 +1398,7 @@ function ReviewCard({ review, agents }: { review: ReviewState; agents: AgentSumm
     : review.status === "approved" ? (review.reviewType === "critique" ? `${reviewer} 认可该方案` : `${reviewer} 核对通过`)
     : review.status === "changes-requested" ? `${reviewer} 要求修改（第 ${review.round} 轮）`
     : review.status === "cancelled" ? `${kind}已随协作链取消`
+    : review.unstructured ? `${reviewer} 已给出文字意见，等待你处理`
     : "需要人工介入";
   return (
     <div className={`review-card review-card--${review.status}`}>
@@ -1378,7 +1408,10 @@ function ReviewCard({ review, agents }: { review: ReviewState; agents: AgentSumm
       </div>
       {review.status === "escalated" && review.escalation && <p>{REVIEW_ESCALATION_LABELS[review.escalation]}</p>}
       {review.detail && <p>{review.detail}</p>}
-      {review.summary && <p>{review.summary}</p>}
+      {review.unstructured && <p className="review-card-unstructured-note">以下是审核者的原始回复；由于没有调用 submit_review，它不是已登记的正式结论。</p>}
+      {review.summary && (review.unstructured
+        ? <div className="review-card-unstructured markdown-body"><ReactMarkdown remarkPlugins={[remarkGfm]}>{review.summary}</ReactMarkdown></div>
+        : <p>{review.summary}</p>)}
       {review.findings && review.findings.length > 0 && (
         <ul>{review.findings.map((finding, index) => <li key={`${index}-${finding}`}>{finding}</li>)}</ul>
       )}
@@ -1583,6 +1616,7 @@ export function buildTranscript(events: StoredPlatformEvent[], threadId?: string
   if (!threadId) return [];
   const items: TranscriptItem[] = [];
   const runs = new Map<string, Extract<TranscriptItem, { type: "agent" }>>();
+  const reviewRuns = new Map<string, Extract<TranscriptItem, { type: "agent" }>>();
   const messages = new Map<string, Extract<StoredPlatformEvent, { type: "message.created" }>["message"]>();
   const humanMessages = new Map<string, Extract<TranscriptItem, { type: "human" }>>();
   for (const event of events) {
@@ -1611,12 +1645,15 @@ export function buildTranscript(events: StoredPlatformEvent[], threadId?: string
       const item: Extract<TranscriptItem, { type: "agent" }> = { id: event.run.id, type: "agent", agentId: event.run.agentId, content: "", createdAt: event.recordedAt, status: "queued", thinking: "", tools: [], notices: [], purpose: event.run.purpose ?? "task", ...(event.run.reviewRound ? { reviewRound: event.run.reviewRound } : {}), ...(event.run.mode === "plan" ? { planMode: true } : {}), ...(incoming?.sender.type === "human" ? { replyToHuman: true } : {}), ...(incoming?.sender.type === "agent" ? { replyToAgentId: incoming.sender.id } : {}), ...(incoming ? { incomingKind: incoming.kind } : {}) };
       items.push(item);
       runs.set(event.run.id, item);
+      if ((event.run.purpose ?? "task") === "review" && event.run.taskRunId) {
+        reviewRuns.set(event.run.taskRunId, item);
+      }
       if (incoming?.sender.type === "human") addUnique(humanMessages.get(incoming.id)?.targets, event.run.agentId);
       continue;
     }
     if (event.type === "review.requested" || event.type === "review.submitted" || event.type === "review.rework" || event.type === "review.resolved") {
       if (event.threadId !== threadId) continue;
-      applyReviewEvent(runs.get(event.taskRunId), event);
+      applyReviewEvent(runs.get(event.taskRunId), event, reviewRuns.get(event.taskRunId)?.content);
       continue;
     }
     if (event.type === "plan.awaiting-approval" || event.type === "plan.decided") {
@@ -1674,7 +1711,11 @@ type ReviewEvent = Extract<
 >;
 
 /** Review state lives on the originating task run, across every rework round. */
-function applyReviewEvent(run: Extract<TranscriptItem, { type: "agent" }> | undefined, event: ReviewEvent): void {
+function applyReviewEvent(
+  run: Extract<TranscriptItem, { type: "agent" }> | undefined,
+  event: ReviewEvent,
+  unstructuredReviewerOutput?: string,
+): void {
   if (!run) return;
   const current = run.review;
   if (event.type === "review.requested") {
@@ -1700,13 +1741,27 @@ function applyReviewEvent(run: Extract<TranscriptItem, { type: "agent" }> | unde
     run.review = { ...(current ?? { status: "changes-requested", round: event.round }), status: "changes-requested", round: event.round };
     return;
   }
+  const recoveredSummary =
+    event.outcome === "escalated" &&
+    !current?.summary &&
+    unstructuredReviewerOutput?.trim()
+      ? unstructuredReviewerOutput.trim()
+      : undefined;
   run.review = {
     ...(current ?? { status: "pending", round: event.rounds }),
     status: event.outcome === "approved" ? "approved" : event.outcome === "cancelled" ? "cancelled" : "escalated",
     round: event.rounds,
     ...(event.escalation ? { escalation: event.escalation } : {}),
     ...(event.detail ? { detail: event.detail } : {}),
+    ...(recoveredSummary ? { summary: recoveredSummary, unstructured: true } : {}),
   };
+}
+
+function isAttentionRun(item: TranscriptItem): item is Extract<TranscriptItem, { type: "agent" }> {
+  return item.type === "agent" && (
+    (item.review?.status === "escalated" && !item.plan?.decision) ||
+    Boolean(item.plan && !item.plan.decision)
+  );
 }
 
 function applyToolEvent(run: Extract<TranscriptItem, { type: "agent" }>, event: Extract<StoredPlatformEvent, { type: "run.tool" }>): void {

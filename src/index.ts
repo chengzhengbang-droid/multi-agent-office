@@ -8,7 +8,6 @@ export * from "./core/types.js";
 export * from "./runtime/deterministic-runtime.js";
 export * from "./runtime/pi-runtime.js";
 export * from "./runtime/codex-runtime.js";
-export * from "./runtime/callback-registry.js";
 export * from "./runtime/runtime-factory.js";
 export * from "./runtime/runtime.js";
 export * from "./runtime/session-store.js";

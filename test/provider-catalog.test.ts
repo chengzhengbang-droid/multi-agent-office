@@ -80,6 +80,17 @@ test("the featured providers are a non-empty subset offered on the first-run pag
   assert.equal(ids.size, API_PROVIDER_PRESETS.length);
 });
 
+test("Moonshot open-platform presets default to Kimi K3 and stay distinct from Kimi Coding", () => {
+  for (const id of ["moonshotai-cn", "moonshotai"]) {
+    const preset = findApiProvider(id);
+    assert.equal(preset?.model, "kimi-k3");
+    assert.equal(preset?.envKey, "MOONSHOT_API_KEY");
+  }
+  const coding = findApiProvider("kimi-coding");
+  assert.equal(coding?.model, "kimi-for-coding");
+  assert.equal(coding?.envKey, "KIMI_API_KEY");
+});
+
 test("a declared third-party deployment is registered on the shared model runtime", async (context) => {
   const shared = new PiSharedRuntime({
     customProviders: {
