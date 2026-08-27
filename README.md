@@ -55,8 +55,12 @@ Agent 交付的成果要由**另一个** Agent 把关后才算完成：自称做
 - **球权（ball custody）**：`ball.handed`、`ball.held`、`ball.wake_sent`、`ball.handed_user`、`ball.void_pass`、`task.done` 等事件构成唯一事实源。球权状态可从 JSONL 事件重建，不依赖内存里的隐式布尔值。
 - **有依据的等待**：Agent 可调用 `hold_ball({ wakeAfterMs, waitSourceRef })` 暂存球权；`waitSourceRef` 必须说明等待对象、预期信号和可选 SLA。到时平台给原 Agent 发送 `wake` 消息并恢复同一协作链；重启后未到期的等待会重新挂载，取消整链也会取消等待。
 - **分层协作提示**：Pi 与 Codex 都注入 L0–L7 协议层，依次覆盖身份、平行世界认知、客观事实继承、路由与球权、安全法则、交付/审核协议、实时花名册和协作哲学。实时 roster、当前路由位置与可用工具不再散落在一段不可审计的提示词中。
+- **失败封闭的批次语义**：串行前驱只有在成功完成后才会放行下一棒；失败、取消或中断会抑制依赖它的后续 run。并行批次只要有一个分支失败，就不会被最后完成的成功分支覆盖成 `task.done`，而是把球交回用户处理。
+- **协作链只读投影**：运行界面从同一份事件日志重建 `queued / active / waiting-external / waiting-human / needs-attention / completed / cancelled`，显示当前持球者、等待依据、异常分支，以及每条 `post_message` 对每个目标的排队、执行和终态回执；它不是另一套会漂移的调度状态。
 
 原有的同侪审核、计划模式、写锁和深度/乒乓保护继续作为本地策略层运行；它们不替代路由和球权协议。
+
+这仍是轻量本地实现，不等同于完整 Clowder：当前没有跨 Thread/跨项目共享记忆与证据索引、按需 Skills/SOP Guardian、分布式队列租约与多进程恢复、外部平台网关或多用户权限域。这些能力应按本项目“单机、对等 Agent 工作台”的边界逐项引入，而不是直接复制 Clowder 的 Redis/服务化架构。
 
 ## 同侪审核
 

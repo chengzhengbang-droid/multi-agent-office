@@ -133,6 +133,30 @@ test("rejects duplicate structured posts within one run", async () => {
   assert.equal(countEvents(await platform.getEvents(), "routing.accepted"), 1);
 });
 
+test("a rejected Agent route does not publish a phantom collaboration message", async () => {
+  let result: Awaited<ReturnType<RuntimeRequest["postMessage"]>> | undefined;
+  const platform = createPlatform(
+    [agent("pi")],
+    new Map([
+      ["pi", runtime("pi", async (request) => {
+        result = await request.postMessage({
+          content: "@missing take this",
+          collaborationIntent: "handoff",
+          idempotencyKey: "invalid-target",
+        });
+        return emitOutput(request, "route checked");
+      })],
+    ]),
+    "pi",
+  );
+
+  const { threadId } = await platform.postUserMessage({ content: "@pi route it" });
+  assert.equal(result?.accepted, false);
+  const messages = await platform.getThreadMessages(threadId);
+  assert.equal(messages.filter((message) => message.kind === "collaboration").length, 0);
+  assert.equal(countEvents(await platform.getEvents(), "routing.rejected"), 1);
+});
+
 test("runs read-only peers concurrently", async () => {
   let active = 0;
   let maximum = 0;
@@ -178,6 +202,84 @@ test("defaults multi-Agent dispatch to an honest serial worklist", async () => {
   await platform.postUserMessage({ content: "@pi @codex inspect in order" });
   assert.equal(maximum, 1);
   assert.deepEqual(order, ["pi", "codex"]);
+});
+
+test("stops a serial worklist when its predecessor failed", async () => {
+  const calls: string[] = [];
+  const platform = createPlatform(
+    [agent("pi", "read-only"), agent("codex", "read-only")],
+    new Map([
+      ["pi", runtime("pi", async () => {
+        calls.push("pi");
+        throw new Error("first leg failed");
+      })],
+      ["codex", runtime("codex", async (request) => {
+        calls.push("codex");
+        return emitOutput(request, "must not run");
+      })],
+    ]),
+  );
+
+  await platform.postUserMessage({ content: "@pi @codex inspect in order" });
+  const events = await platform.getEvents();
+
+  assert.deepEqual(calls, ["pi"]);
+  assert.equal(countEvents(events, "run.started"), 1);
+  assert.equal(countEvents(events, "run.failed"), 1);
+  assert.equal(countEvents(events, "run.cancelled"), 1);
+  assert.equal(countEvents(events, "task.done"), 0);
+  const handoff = single(events, "ball.handed_user");
+  assert.equal(handoff.reason, "runtime-failure");
+});
+
+test("a failed parallel branch cannot be hidden by a successful sibling", async () => {
+  const platform = createPlatform(
+    [agent("pi", "read-only"), agent("codex", "read-only")],
+    new Map([
+      ["pi", runtime("pi", async () => {
+        await delay(10);
+        throw new Error("parallel branch failed");
+      })],
+      ["codex", runtime("codex", async (request) => {
+        await delay(25);
+        return emitOutput(request, "parallel branch completed");
+      })],
+    ]),
+  );
+
+  await platform.postUserMessage({
+    content: "@pi @codex inspect independently",
+    routingMode: "parallel",
+  });
+  const events = await platform.getEvents();
+
+  assert.equal(countEvents(events, "run.completed"), 1);
+  assert.equal(countEvents(events, "run.failed"), 1);
+  assert.equal(countEvents(events, "task.done"), 0);
+  assert.equal(single(events, "ball.handed_user").reason, "runtime-failure");
+});
+
+test("a void handoff remains visible instead of being overwritten by task.done", async () => {
+  const platform = createPlatform(
+    [agent("pi", "read-only")],
+    new Map([
+      ["pi", runtime("pi", async (request) => {
+        const result = await request.postMessage({
+          content: "No routable peer was named.",
+          collaborationIntent: "handoff",
+          idempotencyKey: "void-pass",
+        });
+        assert.equal(result.accepted, true);
+        return emitOutput(request, "handoff attempted");
+      })],
+    ]),
+    "pi",
+  );
+
+  await platform.postUserMessage({ content: "@pi hand this off" });
+  const events = await platform.getEvents();
+  assert.equal(countEvents(events, "ball.void_pass"), 1);
+  assert.equal(countEvents(events, "task.done"), 0);
 });
 
 test("hold_ball persists grounded custody and wakes the same Agent", async () => {

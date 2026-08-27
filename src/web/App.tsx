@@ -60,6 +60,12 @@ import {
 } from "../config/custom-providers";
 import { agentAvatarTone, agentInitials } from "./agent-identity";
 import type { A2ARoutingMode, CollaborationIntent } from "../core/collaboration";
+import {
+  projectCollaborationChains,
+  projectHandoffDeliveries,
+  type CollaborationChainProjection,
+  type HandoffDeliveryProjection,
+} from "../core/collaboration-read-model";
 import type {
   AccessMode,
   AgentCatalogV1,
@@ -123,6 +129,7 @@ type TranscriptItem =
       kind: ThreadMessageKind;
       collaborationIntent?: CollaborationIntent;
       routingMode?: A2ARoutingMode;
+      deliveries: HandoffDeliveryProjection[];
     }
   | {
       id: string;
@@ -321,6 +328,11 @@ export function App() {
   }, [data?.workspace.path, selectedThread?.workingDirectory, selectedWorkspace]);
   const recentWorkspaces = useMemo(() => buildWorkspaceOptions(threads, data?.workspace), [threads, data?.workspace]);
   const transcript = useMemo(() => buildTranscript(data?.events ?? [], selectedThreadId), [data?.events, selectedThreadId]);
+  const collaborationChains = useMemo(
+    () => projectCollaborationChains(data?.events ?? [], selectedThreadId),
+    [data?.events, selectedThreadId],
+  );
+  const latestCollaboration = collaborationChains[0];
   const attentionRuns = useMemo(() => transcript.filter(isAttentionRun), [transcript]);
   const attentionKey = attentionRuns.map((item) => `${item.id}:${item.review?.status ?? ""}:${item.plan?.decision ?? "pending"}`).join("|");
   const activeChainId = useMemo(() => findActiveChain(data?.events ?? [], selectedThreadId), [data?.events, selectedThreadId]);
@@ -531,7 +543,7 @@ export function App() {
         <section className="conversation">
           {loadError ? <div className="state-card state-card--error">{loadError}</div> : !data ? <div className="loading-state"><span />正在载入工作区…</div> : transcript.length > 0 ? (
             <div className="transcript">
-              <div className="conversation-intro"><div className="intro-icon"><Bot size={18} /></div><div className="intro-copy"><strong>协作记录</strong><span>{transcript.filter((item) => item.type === "agent").length} 次 Agent 运行 · {transcript.filter((item) => item.type === "human").length} 条任务指令</span></div>{activeChainId ? <span className="live-indicator"><i />实时运行中</span> : <span className="conversation-state"><Check size={12} />已同步</span>}</div>
+              <div className="conversation-intro"><div className="intro-icon"><Bot size={18} /></div><div className="intro-copy"><strong>协作记录</strong><span>{transcript.filter((item) => item.type === "agent").length} 次 Agent 运行 · {transcript.filter((item) => item.type === "human").length} 条任务指令</span></div>{latestCollaboration ? <CollaborationStateBadge chain={latestCollaboration} /> : activeChainId ? <span className="live-indicator"><i />实时运行中</span> : <span className="conversation-state"><Check size={12} />已同步</span>}</div>
               {transcript.map((item) => {
                 if (item.type === "human") return (
                   <article className="human-message" key={item.id}>
@@ -549,6 +561,7 @@ export function App() {
                   <article className="collaboration-message" key={item.id}>
                     <div className="collaboration-meta"><AgentRouteChip agentId={item.agentId} agents={data.agents} /><ArrowRight size={13} />{item.mentions.map((id) => <AgentRouteChip agentId={id} agents={data.agents} key={id} />)}<strong>{collaborationProtocolLabel(item)}</strong></div>
                     <p className="collaboration-preview">{compactMessagePreview(item.content)}</p>
+                    {item.deliveries.length > 0 && <div className="collaboration-deliveries">{item.deliveries.map((delivery) => <span className={`delivery-state delivery-state--${delivery.status}`} title={delivery.detail} key={`${delivery.messageId}:${delivery.targetAgentId}`}><i />{agentName(data.agents, delivery.targetAgentId)} · {handoffDeliveryLabel(delivery.status)}</span>)}</div>}
                     {item.content.length > 180 && <details className="collaboration-details"><summary>查看完整转交内容</summary><div className="markdown-body"><ReactMarkdown remarkPlugins={[remarkGfm]}>{item.content}</ReactMarkdown></div></details>}
                   </article>
                 );
@@ -1304,8 +1317,24 @@ function WorkspacePicker({ open, current, recent, onClose, onSelect }: Workspace
 interface DetailsDrawerProps { open: boolean; onClose(): void; thread?: ThreadSummary; agents: AgentSummary[]; workspace?: WorkspaceSummary; events: StoredPlatformEvent[] }
 
 function DetailsDrawer({ open, onClose, thread, agents, workspace, events }: DetailsDrawerProps) {
-  const threadEvents = useMemo(() => selectThreadEvents(events, thread?.id), [events, thread?.id]); const runCount = threadEvents.filter((event) => event.type === "run.queued").length; const toolCount = threadEvents.filter((event) => event.type === "run.tool" && event.phase === "start").length; const messageCount = threadEvents.filter((event) => event.type === "message.created").length; const timeline = threadEvents.filter((event) => event.type !== "run.delta" && event.type !== "run.thinking" && event.type !== "run.reset" && event.type !== "thread.created");
-  return <>{open && <button className="drawer-scrim" type="button" onClick={onClose} aria-label="关闭运行详情" />}<aside className={`details-drawer ${open ? "details-drawer--open" : ""}`} aria-hidden={!open}><header className="drawer-header"><div><strong>运行详情</strong><span>{thread ? cleanTitle(thread.title) : "尚未创建任务"}</span></div><button className="icon-button" type="button" onClick={onClose} aria-label="关闭运行详情"><X size={18} /></button></header><div className="drawer-content"><section className="drawer-section workspace-card"><Folder size={16} /><div><span>工作目录与写锁作用域</span><code title={workspace?.path}>{workspace?.path ?? "正在读取"}</code></div></section><section className="drawer-section"><h2>概览</h2><div className="stat-grid"><div><strong>{runCount}</strong><span>运行</span></div><div><strong>{messageCount}</strong><span>消息</span></div><div><strong>{toolCount}</strong><span>工具</span></div></div></section><section className="drawer-section"><h2>团队运行时健康</h2><div className="agent-roster">{agents.map((agent) => <div className="roster-item" key={agent.id}><AgentAvatar agentId={agent.id} /><span><strong>{agent.displayName}</strong><small>@{agent.id} · {runtimeLabel(agent)} · {agent.accessMode}</small></span><i>{!agent.enabled ? "已停用" : threadEvents.some((event) => event.type === "run.started" && event.agentId === agent.id) ? "已参与" : agent.availability.available ? "待命" : "离线"}</i></div>)}</div></section><section className="drawer-section"><h2>Agent Session</h2><SessionPanel thread={thread} agents={agents} /></section><section className="drawer-section"><h2>A2A 与运行时间线</h2>{timeline.length > 0 ? <div className="event-timeline">{timeline.map((event) => <TimelineEvent event={event} agents={agents} key={event.eventId} />)}</div> : <p className="drawer-empty">发送任务后，这里会显示 session、排队、工具调用、结构化转交和运行状态。</p>}</section></div></aside></>;
+  const threadEvents = useMemo(() => selectThreadEvents(events, thread?.id), [events, thread?.id]);
+  const chains = useMemo(() => projectCollaborationChains(events, thread?.id), [events, thread?.id]);
+  const runCount = threadEvents.filter((event) => event.type === "run.queued").length;
+  const toolCount = threadEvents.filter((event) => event.type === "run.tool" && event.phase === "start").length;
+  const messageCount = threadEvents.filter((event) => event.type === "message.created").length;
+  const timeline = threadEvents.filter((event) => event.type !== "run.delta" && event.type !== "run.thinking" && event.type !== "run.reset" && event.type !== "thread.created");
+  return <>{open && <button className="drawer-scrim" type="button" onClick={onClose} aria-label="关闭运行详情" />}<aside className={`details-drawer ${open ? "details-drawer--open" : ""}`} aria-hidden={!open}><header className="drawer-header"><div><strong>运行详情</strong><span>{thread ? cleanTitle(thread.title) : "尚未创建任务"}</span></div><button className="icon-button" type="button" onClick={onClose} aria-label="关闭运行详情"><X size={18} /></button></header><div className="drawer-content"><section className="drawer-section workspace-card"><Folder size={16} /><div><span>工作目录与写锁作用域</span><code title={workspace?.path}>{workspace?.path ?? "正在读取"}</code></div></section><section className="drawer-section"><h2>概览</h2><div className="stat-grid"><div><strong>{runCount}</strong><span>运行</span></div><div><strong>{messageCount}</strong><span>消息</span></div><div><strong>{toolCount}</strong><span>工具</span></div></div></section><section className="drawer-section"><h2>协作链与球权</h2>{chains[0] ? <CollaborationStatePanel chain={chains[0]} agents={agents} /> : <p className="drawer-empty">还没有协作链。</p>}</section><section className="drawer-section"><h2>团队运行时健康</h2><div className="agent-roster">{agents.map((agent) => <div className="roster-item" key={agent.id}><AgentAvatar agentId={agent.id} /><span><strong>{agent.displayName}</strong><small>@{agent.id} · {runtimeLabel(agent)} · {agent.accessMode}</small></span><i>{!agent.enabled ? "已停用" : threadEvents.some((event) => event.type === "run.started" && event.agentId === agent.id) ? "已参与" : agent.availability.available ? "待命" : "离线"}</i></div>)}</div></section><section className="drawer-section"><h2>Agent Session</h2><SessionPanel thread={thread} agents={agents} /></section><section className="drawer-section"><h2>A2A 与运行时间线</h2>{timeline.length > 0 ? <div className="event-timeline">{timeline.map((event) => <TimelineEvent event={event} agents={agents} key={event.eventId} />)}</div> : <p className="drawer-empty">发送任务后，这里会显示 session、排队、工具调用、结构化转交和运行状态。</p>}</section></div></aside></>;
+}
+
+function CollaborationStateBadge({ chain }: { chain: CollaborationChainProjection }) {
+  const meta = collaborationStateMeta(chain);
+  return <span className={`collaboration-state-badge collaboration-state-badge--${chain.state}`} title={meta.detail}><i />{meta.label}</span>;
+}
+
+function CollaborationStatePanel({ chain, agents }: { chain: CollaborationChainProjection; agents: AgentSummary[] }) {
+  const meta = collaborationStateMeta(chain);
+  const participants = [...new Set(chain.runs.map((run) => run.agentId))];
+  return <div className={`custody-panel custody-panel--${chain.state}`}><div className="custody-panel-head"><CollaborationStateBadge chain={chain} /><code>{shortId(chain.chainId)}</code></div><p>{meta.detail}</p>{chain.pendingHolds.map((hold) => <div className="custody-wait" key={hold.id}><Clock3 size={13} /><span><strong>{agentName(agents, hold.agentId)} 持球等待</strong><small>{hold.waitSourceRef.kind} · {hold.waitSourceRef.expectedSignal} · {new Intl.DateTimeFormat("zh-CN", { hour: "2-digit", minute: "2-digit", second: "2-digit" }).format(new Date(hold.wakeAt))} 唤醒</small></span></div>)}<div className="custody-participants">{participants.map((agentId) => { const latest = [...chain.runs].reverse().find((run) => run.agentId === agentId); return <span key={agentId}><AgentRouteChip agentId={agentId} agents={agents} /><small>{latest ? handoffDeliveryLabel(latest.status) : "已参与"}</small></span>; })}</div>{chain.voidPassCount > 0 && <p className="custody-warning"><XCircle size={12} />检测到 {chain.voidPassCount} 次未命中 Agent 的交棒</p>}</div>;
 }
 
 function SessionPanel({ thread, agents }: { thread?: ThreadSummary; agents: AgentSummary[] }) {
@@ -1382,7 +1411,7 @@ function describeEvent(event: StoredPlatformEvent, agents: AgentSummary[]) {
   if (event.type === "ball.handed") return { title: `球权交给 ${agentName(agents, event.holderAgentId)}`, detail: `${event.routing.mode === "parallel" ? "并行" : "串行"} ${event.routing.index}/${event.routing.total}`, icon: ArrowRight, tone: "active" };
   if (event.type === "ball.held") return { title: `${agentName(agents, event.hold.agentId)} 持球等待`, detail: `${event.hold.waitSourceRef.kind} · ${event.hold.waitSourceRef.expectedSignal}`, icon: Clock3, tone: "active" };
   if (event.type === "ball.wake_sent") return { title: `已唤醒 ${agentName(agents, event.agentId)}`, detail: shortId(event.holdId), icon: RefreshCw, tone: "active" };
-  if (event.type === "ball.handed_user") return { title: "球权交回给你", detail: event.reason, icon: MessageSquare, tone: "active" };
+  if (event.type === "ball.handed_user") return { title: "球权交回给你", detail: humanHandoffReasonLabel(event.reason), icon: MessageSquare, tone: event.reason === "runtime-failure" ? "danger" : "active" };
   if (event.type === "ball.void_pass") return { title: "检测到虚空传球", detail: "handoff 未命中任何 Agent", icon: XCircle, tone: "danger" };
   if (event.type === "task.done") return { title: "协作球已闭环", detail: agentName(agents, event.agentId), icon: Check, tone: "success" };
   if (event.type === "clarification.requested") return { title: `${agentName(agents, event.agentId)} 先向你确认`, detail: event.questions.map((question) => typeof question === "string" ? question : question.question).join("；").slice(0, 120), icon: MessageSquare, tone: "active" };
@@ -1707,6 +1736,12 @@ function buildThreads(events: StoredPlatformEvent[]): ThreadSummary[] {
 export function buildTranscript(events: StoredPlatformEvent[], threadId?: string): TranscriptItem[] {
   if (!threadId) return [];
   const items: TranscriptItem[] = [];
+  const deliveriesByMessage = new Map<string, HandoffDeliveryProjection[]>();
+  for (const delivery of projectHandoffDeliveries(events, threadId)) {
+    const deliveries = deliveriesByMessage.get(delivery.messageId) ?? [];
+    deliveries.push(delivery);
+    deliveriesByMessage.set(delivery.messageId, deliveries);
+  }
   const runs = new Map<string, Extract<TranscriptItem, { type: "agent" }>>();
   const reviewRuns = new Map<string, Extract<TranscriptItem, { type: "agent" }>>();
   const messages = new Map<string, Extract<StoredPlatformEvent, { type: "message.created" }>["message"]>();
@@ -1726,7 +1761,7 @@ export function buildTranscript(events: StoredPlatformEvent[], threadId?: string
         items.push(item);
         humanMessages.set(event.message.id, item);
       } else if (event.message.kind === "collaboration") {
-        items.push({ id: event.message.id, type: "collaboration", agentId: event.message.sender.id, content: event.message.content, mentions: event.message.mentions, createdAt: event.message.createdAt, kind: event.message.kind, ...(event.message.collaborationIntent ? { collaborationIntent: event.message.collaborationIntent } : {}), ...(event.message.routingMode ? { routingMode: event.message.routingMode } : {}) });
+        items.push({ id: event.message.id, type: "collaboration", agentId: event.message.sender.id, content: event.message.content, mentions: event.message.mentions, createdAt: event.message.createdAt, kind: event.message.kind, deliveries: deliveriesByMessage.get(event.message.id) ?? [], ...(event.message.collaborationIntent ? { collaborationIntent: event.message.collaborationIntent } : {}), ...(event.message.routingMode ? { routingMode: event.message.routingMode } : {}) });
       }
       // review-request/review-feedback are internal transport prompts. Their
       // state and outcome are already represented by the review run/card.
@@ -1921,6 +1956,20 @@ function agentName(agents: AgentSummary[], id: string): string { return agents.f
 function runtimeLabel(agent?: AgentSummary): string { if (!agent || agent.availability.label === "Historical Agent") return "历史 Agent"; return agent.runtime.kind === "pi" ? `Pi · ${agent.runtime.provider} · ${agent.runtime.model}` : `Codex${agent.runtime.model ? ` · ${agent.runtime.model}` : ""}`; }
 function runtimeDetail(agent: AgentSummary | undefined, displayName: string): string | undefined { const label = runtimeLabel(agent); const family = agent?.runtime.kind === "pi" ? "Pi" : "Codex"; if (label.toLocaleLowerCase() === displayName.toLocaleLowerCase()) return undefined; if (displayName.toLocaleLowerCase() === family.toLocaleLowerCase() && label.startsWith(`${family} · `)) return label.slice(family.length + 3); return label; }
 function statusLabel(status: ViewRunStatus, access?: AccessMode): string { if (status === "queued") return access === "read-only" ? "并行队列" : "等待会话/写锁"; return { running: "运行中", completed: "已完成", failed: "失败", cancelled: "已取消", interrupted: "已中断" }[status]; }
+function handoffDeliveryLabel(status: HandoffDeliveryProjection["status"]): string { return { accepted: "路由已接收", queued: "已排队", running: "处理中", completed: "已完成", failed: "失败", cancelled: "未执行", interrupted: "已中断" }[status]; }
+function collaborationStateMeta(chain: CollaborationChainProjection): { label: string; detail: string } {
+  if (chain.state === "active") return { label: "协作进行中", detail: `${chain.activeAgentIds.length} 位 Agent 正在持球执行。` };
+  if (chain.state === "queued") return { label: "等待执行", detail: `${chain.queuedAgentIds.length} 位 Agent 已进入队列。` };
+  if (chain.state === "waiting-external") return { label: "持球等待外部信号", detail: `${chain.pendingHolds.length} 个有依据的等待将在条件到期后唤醒原 Agent。` };
+  if (chain.state === "waiting-human") {
+    const reason = humanHandoffReasonLabel(chain.waitingHumanReason ?? "runtime-failure");
+    return { label: "等待你处理", detail: reason };
+  }
+  if (chain.state === "needs-attention") return { label: "协作异常", detail: chain.voidPassCount > 0 ? "交棒没有命中可运行的 Agent，链路仍未闭环。" : `${chain.failedAgentIds.length || 1} 个执行分支失败或中断。` };
+  if (chain.state === "cancelled") return { label: "协作已取消", detail: "整条协作链已由用户取消。" };
+  return { label: "协作已闭环", detail: `${chain.runs.filter((run) => run.status === "completed").length} 次运行已完成。` };
+}
+function humanHandoffReasonLabel(reason: CollaborationChainProjection["waitingHumanReason"]): string { return { clarification: "Agent 需要你补充关键信息。", "plan-approval": "方案正在等待你拍板。", "review-escalation": "同侪审核未能收敛，需要你裁决。", "runtime-failure": "执行链出现失败，剩余工作没有被标记为完成。" }[reason ?? "runtime-failure"]; }
 function connectionLabel(configured: boolean, connection: string): string { if (!configured) return "等待运行时配置"; if (connection === "connected") return "团队服务已连接"; return connection === "reconnecting" ? "正在重新连接" : "正在连接"; }
 function shortId(id: string): string { return id.split("_")[1]?.slice(0, 8) ?? id.slice(0, 8); }
 function formatClock(value: string): string { return new Intl.DateTimeFormat("zh-CN", { hour: "2-digit", minute: "2-digit", hour12: false }).format(new Date(value)); }
