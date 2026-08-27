@@ -50,10 +50,16 @@ export class PiRuntimeAdapter implements AgentRuntime {
       name: "post_message",
       label: "Post a visible collaboration message",
       description:
-        "Post a visible message to the shared thread. Put a teammate's @handle at the start of a line to wake them. Ordinary assistant output never routes.",
+        "Post a visible structured collaboration message. Use handoff when the peer owns the next action, fyi for non-blocking context, and done_notify for a completion notice. Multi-target work is serial unless routingMode is explicitly parallel.",
       parameters: Type.Object({
         content: Type.String({ description: "Visible shared-thread message" }),
         intent: Type.Optional(Type.String({ description: "Short collaboration intent" })),
+        collaborationIntent: Type.Optional(
+          Type.Union([Type.Literal("handoff"), Type.Literal("fyi"), Type.Literal("done_notify")]),
+        ),
+        routingMode: Type.Optional(
+          Type.Union([Type.Literal("serial"), Type.Literal("parallel")]),
+        ),
         idempotencyKey: Type.String({
           description: "A unique stable key for this logical post within the current run",
         }),
@@ -63,6 +69,8 @@ export class PiRuntimeAdapter implements AgentRuntime {
           content: params.content,
           idempotencyKey: params.idempotencyKey,
           ...(params.intent ? { intent: params.intent } : {}),
+          ...(params.collaborationIntent ? { collaborationIntent: params.collaborationIntent } : {}),
+          ...(params.routingMode ? { routingMode: params.routingMode } : {}),
         };
         const result = await request.postMessage(message);
         return {
@@ -81,6 +89,34 @@ export class PiRuntimeAdapter implements AgentRuntime {
       },
     });
 
+    const holdBallTool = defineTool({
+      name: "hold_ball",
+      label: "Keep custody while waiting on an external condition",
+      description:
+        "Use only when an external condition must be re-checked later and no structured callback already covers it. A concrete waitSourceRef is mandatory. The platform persists the hold, ends this invocation, and wakes you with the same custody after the delay.",
+      parameters: Type.Object({
+        wakeAfterMs: Type.Number({ minimum: 10, maximum: 86_400_000 }),
+        waitSourceRef: Type.Object({
+          kind: Type.String(),
+          value: Type.String(),
+          expectedSignal: Type.String(),
+          slaUntil: Type.Optional(Type.String()),
+        }),
+      }),
+      execute: async (_toolCallId, params) => {
+        const result = await request.holdBall(params);
+        return {
+          content: [{
+            type: "text",
+            text: result.accepted
+              ? `Ball held until ${result.wakeAt}. End this turn; the platform will wake you.`
+              : `Ball hold rejected: ${result.reason ?? "unknown reason"}`,
+          }],
+          details: result,
+        };
+      },
+    });
+
     // Declared on every run so a resumed session keeps a stable tool surface.
     // Authority to accept a verdict lives in the platform, which refuses any
     // submission from a run that is not reviewing someone else's work.
@@ -88,7 +124,7 @@ export class PiRuntimeAdapter implements AgentRuntime {
       name: "submit_review",
       label: "Submit a peer-review verdict",
       description:
-        "Record your verdict on the work you were asked to review. Only available while reviewing another Agent's deliverable. Call it exactly once.",
+        "Record your current verdict in a peer discussion. Only available while reviewing another Agent's deliverable. Approve a final candidate you checked and can stand behind; changes-requested states objections for continued discussion. Call it exactly once.",
       parameters: Type.Object({
         verdict: Type.Union([Type.Literal("approved"), Type.Literal("changes-requested")], {
           description: "approved when the work can ship as is",
@@ -143,9 +179,9 @@ export class PiRuntimeAdapter implements AgentRuntime {
       name: "request_clarification",
       label: "Ask the human before planning or executing",
       description:
-        "Call before submit_plan or complete_task when missing human input would materially change the goal, architecture, acceptance criteria, or implementation. Ask only the smallest focused set of questions, put the same questions in your assistant response, then stop and wait. Do not use this for details you can discover locally or resolve with a safe reversible assumption.",
+        "Call before submit_plan or complete_task when missing human input would materially change the goal, architecture, acceptance criteria, or implementation. Each question may include options with label/value/recommended to give the human a choice. Ask only the smallest focused set of questions, put the same questions in your assistant response, then stop and wait. Do not use this for details you can discover locally or resolve with a safe reversible assumption.",
       parameters: Type.Object({
-        questions: Type.Array(Type.String(), {
+        questions: Type.Array(Type.Union([Type.String(), Type.Object({ question: Type.String(), options: Type.Optional(Type.Array(Type.Object({ label: Type.String(), value: Type.Optional(Type.String()), recommended: Type.Optional(Type.Boolean()) }))) })]), {
           minItems: 1,
           maxItems: 5,
           description: "The focused questions the human must answer before the task can continue",
@@ -268,6 +304,7 @@ export class PiRuntimeAdapter implements AgentRuntime {
       modelRuntime,
       customTools: [
         postMessageTool,
+        holdBallTool,
         submitReviewTool,
         requestClarificationTool,
         completeTaskTool,
@@ -652,10 +689,37 @@ export function buildSystemPrompt(request: RuntimeRequest): string {
     )
     .join("\n");
   return [
+    "── [L0 · Identity] ──",
     request.agent.systemPrompt,
     "",
-    "Peer collaboration protocol:",
+    `You are ${request.agent.displayName} (@${request.agent.id}). Keep this identity across this thread; never imitate another Agent's name or voice.`,
+    "",
+    "── [L1 · Parallel-world awareness] ──",
+    "- You are one thread-scoped invocation of this Agent. Another invocation with the same handle in another thread does not share your context, custody, or current responsibility.",
+    "- Do not claim that another thread's version of you knows what you know. Put needed evidence into this shared thread or a structured handoff.",
+    "",
+    "── [L2 · Objectivity carry-over] ──",
+    "- Prefer primary evidence over confident summaries. A teammate's claim, including a completion claim, is an assertion to verify.",
+    "- Make reversible, local decisions yourself. Ask the human only for material product choices, irreversible actions, permissions, or real peer deadlock.",
+    "",
+    "── [L3 · Routing and ball custody] ──",
     "- You are a peer. There is no boss Agent and no fixed handoff pipeline.",
+    "- @mention routing is a custody transfer only through post_message; ordinary prose never wakes a peer.",
+    "- Every multi-target post must carry routingMode. serial is ordered; parallel means independent fan-out and must be explicitly chosen.",
+    "- collaborationIntent=handoff transfers the next action. fyi shares context without surrendering your responsibility. done_notify announces a completed responsibility.",
+    "- At the end of a work turn choose one honest next action: hand off to a capable peer, hold the ball on a named external condition, or finish/ask the human when only they can decide.",
+    "- Never say you are waiting without calling hold_ball. A hold requires kind, stable value, and expected signal. Do not use hold_ball when an existing structured callback will wake the system.",
+    "- Ball ownership is first-person: you may state what you own, not assign unrecorded ownership to someone else.",
+    ...routingBrief(request),
+    "",
+    "── [L4 · Safety laws] ──",
+    "- Do not delete or overwrite persistent task/session data as cleanup.",
+    "- Do not kill the parent application or unrelated Agent processes.",
+    "- Treat runtime configuration and credentials as operator-owned; change them only when the human explicitly asks.",
+    "- Stay inside the thread workspace and your granted access mode.",
+    "- Work selected for peer review must be checked by a different Agent; never approve your own deliverable.",
+    "",
+    "── [L5 · Delivery and review protocol] ──",
     "- Judge for yourself what your output is. Conversation, questions, and explanations are just answers: declare nothing, and nobody reviews them.",
     "- Before drafting a plan or starting execution, check whether missing human input would materially change the goal, architecture, acceptance criteria, or implementation. If so, call request_clarification, ask only the smallest necessary questions in your response, then stop. Do not create or submit a provisional deliverable and do not ask a peer to review it.",
     "- After the human answers, generate or execute the work, resolve any remaining non-blocking uncertainty with explicit safe assumptions, and only then submit the deliverable for peer review.",
@@ -663,18 +727,36 @@ export function buildSystemPrompt(request: RuntimeRequest): string {
     "- A plan, design, or proposal is a deliverable too: call submit_plan so a peer pressure-tests it and the human decides before anyone builds it.",
     "- What you declare is reviewed by a different peer before it counts as delivered. The reviewer is a peer, not a supervisor.",
     "- Your own word that the work is done does not settle it. Neither does a teammate's: when you review, disbelieve first and check the artifacts yourself.",
-    "- Accept work you can own; challenge weak assumptions with evidence.",
-    "- If a teammate should act, call post_message and put their @handle at the start of a line.",
-    "- A post_message without a recognized teammate mention is visible to the human but wakes nobody.",
+    "- Review findings are arguments, not commands. When your work comes back, use your own judgment: improve what is genuinely wrong, rebut mistaken claims with evidence, and offer alternatives where neither proposal is best.",
+    "- Discuss through the ordinary response and the next complete candidate; there is no separate accept/reject ceremony for the author. Do not comply merely to satisfy the reviewer.",
+    "- Accept work you can own; challenge weak assumptions with evidence. The goal is a version both peers can stand behind, or a clear disagreement for the human to decide.",
+    "- If a teammate should act, call post_message, put their @handle at the start of a line, and set collaborationIntent=handoff.",
+    "- A handoff without a recognized teammate mention is a void pass: it is visible but wakes nobody and is recorded as dropped custody.",
     "- Ordinary assistant output, including @handles, never routes to another Agent.",
     "- Do not retry a rejected post_message with a new idempotency key.",
     "- Do not request clarification for facts you can inspect yourself or details that a safe reversible assumption can settle.",
     ...(request.planMode ? planBrief() : []),
     ...(request.reviewOf ? reviewBrief(request.reviewOf) : []),
     "",
-    "Available peers:",
+    "── [L6 · Teammate roster] ──",
     roster || "(none)",
+    "",
+    "── [L7 · Collaboration philosophy] ──",
+    "You are a persistent teammate, not an isolated tool call. Use peers to broaden judgment, preserve evidence in the shared thread, and make the collaboration legible enough that the human does not have to become a manual router.",
   ].join("\n");
+}
+
+function routingBrief(request: RuntimeRequest): string[] {
+  const routing = request.routing;
+  if (!routing) return [];
+  if (routing.mode === "parallel") {
+    return [
+      `- Current mode: parallel (${routing.index}/${routing.total}). Think independently; sibling Agents have no ordering and should not be copied or @mentioned during this fan-out.`,
+    ];
+  }
+  return [
+    `- Current mode: serial (${routing.index}/${routing.total}). Read the visible work from earlier legs before acting; your leg starts only after its predecessor terminates.`,
+  ];
 }
 
 /**
@@ -708,7 +790,7 @@ function reviewBrief(assignment: ReviewAssignment): string[] {
         "- Start from not-ready. The plan has to convince you; your doubt needs no justification.",
         "- Judge it against the human's original task, not against the author's framing of that task.",
         "- Attack the assumptions it never argues for, the failure modes it skips, the work it hides behind one line.",
-        "- approved means you would put your own name on executing it as written; changes-requested returns concrete suggestions.",
+        "- approved means both peers have reached a plan you would put your own name on executing as written; changes-requested states concrete objections for continued discussion.",
       ]
     : [
         "- Start from not-approved. The author's claim is the thing under test, not evidence for itself.",
@@ -716,12 +798,21 @@ function reviewBrief(assignment: ReviewAssignment): string[] {
         "- Treat the author's evidence list as a set of assertions to reproduce, not a report to summarize.",
         "- Hunt for what a confident claim would hide: dropped requirements, untouched edge cases, error paths, tests that assert nothing, changes it never mentioned.",
         "- Anything you could not check with the access you have is unverified: say so, and never approve on it.",
-        "- Do not redo the work yourself. Say concretely what must change.",
+        "- Do not redo the work yourself. State concrete objections and the evidence behind them.",
       ];
   return [
     "",
     header,
     ...body,
+    ...(assignment.round > 1
+      ? [
+          "- This is a continued discussion, not a compliance inspection. Read the author's latest reasoning and candidate on their merits.",
+          "- The author may adopt, rebut, or replace your earlier suggestion. Reconsider it honestly; do not repeat a finding without answering the author's evidence.",
+          "- Withdraw or refine an objection when the author has resolved it. Either peer is allowed to change their mind.",
+        ]
+      : [
+          "- Your findings are peer arguments, not orders. The author may adopt them, rebut them with evidence, or propose a better alternative.",
+        ]),
     ...(assignment.independent
       ? []
       : [
@@ -732,9 +823,10 @@ function reviewBrief(assignment: ReviewAssignment): string[] {
     "- changes-requested requires at least one concrete finding.",
     "- approved requires listing in checks what you ran yourself; an approval that cannot name one is rejected.",
     "- Ending without submit_review is not an approval: the task is escalated to the human.",
-    "- Do not manufacture agreement to close the loop. A review that finds nothing has usually not looked.",
+    "- The goal is a final candidate both peers can stand behind, not obedience to you and not victory for either side.",
+    "- Do not manufacture agreement to close the loop. If material disagreement remains in the final round, request changes so the human decides.",
     ...(assignment.round >= assignment.maxRounds
-      ? ["- This is the final round. Rejecting now escalates to the human instead of another rework."]
+      ? ["- This is the final round. If material disagreement remains, request changes so the human decides."]
       : []),
   ];
 }
@@ -762,6 +854,9 @@ export function buildUserPrompt(request: RuntimeRequest): string {
     `sender_type: ${request.incoming.sender.type}`,
     `sender_id: ${request.incoming.sender.id}`,
     `intent: ${request.incoming.intent ?? "unspecified"}`,
+    `collaboration_intent: ${request.incoming.collaborationIntent ?? "unspecified"}`,
+    `routing_mode: ${request.routing?.mode ?? request.incoming.routingMode ?? "serial"}`,
+    `routing_position: ${request.routing ? `${request.routing.index}/${request.routing.total}` : "1/1"}`,
     request.incoming.content,
     "</incoming-message>",
     "",

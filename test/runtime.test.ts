@@ -59,6 +59,31 @@ test("the collaboration prompt makes human clarification a pre-review gate", () 
   assert.match(prompt, /only then submit the deliverable for peer review/);
 });
 
+test("peer review prompts make later rounds a discussion instead of reviewer commands", () => {
+  const authorPrompt = buildSystemPrompt(request("author-discussion", []));
+  assert.match(authorPrompt, /Review findings are arguments, not commands/);
+  assert.match(authorPrompt, /no separate accept\/reject ceremony/);
+  assert.match(authorPrompt, /Do not comply merely to satisfy the reviewer/);
+
+  const reviewRequest: RuntimeRequest = {
+    ...request("review-discussion", []),
+    reviewOf: {
+      taskRunId: "task-1",
+      authorAgentId: "pi",
+      round: 2,
+      maxRounds: 2,
+      reviewType: "verify",
+      independent: true,
+    },
+    submitReview: async () => ({ accepted: true }),
+  };
+  const reviewerPrompt = buildSystemPrompt(reviewRequest);
+  assert.match(reviewerPrompt, /continued discussion, not a compliance inspection/);
+  assert.match(reviewerPrompt, /rebut.*earlier suggestion/i);
+  assert.match(reviewerPrompt, /Either peer is allowed to change their mind/);
+  assert.match(reviewerPrompt, /human decides/);
+});
+
 test("DeepSeek runtime requires and recognizes its API key", () => {
   const spec = {
     kind: "pi" as const,
@@ -238,7 +263,7 @@ process.on("SIGTERM", () => process.exit(0));
     assert.equal(secondEvents.find((event) => event.type === "tool_start")?.toolName, "submit_review");
 
     process.env.FAKE_CODEX_TOOL = "request_clarification";
-    let clarificationQuestions: string[] | undefined;
+    let clarificationQuestions: Array<string | { question: string; options?: Array<{ label: string; value?: string; recommended?: boolean }> }> | undefined;
     const thirdEvents: RuntimeEvent[] = [];
     const thirdRequest = request("run-3", thirdEvents);
     thirdRequest.requestClarification = async (input) => {
@@ -258,7 +283,7 @@ process.on("SIGTERM", () => process.exit(0));
     const rpc = records.filter((record) => record.kind === "rpc").map((record) => record.value as Record<string, unknown>);
     const started = rpc.find((message) => message.method === "thread/start");
     const startParams = started?.params as { dynamicTools?: Array<{ name: string }> };
-    assert.deepEqual(startParams.dynamicTools?.map((tool) => tool.name), ["post_message", "submit_review", "request_clarification", "complete_task", "submit_plan"]);
+    assert.deepEqual(startParams.dynamicTools?.map((tool) => tool.name), ["post_message", "hold_ball", "submit_review", "request_clarification", "complete_task", "submit_plan"]);
     assert.equal(JSON.stringify(started).includes("mcp_servers"), false);
     assert.equal(rpc.some((message) => message.method === "thread/resume" && (message.params as { threadId?: string }).threadId === "codex-session-123"), true);
   } finally {
@@ -378,6 +403,7 @@ function request(runId: string, events: RuntimeEvent[], signal = new AbortContro
     signal,
     emit: async (event) => { events.push(event); },
     postMessage: async () => ({ accepted: true, targets: [] }),
+    holdBall: async () => ({ accepted: true, holdId: "hold-test" }),
     requestClarification: async () => ({ accepted: true }),
     declareDeliverable: async () => ({ accepted: true }),
   };

@@ -150,8 +150,71 @@ test("runs read-only peers concurrently", async () => {
       ["codex", runtime("codex", handler)],
     ]),
   );
-  await platform.postUserMessage({ content: "@pi @codex research" });
+  await platform.postUserMessage({ content: "@pi @codex research", routingMode: "parallel" });
   assert.equal(maximum, 2);
+});
+
+test("defaults multi-Agent dispatch to an honest serial worklist", async () => {
+  let active = 0;
+  let maximum = 0;
+  const order: string[] = [];
+  const handler = async (request: RuntimeRequest): Promise<RuntimeResult> => {
+    active++;
+    maximum = Math.max(maximum, active);
+    order.push(request.agent.id);
+    assert.equal(request.routing?.mode, "serial");
+    await delay(20);
+    active--;
+    return emitOutput(request, request.agent.id);
+  };
+  const platform = createPlatform(
+    [agent("pi", "read-only"), agent("codex", "read-only")],
+    new Map([
+      ["pi", runtime("pi", handler)],
+      ["codex", runtime("codex", handler)],
+    ]),
+  );
+
+  await platform.postUserMessage({ content: "@pi @codex inspect in order" });
+  assert.equal(maximum, 1);
+  assert.deepEqual(order, ["pi", "codex"]);
+});
+
+test("hold_ball persists grounded custody and wakes the same Agent", async () => {
+  let calls = 0;
+  const platform = createPlatform(
+    [agent("pi", "read-only")],
+    new Map([
+      ["pi", runtime("pi", async (request) => {
+        calls++;
+        if (request.incoming.kind !== "wake") {
+          const held = await request.holdBall({
+            wakeAfterMs: 20,
+            waitSourceRef: {
+              kind: "ci",
+              value: "build-42",
+              expectedSignal: "terminal status",
+            },
+          });
+          assert.equal(held.accepted, true);
+        }
+        return emitOutput(request, request.incoming.kind);
+      })],
+    ]),
+    "pi",
+  );
+
+  const started = await platform.startUserMessage({ content: "@pi wait for CI" });
+  let completed = false;
+  void started.completion.then(() => { completed = true; });
+  await delay(10);
+  assert.equal(completed, false, "a persisted hold keeps the collaboration chain open");
+  await started.completion;
+  const events = await platform.getEvents();
+  assert.equal(calls, 2);
+  assert.equal(countEvents(events, "ball.held"), 1);
+  assert.equal(countEvents(events, "ball.wake_sent"), 1);
+  assert.equal(countEvents(events, "run.completed"), 2);
 });
 
 test("serializes writers in the same workspace", async () => {
@@ -637,7 +700,8 @@ test("a critique that requests changes reworks the plan as a critique round", as
   const feedback = (await platform.getThreadMessages(requests[0]!.threadId)).find(
     (message) => message.kind === "review-feedback",
   );
-  assert.match(feedback?.content ?? "", /Revise your plan/);
+  assert.match(feedback?.content ?? "", /peer's arguments, not instructions/);
+  assert.match(feedback?.content ?? "", /complete, self-contained candidate plan/);
   assert.equal(single(events, "review.resolved").outcome, "approved");
 });
 
@@ -1132,7 +1196,7 @@ test("a task with no eligible reviewer escalates instead of passing", async () =
   assert.equal(resolved.escalation, "no-reviewer");
 });
 
-test("changes-requested hands feedback back to the author and re-reviews the rework", async () => {
+test("changes-requested opens a natural discussion and re-reviews the next candidate", async () => {
   const order: string[] = [];
   const verdicts: ReviewVerdict[] = ["changes-requested", "approved"];
   const platform = createReviewPlatform([agent("pi"), agent("codex")], {
@@ -1167,6 +1231,10 @@ test("changes-requested hands feedback back to the author and re-reviews the rew
   assert.deepEqual(feedback?.mentions, ["pi"]);
   assert.match(feedback?.content ?? "", /缺少错误处理/);
   assert.match(feedback?.content ?? "", /为解析失败补一个分支/);
+  assert.match(feedback?.content ?? "", /arguments, not instructions/);
+  assert.match(feedback?.content ?? "", /no separate accept\/reject action/);
+  assert.match(feedback?.content ?? "", /rebut it with evidence/);
+  assert.match(feedback?.content ?? "", /complete final result/);
 
   // Exactly one terminal marker, and it is the approval of round 2.
   const resolved = single(events, "review.resolved");
@@ -1201,6 +1269,8 @@ test("escalates to the human instead of looping past maxReviewRounds", async () 
   assert.equal(resolved.outcome, "escalated");
   assert.equal(resolved.escalation, "max-rounds");
   assert.equal(resolved.rounds, 2);
+  assert.match(resolved.detail ?? "", /仍未达成一致/);
+  assert.match(resolved.detail ?? "", /人类裁决/);
 });
 
 test("a review run that ends without submit_review is escalated, never approved", async () => {

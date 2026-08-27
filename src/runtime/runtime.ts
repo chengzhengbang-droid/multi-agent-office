@@ -9,6 +9,12 @@ import type {
   RuntimeAvailability,
   ThreadMessage,
 } from "../core/types.js";
+import type {
+  A2ARoutingMode,
+  A2ARoutingProjection,
+  CollaborationIntent,
+  WaitSourceRef,
+} from "../core/collaboration.js";
 
 export type RuntimeLifecyclePhase =
   | "retry_start"
@@ -48,6 +54,10 @@ export type RuntimeEvent =
 export interface PostAgentMessageInput {
   content: string;
   intent?: string;
+  /** Defaults to handoff when one or more peers are named. */
+  collaborationIntent?: CollaborationIntent;
+  /** Inline/tool multi-target dispatches are serial unless explicitly parallel. */
+  routingMode?: A2ARoutingMode;
   idempotencyKey: string;
 }
 
@@ -55,6 +65,20 @@ export interface PostAgentMessageResult {
   accepted: boolean;
   messageId?: Id;
   targets: Id[];
+  reason?: string;
+}
+
+export interface HoldBallInput {
+  /** Delay before the holder is re-invoked to check the external condition. */
+  wakeAfterMs: number;
+  /** Grounding is mandatory: the platform will not persist a vague "wait". */
+  waitSourceRef: WaitSourceRef;
+}
+
+export interface HoldBallResult {
+  accepted: boolean;
+  holdId?: Id;
+  wakeAt?: string;
   reason?: string;
 }
 
@@ -74,7 +98,12 @@ export interface DeclareDeliverableResult {
 
 export interface RequestClarificationInput {
   /** The smallest set of human answers needed before work or planning can continue. */
-  questions: string[];
+  questions: Array<string | ClarificationQuestion>;
+}
+
+export interface ClarificationQuestion {
+  question: string;
+  options?: Array<{ label: string; value?: string; recommended?: boolean }>;
 }
 
 export interface RequestClarificationResult {
@@ -133,8 +162,12 @@ export interface RuntimeRequest {
    * verdict only when this assignment and submitReview are present.
    */
   reviewOf?: ReviewAssignment;
+  /** Structured scheduling mode for this run; prose never changes it. */
+  routing?: A2ARoutingProjection;
   emit(event: RuntimeEvent): Promise<void>;
   postMessage(input: PostAgentMessageInput): Promise<PostAgentMessageResult>;
+  /** Keep the ball while waiting on a named external condition, then wake up. */
+  holdBall(input: HoldBallInput): Promise<HoldBallResult>;
   /**
    * Pause before producing a deliverable when missing human input would
    * materially change the goal, plan, acceptance criteria, or implementation.

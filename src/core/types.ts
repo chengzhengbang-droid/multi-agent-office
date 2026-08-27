@@ -1,3 +1,10 @@
+import type {
+  A2ARoutingMode,
+  A2ARoutingProjection,
+  CollaborationIntent,
+  PendingBallHold,
+} from "./collaboration.js";
+
 export type Id = string;
 
 export type AccessMode = "read-only" | "workspace-write" | "full";
@@ -75,6 +82,8 @@ export interface CausalMetadata {
 export type ThreadMessageKind =
   | "chat"
   | "collaboration"
+  /** A managed ball hold woke the same Agent with fresh external context. */
+  | "wake"
   /** A declared deliverable submitted to a peer for verification or critique. */
   | "review-request"
   /** A reviewer's verdict handed back to the Agent that produced the work. */
@@ -97,6 +106,10 @@ export interface ThreadMessage {
   mentions: Id[];
   content: string;
   intent?: string;
+  /** Structured semantics for Agent-to-Agent messages; never inferred from prose. */
+  collaborationIntent?: CollaborationIntent;
+  /** Structured scheduling contract for a multi-Agent dispatch. */
+  routingMode?: A2ARoutingMode;
   createdAt: string;
   causal?: CausalMetadata;
   attachments?: MessageAttachment[];
@@ -157,9 +170,9 @@ export type ReviewEscalation =
   | "inconclusive"
   /** The review run failed, was cancelled, or its reviewer became unavailable. */
   | "review-failed"
-  /** maxReviewRounds rounds of rework still did not satisfy the reviewer. */
+  /** maxReviewRounds rounds of peer discussion ended without consensus. */
   | "max-rounds"
-  /** The author stopped rework because a material human decision is missing. */
+  /** The author stopped discussion because a material human decision is missing. */
   | "clarification-needed";
 
 export interface ReviewSubmission {
@@ -243,6 +256,8 @@ export interface AgentRun {
   reviewType?: ReviewType;
   /** Absent in pre-plan-mode event logs, where every run was a "normal" run. */
   mode?: RunMode;
+  /** Honest serial/parallel scheduling metadata carried into the runtime. */
+  routing?: A2ARoutingProjection;
 }
 
 export type PlatformEventPayload =
@@ -361,6 +376,78 @@ export type PlatformEventPayload =
       messageId: Id;
     }
   | {
+      /** The target actually acquired this turn's ball and may now act. */
+      type: "ball.handed";
+      threadId: Id;
+      chainId: Id;
+      runId: Id;
+      messageId: Id;
+      holderAgentId: Id;
+      fromAgentId?: Id;
+      routing: A2ARoutingProjection;
+    }
+  | {
+      /** An Agent kept custody while waiting on a named external condition. */
+      type: "ball.held";
+      hold: PendingBallHold;
+    }
+  | {
+      /** A persisted hold fired and re-invoked its holder. */
+      type: "ball.wake_sent";
+      threadId: Id;
+      chainId: Id;
+      holdId: Id;
+      runId: Id;
+      messageId: Id;
+      agentId: Id;
+    }
+  | {
+      /** The next move genuinely requires a human decision or clarification. */
+      type: "ball.handed_user";
+      threadId: Id;
+      chainId: Id;
+      runId: Id;
+      reason: "clarification" | "plan-approval" | "review-escalation";
+    }
+  | {
+      /** A handoff was claimed in structure but named no routable recipient. */
+      type: "ball.void_pass";
+      threadId: Id;
+      chainId: Id;
+      runId: Id;
+      messageId: Id;
+    }
+  | {
+      type: "ball.hold_cancelled";
+      threadId: Id;
+      chainId: Id;
+      holdId: Id;
+      reason: string;
+    }
+  | {
+      type: "invocation.died";
+      threadId: Id;
+      chainId: Id;
+      runId: Id;
+      agentId: Id;
+      reason: string;
+    }
+  | {
+      type: "task.done";
+      threadId: Id;
+      chainId: Id;
+      runId: Id;
+      agentId: Id;
+    }
+  | {
+      type: "ball.cancelled";
+      threadId: Id;
+      chainId: Id;
+      runId: Id;
+      agentId: Id;
+      reason: string;
+    }
+  | {
       /** An Agent declared its run produced a deliverable. Arms the review gate. */
       type: "deliverable.declared";
       runId: Id;
@@ -376,7 +463,7 @@ export type PlatformEventPayload =
       runId: Id;
       threadId: Id;
       agentId: Id;
-      questions: string[];
+      questions: Array<string | { question: string; options?: Array<{ label: string; value?: string; recommended?: boolean }> }>;
     }
   | {
       type: "review.requested";
@@ -403,6 +490,7 @@ export type PlatformEventPayload =
       checks?: string[];
     }
   | {
+      /** A review objection opened another natural-language deliberation round. */
       type: "review.rework";
       threadId: Id;
       taskRunId: Id;

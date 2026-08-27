@@ -5,6 +5,13 @@ import type { ContextCompiler } from "./context-compiler.js";
 import type { EventStore } from "./event-store.js";
 import { parseAgentMentions, parseUserMentions } from "./mentions.js";
 import type {
+  A2ARoutingMode,
+  A2ARoutingProjection,
+  CollaborationIntent,
+  PendingBallHold,
+  WaitSourceRef,
+} from "./collaboration.js";
+import type {
   AccessMode,
   AgentDefinition,
   AgentRun,
@@ -28,6 +35,8 @@ import type {
   AgentRuntime,
   DeclareDeliverableInput,
   DeclareDeliverableResult,
+  HoldBallInput,
+  HoldBallResult,
   PostAgentMessageInput,
   PostAgentMessageResult,
   RequestClarificationInput,
@@ -89,6 +98,8 @@ export interface PostUserMessageInput {
    * before anything is built.
    */
   planMode?: boolean;
+  /** Structured multi-target scheduling. Defaults to serial. */
+  routingMode?: A2ARoutingMode;
   /**
    * Pre-assigned id for the message this call creates. The plan gate uses it to
    * record its decision before starting the follow-up, so a crash between the
@@ -205,8 +216,8 @@ export class MultiAgentPlatform {
   /** runIds that changed the workspace, declared or not. */
   private readonly runWriteEffects = new Set<Id>();
   /** runId -> material questions the Agent chose to ask before delivery. */
-  private readonly runClarifications = new Map<Id, string[]>();
-  /** taskRunId -> what its review rounds judge, stable across rework. */
+  private readonly runClarifications = new Map<Id, Array<string | { question: string; options?: Array<{ label: string; value?: string; recommended?: boolean }> }>>();
+  /** taskRunId -> what its review rounds judge, stable across discussion rounds. */
   private readonly taskReviewTypes = new Map<Id, ReviewType>();
   /** reviewRunId -> the claim that review is checking, if the author made one. */
   private readonly reviewDeclarations = new Map<Id, DeliverableDeclaration>();
@@ -214,6 +225,11 @@ export class MultiAgentPlatform {
   private readonly planDrafts = new Map<Id, PlanDraft>();
   /** taskRunId -> a plan parked in front of the human. Cleared when decided. */
   private readonly planApprovals = new Map<Id, PlanApproval>();
+  /** Durable, replayable external waits; timers are only a live projection. */
+  private readonly pendingHolds = new Map<Id, PendingBallHold>();
+  private readonly holdTimers = new Map<Id, ReturnType<typeof setTimeout>>();
+  /** A run must choose one next-action path: peer handoff, external hold, or human. */
+  private readonly runCustodyActions = new Map<Id, "handoff" | "hold" | "human">();
   private readonly maxA2ADepth: number;
   private readonly maxAgentRunsPerChain: number;
   private readonly maxMentionTargets: number;
@@ -233,7 +249,7 @@ export class MultiAgentPlatform {
     this.installRoster(options.agents, options.runtimes, options.defaultAgentId);
     this.maxA2ADepth = options.maxA2ADepth ?? 4;
     this.maxAgentRunsPerChain = options.maxAgentRunsPerChain ?? 8;
-    this.maxMentionTargets = options.maxMentionTargets ?? 2;
+    this.maxMentionTargets = options.maxMentionTargets ?? 3;
     this.maxPingPongHops = options.maxPingPongHops ?? 4;
     this.maxParallelReadRuns = options.maxParallelReadRuns ?? 4;
     this.reviewMode = options.reviewMode ?? "smart";
@@ -353,6 +369,8 @@ export class MultiAgentPlatform {
     const chainId = createId("chain");
     const causal: CausalMetadata = { chainId, depth: 0 };
     const planMode = input.planMode === true;
+    const routingMode = normalizeRoutingMode(input.routingMode);
+    const batchId = createId("batch");
     const message: ThreadMessage = {
       id: input.messageId ?? createId("msg"),
       threadId,
@@ -360,6 +378,7 @@ export class MultiAgentPlatform {
       kind: "chat",
       mentions: targets,
       content,
+      routingMode,
       createdAt: now(),
       causal,
       ...(input.attachments && input.attachments.length > 0
@@ -369,18 +388,33 @@ export class MultiAgentPlatform {
     await this.addMessage(message);
 
     const steered: Id[] = [];
-    for (const target of targets) {
+    let predecessorRunId: Id | undefined;
+    for (const [targetIndex, target] of targets.entries()) {
       const agent = this.agents.get(target);
       if (!agent) continue;
       // Steering drops a message into a run that is already executing, so it
       // cannot change that run's mode or its access. A plan-mode message must
       // start its own read-only run rather than land inside a writing one.
-      if (input.steer && !planMode && (await this.trySteer(threadId, target, message))) {
+      // A multi-recipient dispatch owns an explicit serial/parallel contract.
+      // Steering one member into an older run would make that batch impossible
+      // to order or observe faithfully, so steering is reserved for a single
+      // recipient message.
+      if (input.steer && targets.length === 1 && !planMode && (await this.trySteer(threadId, target, message))) {
         steered.push(target);
         continue;
       }
+      const runId = createId("run");
+      const routing: A2ARoutingProjection = {
+        mode: routingMode,
+        index: targetIndex + 1,
+        total: targets.length,
+        batchId,
+        ...(routingMode === "serial" && predecessorRunId
+          ? { predecessorRunId }
+          : {}),
+      };
       await this.enqueueRun({
-        id: createId("run"),
+        id: runId,
         threadId,
         agentId: target,
         incomingMessageId: message.id,
@@ -392,8 +426,10 @@ export class MultiAgentPlatform {
         causal,
         createdAt: now(),
         purpose: "task",
+        routing,
         ...(planMode ? { mode: "plan" as const } : {}),
       });
+      if (routingMode === "serial") predecessorRunId = runId;
     }
     this.startScheduler();
     const completion = this.waitForChain(chainId);
@@ -466,6 +502,20 @@ export class MultiAgentPlatform {
       if (index >= 0) this.queue.splice(index, 1);
       await this.recordCancelled(run, reason);
       this.finishPendingRun(run);
+    }
+
+    for (const hold of [...this.pendingHolds.values()]) {
+      if (hold.chainId !== chainId) continue;
+      this.clearHoldTimer(hold.id);
+      this.pendingHolds.delete(hold.id);
+      await this.record({
+        type: "ball.hold_cancelled",
+        threadId: hold.threadId,
+        chainId,
+        holdId: hold.id,
+        reason,
+      });
+      this.finishPendingChain(chainId);
     }
 
     const cancellations: Promise<void>[] = [];
@@ -558,6 +608,10 @@ export class MultiAgentPlatform {
         });
       } else if (event.type === "clarification.requested") {
         this.runClarifications.set(event.runId, event.questions);
+      } else if (event.type === "ball.held") {
+        this.pendingHolds.set(event.hold.id, event.hold);
+      } else if (event.type === "ball.wake_sent" || event.type === "ball.hold_cancelled") {
+        this.pendingHolds.delete(event.holdId);
       } else if (event.type === "review.requested") {
         this.reviewRounds.set(event.taskRunId, event.round);
         this.reviewAuthors.set(event.reviewRunId, event.authorAgentId);
@@ -603,6 +657,12 @@ export class MultiAgentPlatform {
       }
     }
     this.hydrated = true;
+    for (const hold of this.pendingHolds.values()) {
+      // A durable hold is a live unit of work even though no invocation is
+      // currently running. Keep completion waiters open across restarts.
+      this.incrementPending(hold.chainId);
+      this.scheduleHold(hold);
+    }
 
     const interrupted: AgentRun[] = [];
     for (const run of this.runs.values()) {
@@ -654,6 +714,7 @@ export class MultiAgentPlatform {
         void this.executeRun(active).finally(() => {
           this.activeRuns.delete(active.run.id);
           this.forgetRunGateState(active.run.id);
+          this.runCustodyActions.delete(active.run.id);
           this.finishPendingRun(active.run);
           this.wakeScheduler();
         });
@@ -668,6 +729,8 @@ export class MultiAgentPlatform {
 
   private isEligible(run: AgentRun): boolean {
     if (!this.isRoutable(run.agentId)) return true;
+    const predecessor = run.routing?.predecessorRunId;
+    if (predecessor && !isTerminal(this.runStatuses.get(predecessor))) return false;
     if ([...this.activeRuns.values()].some((active) => active.run.agentId === run.agentId)) {
       return false;
     }
@@ -738,6 +801,17 @@ export class MultiAgentPlatform {
       threadId: run.threadId,
       agentId: run.agentId,
     });
+    const routing = run.routing ?? singleRouting(run.id);
+    await this.record({
+      type: "ball.handed",
+      threadId: run.threadId,
+      chainId: run.causal.chainId,
+      runId: run.id,
+      messageId: incoming.id,
+      holderAgentId: run.agentId,
+      ...(incoming.sender.type === "agent" ? { fromAgentId: incoming.sender.id } : {}),
+      routing,
+    });
 
     let completedOutput: string | undefined;
     try {
@@ -756,6 +830,7 @@ export class MultiAgentPlatform {
         incoming,
         context,
         ...(run.mode === "plan" ? { planMode: true as const } : {}),
+        routing,
         ...(attachments.length > 0 ? { attachments } : {}),
         ...(images.length > 0 ? { images } : {}),
         signal: controller.signal,
@@ -770,6 +845,7 @@ export class MultiAgentPlatform {
           : {}),
         emit: (event) => this.recordRuntimeEvent(active, event),
         postMessage: (message) => this.acceptAgentMessage(run, message),
+        holdBall: (input) => this.acceptBallHold(run, input),
         requestClarification: (input) => this.acceptClarificationRequest(run, input),
         declareDeliverable: (input) => this.acceptDeliverableDeclaration(run, input),
       });
@@ -816,6 +892,14 @@ export class MultiAgentPlatform {
           error: errorMessage(error),
         });
         this.runStatuses.set(run.id, "failed");
+        await this.record({
+          type: "invocation.died",
+          threadId: run.threadId,
+          chainId: run.causal.chainId,
+          runId: run.id,
+          agentId: run.agentId,
+          reason: errorMessage(error),
+        });
         await this.escalateReviewRun(run, `审核运行失败：${errorMessage(error)}`);
       }
     }
@@ -826,6 +910,7 @@ export class MultiAgentPlatform {
     // finishPendingRun — the chain cannot resolve while a review is owed.
     if (completedOutput !== undefined) {
       await this.advanceReview(run, completedOutput);
+      await this.maybeResolveBall(run);
     }
   }
 
@@ -868,6 +953,11 @@ export class MultiAgentPlatform {
 
     const parsed = parseAgentMentions(content, [...this.agents.values()], this.maxMentionTargets);
     const targets = parsed.targets.filter((target) => target !== sourceRun.agentId);
+    const collaborationIntent = normalizeCollaborationIntent(
+      input.collaborationIntent ?? input.intent,
+      targets.length > 0 ? "handoff" : "fyi",
+    );
+    const routingMode = normalizeRoutingMode(input.routingMode);
     const depth = sourceRun.causal.depth + 1;
     const message: ThreadMessage = {
       id: createId("msg"),
@@ -876,6 +966,8 @@ export class MultiAgentPlatform {
       kind: "collaboration",
       mentions: targets,
       content,
+      collaborationIntent,
+      routingMode,
       createdAt: now(),
       causal: {
         chainId: sourceRun.causal.chainId,
@@ -897,7 +989,26 @@ export class MultiAgentPlatform {
       );
     }
     if (targets.length === 0) {
+      if (collaborationIntent === "handoff") {
+        await this.record({
+          type: "ball.void_pass",
+          threadId: sourceRun.threadId,
+          chainId: sourceRun.causal.chainId,
+          runId: sourceRun.id,
+          messageId: message.id,
+        });
+      }
       return { accepted: true, targets: [], messageId: message.id };
+    }
+    if (
+      collaborationIntent === "handoff" &&
+      this.runCustodyActions.has(sourceRun.id)
+    ) {
+      return reject(
+        `This run already chose ${this.runCustodyActions.get(sourceRun.id)} as its next custody action`,
+        undefined,
+        message.id,
+      );
     }
     if (this.cancelledChains.has(sourceRun.causal.chainId)) {
       return reject("Collaboration chain is cancelled", undefined, message.id);
@@ -909,6 +1020,8 @@ export class MultiAgentPlatform {
     if (currentRunCount + targets.length > this.maxAgentRunsPerChain) {
       return reject(`Agent run limit exceeded (${this.maxAgentRunsPerChain})`, undefined, message.id);
     }
+    const batchId = createId("batch");
+    let predecessorRunId: Id | undefined = routingMode === "serial" ? sourceRun.id : undefined;
     for (const target of targets) {
       if (!this.isRoutable(target)) {
         return reject(`Agent @${target} is disabled or unavailable`, target, message.id);
@@ -922,7 +1035,7 @@ export class MultiAgentPlatform {
       }
     }
 
-    for (const target of targets) {
+    for (const [targetIndex, target] of targets.entries()) {
       await this.record({
         type: "routing.accepted",
         runId: sourceRun.id,
@@ -933,8 +1046,16 @@ export class MultiAgentPlatform {
       });
       const agent = this.agents.get(target);
       if (!agent) continue;
+      const runId = createId("run");
+      const routing: A2ARoutingProjection = {
+        mode: routingMode,
+        index: targetIndex + 1,
+        total: targets.length,
+        batchId,
+        ...(predecessorRunId ? { predecessorRunId } : {}),
+      };
       await this.enqueueRun({
-        id: createId("run"),
+        id: runId,
         threadId: sourceRun.threadId,
         agentId: target,
         incomingMessageId: message.id,
@@ -943,10 +1064,152 @@ export class MultiAgentPlatform {
         causal: message.causal as CausalMetadata,
         createdAt: now(),
         purpose: "task",
+        routing,
       });
+      if (routingMode === "serial") predecessorRunId = runId;
+    }
+    if (collaborationIntent === "handoff") {
+      this.runCustodyActions.set(sourceRun.id, "handoff");
     }
     this.startScheduler();
     return { accepted: true, targets, messageId: message.id };
+  }
+
+  private async acceptBallHold(
+    sourceRun: AgentRun,
+    input: HoldBallInput,
+  ): Promise<HoldBallResult> {
+    if (sourceRun.purpose === "review") {
+      return { accepted: false, reason: "A reviewer must finish with a verdict; it cannot hold the task ball" };
+    }
+    const existing = this.runCustodyActions.get(sourceRun.id);
+    if (existing) {
+      return { accepted: false, reason: `This run already chose ${existing} as its next custody action` };
+    }
+    if (!Number.isFinite(input.wakeAfterMs) || input.wakeAfterMs < 10 || input.wakeAfterMs > 86_400_000) {
+      return { accepted: false, reason: "wakeAfterMs must be between 10 ms and 24 hours" };
+    }
+    const waitSourceRef = normalizeWaitSourceRef(input.waitSourceRef);
+    if (!waitSourceRef) {
+      return {
+        accepted: false,
+        reason: "waitSourceRef.kind, value, and expectedSignal are required; vague waiting cannot keep custody",
+      };
+    }
+    const hold: PendingBallHold = {
+      id: createId("hold"),
+      runId: sourceRun.id,
+      threadId: sourceRun.threadId,
+      chainId: sourceRun.causal.chainId,
+      agentId: sourceRun.agentId,
+      wakeAt: new Date(Date.now() + Math.floor(input.wakeAfterMs)).toISOString(),
+      waitSourceRef,
+      causal: {
+        ...sourceRun.causal,
+        parentRunId: sourceRun.id,
+      },
+    };
+    this.pendingHolds.set(hold.id, hold);
+    this.runCustodyActions.set(sourceRun.id, "hold");
+    await this.record({ type: "ball.held", hold });
+    this.incrementPending(hold.chainId);
+    this.scheduleHold(hold);
+    return { accepted: true, holdId: hold.id, wakeAt: hold.wakeAt };
+  }
+
+  private scheduleHold(hold: PendingBallHold): void {
+    this.clearHoldTimer(hold.id);
+    const delay = Math.max(0, new Date(hold.wakeAt).getTime() - Date.now());
+    const timer = setTimeout(() => {
+      void this.fireHold(hold.id);
+    }, Math.min(delay, 2_147_000_000));
+    (timer as NodeJS.Timeout).unref?.();
+    this.holdTimers.set(hold.id, timer);
+  }
+
+  private clearHoldTimer(holdId: Id): void {
+    const timer = this.holdTimers.get(holdId);
+    if (timer) clearTimeout(timer);
+    this.holdTimers.delete(holdId);
+  }
+
+  private async fireHold(holdId: Id): Promise<void> {
+    const hold = this.pendingHolds.get(holdId);
+    if (!hold) return;
+    const remaining = new Date(hold.wakeAt).getTime() - Date.now();
+    if (remaining > 0) {
+      this.scheduleHold(hold);
+      return;
+    }
+    this.clearHoldTimer(hold.id);
+    this.pendingHolds.delete(hold.id);
+    try {
+      const agent = this.agents.get(hold.agentId);
+      if (!agent || !this.isRoutable(hold.agentId) || this.cancelledChains.has(hold.chainId)) {
+        await this.record({
+          type: "ball.hold_cancelled",
+          threadId: hold.threadId,
+          chainId: hold.chainId,
+          holdId: hold.id,
+          reason: this.cancelledChains.has(hold.chainId) ? "Collaboration chain was cancelled" : `Agent @${hold.agentId} is unavailable`,
+        });
+        return;
+      }
+      const message: ThreadMessage = {
+        id: createId("msg"),
+        threadId: hold.threadId,
+        sender: { type: "agent", id: hold.agentId },
+        kind: "wake",
+        mentions: [hold.agentId],
+        content: buildHoldWakeContent(hold),
+        intent: "external-condition-recheck",
+        collaborationIntent: "handoff",
+        routingMode: "serial",
+        createdAt: now(),
+        causal: hold.causal,
+      };
+      await this.addMessage(message);
+      const runId = createId("run");
+      await this.record({
+        type: "ball.wake_sent",
+        threadId: hold.threadId,
+        chainId: hold.chainId,
+        holdId: hold.id,
+        runId,
+        messageId: message.id,
+        agentId: hold.agentId,
+      });
+      await this.enqueueRun({
+        id: runId,
+        threadId: hold.threadId,
+        agentId: hold.agentId,
+        incomingMessageId: message.id,
+        status: "queued",
+        accessMode: agent.accessMode,
+        causal: hold.causal,
+        createdAt: now(),
+        purpose: "task",
+        routing: singleRouting(runId),
+      });
+      this.startScheduler();
+    } finally {
+      // enqueueRun acquires the next pending token before the durable hold
+      // releases its own, so chain completion cannot flicker between them.
+      this.finishPendingChain(hold.chainId);
+    }
+  }
+
+  private async maybeResolveBall(run: AgentRun): Promise<void> {
+    const action = this.runCustodyActions.get(run.id);
+    if (action === "hold" || action === "human") return;
+    if ((this.chainPendingCounts.get(run.causal.chainId) ?? 0) > 1) return;
+    await this.record({
+      type: "task.done",
+      threadId: run.threadId,
+      chainId: run.causal.chainId,
+      runId: run.id,
+      agentId: run.agentId,
+    });
   }
 
   // ---------------------------------------------------------------------------
@@ -958,7 +1221,7 @@ export class MultiAgentPlatform {
   // all escalate to the human), and nothing with side effects is auto-retried.
   // ---------------------------------------------------------------------------
 
-  /** The stable id of the task a run serves, across every rework round. */
+  /** The stable id of the task a run serves, across every discussion round. */
   private taskRunIdOf(run: AgentRun): Id {
     return run.taskRunId ?? run.id;
   }
@@ -969,7 +1232,7 @@ export class MultiAgentPlatform {
    * "required" gates every such run, which is what made a greeting cost a full
    * review round-trip. "smart" additionally asks what the run actually
    * produced: an Agent that declared a deliverable, a run that wrote files
-   * without declaring one, or a rework round already inside the gate. Plain
+   * without declaring one, or a discussion round already inside the gate. Plain
    * conversation declares nothing, touches nothing, and is reviewed by nobody.
    */
   private isReviewGated(run: AgentRun): boolean {
@@ -1036,7 +1299,7 @@ export class MultiAgentPlatform {
     const taskRunId = this.taskRunIdOf(run);
     if (this.isClarificationOnly(run)) {
       // Initial questions simply end this conversational turn. If a material
-      // question surfaced during rework, close the old review task explicitly
+      // question surfaced during discussion, close the old review task explicitly
       // so it cannot keep cycling or leave a stale pending gate behind.
       if ((run.reviewRound ?? 0) > 0) {
         await this.resolveClarificationDuringRework(run);
@@ -1115,7 +1378,7 @@ export class MultiAgentPlatform {
       intent: "review-request",
       createdAt: now(),
       // Review runs keep the author's depth. Spending A2A depth on the gate
-      // would leave a reworking Agent unable to collaborate at all.
+      // would leave an author in discussion unable to collaborate at all.
       causal: {
         chainId: run.causal.chainId,
         parentRunId: run.id,
@@ -1265,7 +1528,7 @@ export class MultiAgentPlatform {
   /**
    * Agents that produced work in this collaboration chain. Review runs are not
    * counted: a reviewer that already rejected round 1 is exactly who should
-   * judge the rework, and counting its own review would disqualify it.
+   * judge the next candidate, and counting its own review would disqualify it.
    */
   private chainContributors(chainId: Id): Set<Id> {
     const contributors = new Set<Id>();
@@ -1307,7 +1570,7 @@ export class MultiAgentPlatform {
         "escalated",
         round,
         "max-rounds",
-        `${round} 轮审核后仍未通过，需要人工判断`,
+        `${round} 轮协商后作者与审核者仍未达成一致，需要人类裁决`,
       );
       return;
     }
@@ -1320,7 +1583,7 @@ export class MultiAgentPlatform {
         "escalated",
         round,
         "review-failed",
-        `执行者 @${authorAgentId ?? "unknown"} 已不可用，无法返工`,
+        `作者 @${authorAgentId ?? "unknown"} 已不可用，无法继续协商`,
       );
       return;
     }
@@ -1401,11 +1664,22 @@ export class MultiAgentPlatform {
       ...(detail ? { detail } : {}),
       ...(reviewType ? { reviewType } : {}),
     });
+    if (outcome === "escalated" && reviewType !== "critique") {
+      this.runCustodyActions.set(run.id, "human");
+      await this.record({
+        type: "ball.handed_user",
+        threadId: run.threadId,
+        chainId: run.causal.chainId,
+        runId: run.id,
+        reason: "review-escalation",
+      });
+    }
     // A critique settling is not the end of a plan, only the end of the peer
-    // round. Approved or escalated, the plan now goes to the human — the peers
-    // advise, the human decides. Cancellation is the operator's own doing and
-    // asks nothing of them.
+    // round. Consensus or escalation both put the plan in front of the human:
+    // peers deliberate, while the human retains the final product decision.
+    // Cancellation is the operator's own doing and asks nothing of them.
     if (reviewType === "critique" && outcome !== "cancelled") {
+      this.runCustodyActions.set(run.id, "human");
       await this.awaitPlanApproval(
         run.threadId,
         taskRunId,
@@ -1438,7 +1712,7 @@ export class MultiAgentPlatform {
       rounds: run.reviewRound ?? 0,
       escalation: "clarification-needed",
       detail: questions.length > 0
-        ? `执行者需要你先补充：${questions.join("；")}`
+        ? `执行者需要你先补充：${questions.map((question) => typeof question === "string" ? question : question.question).join("；")}`
         : "执行者需要你先补充关键信息，再继续方案或执行",
       ...(run.reviewType ? { reviewType: run.reviewType } : {}),
     });
@@ -1500,6 +1774,17 @@ export class MultiAgentPlatform {
       ...(peerSummary ? { peerSummary } : {}),
       ...(escalation ? { escalation } : {}),
     });
+    const planRun = this.runs.get(approval.planRunId);
+    if (planRun) {
+      this.runCustodyActions.set(planRun.id, "human");
+      await this.record({
+        type: "ball.handed_user",
+        threadId,
+        chainId: planRun.causal.chainId,
+        runId: planRun.id,
+        reason: "plan-approval",
+      });
+    }
   }
 
   /**
@@ -1570,16 +1855,22 @@ export class MultiAgentPlatform {
         reason: "this run already changed the workspace; clarification must happen before execution",
       };
     }
+    const custodyAction = this.runCustodyActions.get(run.id);
+    if (custodyAction) {
+      return { accepted: false, reason: `this run already chose ${custodyAction} as its next custody action` };
+    }
     const questions = (input.questions ?? [])
-      .map((question) => question.trim())
-      .filter(Boolean);
+      .map((question) => typeof question === "string"
+        ? question.trim()
+        : { ...question, question: question.question.trim(), ...(question.options ? { options: question.options.filter((option) => option.label.trim()).map((option) => ({ ...option, label: option.label.trim() })) } : {}) })
+      .filter((question) => typeof question === "string" ? Boolean(question) : Boolean(question.question));
     if (questions.length === 0) {
       return { accepted: false, reason: "at least one clarification question is required" };
     }
     if (questions.length > 5) {
       return { accepted: false, reason: "ask at most five focused clarification questions" };
     }
-    if (questions.some((question) => question.length > 2_000)) {
+    if (questions.some((question) => (typeof question === "string" ? question : question.question).length > 2_000)) {
       return { accepted: false, reason: "each clarification question must be at most 2,000 characters" };
     }
     if (this.runClarifications.has(run.id)) {
@@ -1592,6 +1883,14 @@ export class MultiAgentPlatform {
       threadId: run.threadId,
       agentId: run.agentId,
       questions,
+    });
+    this.runCustodyActions.set(run.id, "human");
+    await this.record({
+      type: "ball.handed_user",
+      threadId: run.threadId,
+      chainId: run.causal.chainId,
+      runId: run.id,
+      reason: "clarification",
     });
     return { accepted: true };
   }
@@ -1977,6 +2276,14 @@ export class MultiAgentPlatform {
       reason,
     });
     this.runStatuses.set(run.id, "cancelled");
+    await this.record({
+      type: "ball.cancelled",
+      threadId: run.threadId,
+      chainId: run.causal.chainId,
+      runId: run.id,
+      agentId: run.agentId,
+      reason,
+    });
     await this.escalateReviewRun(run, `审核被取消：${reason}`);
   }
 
@@ -1989,6 +2296,14 @@ export class MultiAgentPlatform {
       reason,
     });
     this.runStatuses.set(run.id, "interrupted");
+    await this.record({
+      type: "invocation.died",
+      threadId: run.threadId,
+      chainId: run.causal.chainId,
+      runId: run.id,
+      agentId: run.agentId,
+      reason,
+    });
     await this.escalateReviewRun(run, `审核被中断：${reason}`);
   }
 
@@ -2007,7 +2322,10 @@ export class MultiAgentPlatform {
   }
 
   private finishPendingRun(run: AgentRun): void {
-    const chainId = run.causal.chainId;
+    this.finishPendingChain(run.causal.chainId);
+  }
+
+  private finishPendingChain(chainId: Id): void {
     const next = Math.max(0, (this.chainPendingCounts.get(chainId) ?? 1) - 1);
     if (next > 0) {
       this.chainPendingCounts.set(chainId, next);
@@ -2181,7 +2499,8 @@ function buildReviewRequestContent(input: {
   // The two briefs differ in what counts as doing the job: a plan is judged on
   // its reasoning, finished work on the artifacts it claims to have produced.
   // Both start from disbelief: an author's "done" is a claim to test, never a
-  // fact to take on trust, and agreement is what has to be earned here.
+  // fact to take on trust. Later rounds are deliberation, though, not an order
+  // followed by a compliance check: both peers may change their minds.
   const brief =
     input.reviewType === "critique"
       ? [
@@ -2189,7 +2508,7 @@ function buildReviewRequestContent(input: {
           "This is a plan, not finished work. Try to break it before anyone builds it.",
           "Judge it against the human's original task above, not against the author's framing of that task.",
           "Attack the assumptions it never argues for, the failure modes it skips, and the work it hides behind one line.",
-          "approved means you would put your own name on executing it as written. changes-requested returns concrete suggestions for one revision round.",
+          "approved means you and the author have reached a version you would put your own name on executing as written. changes-requested states concrete objections for the next discussion round.",
         ]
       : [
           "Your default position is not-approved. The burden of proof is on the author's claim, not on your doubt.",
@@ -2197,8 +2516,17 @@ function buildReviewRequestContent(input: {
           "Go to the primary sources yourself: open the files it says it changed, run the commands it says it ran, read the real output.",
           "Look for what the claim would hide: dropped requirements from the original task, untouched edge cases, error paths, tests that assert nothing, changes it never mentioned.",
           "Anything you could not check with the access you have is unverified. Say so plainly, and never approve on it.",
-          "Do not redo the work yourself. Say concretely what must change.",
+          "Do not redo the work yourself. State concrete objections and the evidence behind them.",
         ];
+  const deliberation = input.round > 1
+    ? [
+        "This is a continued peer discussion, not a compliance inspection.",
+        "Read the author's latest response and candidate on their merits. They may have changed the work, rebutted your earlier objection with evidence, or proposed a better alternative.",
+        "Acknowledge sound reasoning and withdraw or refine objections when warranted. Never repeat an earlier finding without addressing the author's answer to it.",
+      ]
+    : [
+        "Your findings are peer arguments, not orders. The author may adopt them, rebut them with evidence, or propose an alternative in the next round.",
+      ];
   const independence = input.independent
     ? []
     : [
@@ -2218,10 +2546,12 @@ function buildReviewRequestContent(input: {
     "</deliverable>",
     "",
     ...brief,
+    ...deliberation,
     ...independence,
     "Finish by calling submit_review exactly once: approved, or changes-requested with concrete findings.",
     "approved requires listing at least one check you ran yourself; an approval that cannot name one is rejected.",
-    "Do not manufacture agreement to close the loop. A review that finds nothing has usually not looked.",
+    "The goal is a final candidate both peers can stand behind, not obedience to the reviewer and not victory for either side.",
+    "Do not manufacture agreement to close the loop. If material disagreement remains in the final round, request changes so the platform asks the human to decide.",
     "Ending without submit_review is not an approval — it escalates the task to the human.",
   ].join("\n");
 }
@@ -2284,15 +2614,19 @@ function buildReviewFeedbackContent(input: {
   const findings = input.submission.findings ?? [];
   const closing =
     input.reviewType === "critique"
-      ? `Revise your plan to address these. Round ${input.round + 1} will review the revision.`
-      : `Fix these and deliver again. Round ${input.round + 1} will verify your update.`;
+      ? `Continue the discussion and then submit a complete, self-contained candidate plan for round ${input.round + 1}.`
+      : `Continue the discussion and then present the complete candidate delivery for round ${input.round + 1}.`;
   return [
-    `@${input.authorAgentId} Review round ${input.round} of ${input.maxRounds}: changes requested.`,
+    `@${input.authorAgentId} Peer review round ${input.round} of ${input.maxRounds}: the reviewer raised objections.`,
     "",
     input.submission.summary,
     ...(findings.length > 0 ? ["", "Findings:", ...findings.map((f) => `- ${f}`)] : []),
     "",
+    "These are a peer's arguments, not instructions. Judge each one yourself: adopt it when it is right, rebut it with evidence when it is wrong, or propose a better alternative.",
+    "Respond naturally in your next delivery; no separate accept/reject action or point-by-point form is required. Explain the reasoning that matters so the reviewer can reconsider rather than merely check compliance.",
+    "Your next output is the candidate the reviewer will judge, so include the complete final result, not only a rebuttal or a change list.",
     closing,
+    `If you still disagree after round ${input.maxRounds}, preserve the disputed reasoning clearly; the platform will ask the human to decide rather than forcing either peer to yield.`,
   ].join("\n");
 }
 
@@ -2302,12 +2636,66 @@ function cursorKey(threadId: Id, agentId: Id): string {
 
 /**
  * The per-chain run budget bounds Agent-initiated fan-out, which is unbounded
- * and adversarial. Review and rework runs are platform-initiated and already
+ * and adversarial. Review and discussion runs are platform-initiated and already
  * bounded by maxReviewRounds, so counting them would let an Agent's A2A spend
  * strand a task mid-gate.
  */
 function countsTowardChainBudget(run: AgentRun): boolean {
   return (run.purpose ?? "task") === "task" && (run.reviewRound ?? 0) === 0;
+}
+
+function normalizeRoutingMode(value: unknown): A2ARoutingMode {
+  if (value === undefined) return "serial";
+  if (value === "serial" || value === "parallel") return value;
+  throw new Error("routingMode must be serial or parallel");
+}
+
+function normalizeCollaborationIntent(
+  value: unknown,
+  fallback: CollaborationIntent,
+): CollaborationIntent {
+  return value === "handoff" || value === "fyi" || value === "done_notify"
+    ? value
+    : fallback;
+}
+
+function normalizeWaitSourceRef(value: WaitSourceRef | undefined): WaitSourceRef | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const kind = typeof value.kind === "string" ? value.kind.trim() : "";
+  const stableValue = typeof value.value === "string" ? value.value.trim() : "";
+  const expectedSignal = typeof value.expectedSignal === "string"
+    ? value.expectedSignal.trim()
+    : "";
+  if (!kind || !stableValue || !expectedSignal) return undefined;
+  const slaUntil = typeof value.slaUntil === "string" && !Number.isNaN(Date.parse(value.slaUntil))
+    ? new Date(value.slaUntil).toISOString()
+    : undefined;
+  return {
+    kind: kind.slice(0, 120),
+    value: stableValue.slice(0, 1_000),
+    expectedSignal: expectedSignal.slice(0, 1_000),
+    ...(slaUntil ? { slaUntil } : {}),
+  };
+}
+
+function singleRouting(batchId: Id): A2ARoutingProjection {
+  return { mode: "serial", index: 1, total: 1, batchId };
+}
+
+function buildHoldWakeContent(hold: PendingBallHold): string {
+  return [
+    `@${hold.agentId} Your managed wait has fired. You still own the ball.`,
+    "",
+    "<wait-source>",
+    `kind: ${hold.waitSourceRef.kind}`,
+    `value: ${hold.waitSourceRef.value}`,
+    `expected_signal: ${hold.waitSourceRef.expectedSignal}`,
+    ...(hold.waitSourceRef.slaUntil ? [`sla_until: ${hold.waitSourceRef.slaUntil}`] : []),
+    `scheduled_wake_at: ${hold.wakeAt}`,
+    "</wait-source>",
+    "",
+    "Re-check the named external condition from primary evidence. Then choose exactly one next action: hand off to a peer, hold again with fresh grounding, or finish/ask the human when only they can decide.",
+  ].join("\n");
 }
 
 function unorderedPair(first: string, second: string): string {

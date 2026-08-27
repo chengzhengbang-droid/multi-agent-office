@@ -158,6 +158,8 @@ test("a peer-approved plan waits for the human instead of being executed", async
   assert.match(awaiting.plan, /删旧代码/);
   // Peer approval settles the critique, not the plan: no execution run exists.
   assert.equal(countEvents(events, "plan.decided"), 0);
+  assert.equal(countEvents(events, "ball.handed_user"), 1);
+  assert.equal(countEvents(events, "task.done"), 0);
   const taskRuns = queuedRuns(events).filter((run) => run.purpose === "task");
   assert.equal(taskRuns.length, 1);
   const pending = await platform.getPendingPlanApprovals();
