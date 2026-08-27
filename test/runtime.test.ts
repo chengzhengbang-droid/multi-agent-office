@@ -283,7 +283,7 @@ process.on("SIGTERM", () => process.exit(0));
     const rpc = records.filter((record) => record.kind === "rpc").map((record) => record.value as Record<string, unknown>);
     const started = rpc.find((message) => message.method === "thread/start");
     const startParams = started?.params as { dynamicTools?: Array<{ name: string }> };
-    assert.deepEqual(startParams.dynamicTools?.map((tool) => tool.name), ["post_message", "submit_review", "request_clarification", "complete_task", "submit_plan"]);
+    assert.deepEqual(startParams.dynamicTools?.map((tool) => tool.name), ["post_message", "hold_ball", "submit_review", "request_clarification", "complete_task", "submit_plan"]);
     assert.equal(JSON.stringify(started).includes("mcp_servers"), false);
     assert.equal(rpc.some((message) => message.method === "thread/resume" && (message.params as { threadId?: string }).threadId === "codex-session-123"), true);
   } finally {
@@ -403,6 +403,7 @@ function request(runId: string, events: RuntimeEvent[], signal = new AbortContro
     signal,
     emit: async (event) => { events.push(event); },
     postMessage: async () => ({ accepted: true, targets: [] }),
+    holdBall: async () => ({ accepted: true, holdId: "hold-test" }),
     requestClarification: async () => ({ accepted: true }),
     declareDeliverable: async () => ({ accepted: true }),
   };

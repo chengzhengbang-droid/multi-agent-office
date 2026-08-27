@@ -37,14 +37,26 @@ Agent 交付的成果要由**另一个** Agent 把关后才算完成：自称做
 
 ## 路由语义
 
-- 用户可以在普通正文中写 `@handle`，一条消息最多唤醒两个不同 Agent。
+- 用户可以在普通正文中写 `@handle`，一条消息最多唤醒三个不同 Agent。
 - 代码块、行内代码、URL 和引用字符串中的 `@handle` 不参与路由。
 - 没有显式 mention 时，依次选择该 Thread 最近成功回复且在线的 Agent、花名册中配置的默认 Agent、第一个在线 Agent。
-- Agent 只能通过结构化 `post_message({ content, intent?, idempotencyKey })` 发布协作消息并触发 A2A；目标从行首、列表或引用前缀后的 `@handle` 解析。
+- 用户与 Agent 的多目标消息都有明确 `routingMode`：默认 `serial`，按 mention 顺序逐棒执行；选择 `parallel` 时才并行扇出。平台不再从自然语言猜测并发意图。
+- Agent 只能通过结构化 `post_message({ content, collaborationIntent, routingMode, idempotencyKey })` 发布协作消息并触发 A2A；目标从行首、列表或引用前缀后的 `@handle` 解析。`collaborationIntent` 为 `handoff`（交棒）、`fyi`（仅同步）或 `done_notify`（完成通知）。
 - 普通最终输出中的 `@handle` 永远不会触发另一个 Agent。
 - 未知、停用或离线目标会返回明确错误，不会静默回退。
 
 平台保留深度 4、每条协作链最多 8 次运行、幂等去重、同一对 Agent 连续 4 次乒乓限制和整链取消。
+
+### Clowder 风格的协作内核
+
+多 Agent 框架参考 [clowder-ai](https://github.com/zts212653/clowder-ai) 的交互模型，落成四个彼此独立、可回放的协议层：
+
+- **显式路由**：`serial` 是有前驱约束的顺序交棒，`parallel` 是同一批次的独立分支；每个 run 持有 `batchId / index / total / predecessorRunId` 投影。
+- **球权（ball custody）**：`ball.handed`、`ball.held`、`ball.wake_sent`、`ball.handed_user`、`ball.void_pass`、`task.done` 等事件构成唯一事实源。球权状态可从 JSONL 事件重建，不依赖内存里的隐式布尔值。
+- **有依据的等待**：Agent 可调用 `hold_ball({ wakeAfterMs, waitSourceRef })` 暂存球权；`waitSourceRef` 必须说明等待对象、预期信号和可选 SLA。到时平台给原 Agent 发送 `wake` 消息并恢复同一协作链；重启后未到期的等待会重新挂载，取消整链也会取消等待。
+- **分层协作提示**：Pi 与 Codex 都注入 L0–L7 协议层，依次覆盖身份、平行世界认知、客观事实继承、路由与球权、安全法则、交付/审核协议、实时花名册和协作哲学。实时 roster、当前路由位置与可用工具不再散落在一段不可审计的提示词中。
+
+原有的同侪审核、计划模式、写锁和深度/乒乓保护继续作为本地策略层运行；它们不替代路由和球权协议。
 
 ## 同侪审核
 
@@ -61,7 +73,7 @@ Agent 交付的成果要由**另一个** Agent 把关后才算完成：自称做
 - 协商最多 `MAO_MAX_REVIEW_ROUNDS`（默认 2）轮。目标是一版双方都愿意负责的结果，而不是谁服从谁；轮数用满仍有实质分歧时，平台保留双方理由并升级给用户裁决，不强迫任何 Agent 假装同意。
 - 以下四种情况一律记为"需要人工介入"，**绝不当作通过**：没有其他可用 Agent 可以审核；审核 run 结束却没有调用 `submit_review`；审核 run 失败或审核者中途不可用；协商轮数用尽仍未达成共识。
 - 整链取消会一并取消进行中的审核，标记为"已取消"而不是升级——那是人工动作，不是质量信号。
-- 审核与协商 run 由平台发起，不占用每链 8 次运行的额度，也不增加 A2A 深度或乒乓计数；它们只受审核轮数约束。用户消息可指定两个 Agent，沿用 A2A 额度会随机撞限。
+- 审核与协商 run 由平台发起，不占用每链 8 次运行的额度，也不增加 A2A 深度或乒乓计数；它们只受审核轮数约束。用户消息可指定三个 Agent，沿用 A2A 额度会随机撞限。
 - A2A 协作产生的 run（depth ≥ 1）不进入审核门，只有用户直接发起的任务会。
 - 用户插话不会新建 run，因此沿用当前这一轮所属任务的审核状态。
 - `MAO_REVIEW_GATE=on`（或 `required`）恢复旧行为：用户发起的每个任务一律送审，包括一句"你好"。`MAO_REVIEW_GATE=off` 关闭审核，只用于演示和离线测试。
@@ -220,7 +232,7 @@ pnpm demo -- --plan --reject
 
 - `GET /api/agents`：安全花名册、revision、运行时在线/认证状态。
 - `PUT /api/agents`：用 revision 乐观锁原子替换花名册；不接受或返回密钥。
-- `POST /api/messages`：接收 `content`、可选 `threadId`、新 Thread 的 `workspacePath`、`attachments`（PNG/JPEG/WebP/GIF，最多 4 张、每张 5 MB）、`steer` 和 `planMode`。
+- `POST /api/messages`：接收 `content`、可选 `threadId`、新 Thread 的 `workspacePath`、`attachments`（PNG/JPEG/WebP/GIF，最多 4 张、每张 5 MB）、`steer`、`planMode` 和 `routingMode`（`serial` / `parallel`，默认串行）。
 - `GET /api/plans?threadId=`：正在等待人工拍板的方案。
 - `POST /api/plans/:taskRunId/decision`：人工拍板，接收 `decision`（`approved` / `rejected`）与 `note`；打回时 `note` 必填。
 - `POST /api/chains/:chainId/cancel`：取消整条协作链。
@@ -230,7 +242,7 @@ pnpm demo -- --plan --reject
 - `GET /api/agents/:agentId/session?threadId=`：该 Agent 在此 Thread 的 session 统计。
 - `POST /api/agents/:agentId/session?threadId=&action=compact|export&format=html|jsonl`：手动压缩上下文或导出 session。
 
-Codex 通过 app-server 的原生动态 tool 暴露 `post_message`、`submit_review`、`request_clarification`、`complete_task` 与 `submit_plan`，tool handler 在同一进程内直接调用平台能力，不再启动自建 MCP server，也不再经过本机 HTTP callback。Pi Agent 同样使用进程内 tool；所有澄清请求、verdict、checks、findings 与交付声明都直接交给平台校验。Codex 会话协议有独立版本标记，升级 tool contract 后不会误续接缺少新工具的旧会话。
+Codex 通过 app-server 的原生动态 tool 暴露 `post_message`、`hold_ball`、`submit_review`、`request_clarification`、`complete_task` 与 `submit_plan`，tool handler 在同一进程内直接调用平台能力，不再启动自建 MCP server，也不再经过本机 HTTP callback。Pi Agent 同样使用进程内 tool；所有路由、等待、澄清请求、verdict、checks、findings 与交付声明都直接交给平台校验。Codex 会话协议有独立版本标记，升级 tool contract 后不会误续接缺少新工具的旧会话。
 
 ## 验证
 
@@ -240,7 +252,7 @@ pnpm test
 pnpm build
 ```
 
-测试覆盖花名册、mention 解析、对等路由、A2A、幂等与乒乓限制、读写调度、整链取消、上下文游标、session 隔离、Codex app-server 首次执行与 resume、原生动态 tool 调用、Pi 凭据判定、多 provider 凭据互不覆盖、Agent 头像标识去重、可观测性事件投影、运行中插话与回退、图片附件，以及现有历史事件的完整兼容回放。
+测试覆盖花名册、mention 解析、显式串行/并行路由、球权事件投影、`hold_ball` 唤醒、A2A、幂等与乒乓限制、读写调度、整链取消、上下文游标、session 隔离、Codex app-server 首次执行与 resume、原生动态 tool 调用、Pi 凭据判定、多 provider 凭据互不覆盖、Agent 头像标识去重、可观测性事件投影、运行中插话与回退、图片附件，以及现有历史事件的完整兼容回放。
 
 审核相关覆盖：强制送审与审核者选取（配置优先、离线回退、同链共作者让位给未参与的同侪、无人可让时仍然送审并标记为不中立）、怀疑立场与平等协商（审核简报要求自己查一手材料、意见不是命令、作者可自然反驳、后续轮必须重新评价、`approved` 缺少自查项被拒、`changes-requested` 不要求自查项）、达成共识后终结、存在异议时继续协商、轮数上限交给人类裁决、无结论/无审核者/审核失败一律不通过、审核中取消、重启后中断的审核升级、审核 run 不占用链额度与深度、审核者不会变成 Thread 的默认应答者，以及旧日志回放不补发审核。smart 门另有覆盖：闲聊不送审、阻塞性问题先澄清且不送审、计划模式与强制门同样尊重澄清、协商时发现人类决策会终止审核循环、声明完成走 verify 且证据进入审核简报、提交方案走 critique 且协商轮仍是 critique、改文件不声明也送审、只读运行与 shell 读命令不触发、审核者不能自我声明、声明不能改口径，以及带声明的日志回放。
 

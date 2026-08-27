@@ -44,7 +44,7 @@ interface TurnCompletion {
  * changes so sessions created by the old `codex exec` + MCP adapter are not
  * resumed without the native tools.
  */
-export const CODEX_SESSION_PROTOCOL = "app-server-dynamic-tools-v2";
+export const CODEX_SESSION_PROTOCOL = "app-server-dynamic-tools-v3-clowder-routing";
 
 export class CodexRuntimeAdapter implements AgentRuntime {
   public readonly id: string;
@@ -433,15 +433,42 @@ function codexDynamicTools(): Array<Record<string, unknown>> {
       type: "function",
       name: "post_message",
       description:
-        "Post a visible message to the shared multi-Agent thread. Put a teammate's @handle at the start of a line to wake them.",
+        "Post a visible structured collaboration message. handoff transfers the next action; fyi does not. Multi-target dispatch is serial unless routingMode is explicitly parallel.",
       inputSchema: {
         type: "object",
         properties: {
           content: { type: "string", minLength: 1, maxLength: 20_000 },
           intent: { type: "string" },
+          collaborationIntent: { type: "string", enum: ["handoff", "fyi", "done_notify"] },
+          routingMode: { type: "string", enum: ["serial", "parallel"] },
           idempotencyKey: { type: "string", minLength: 1 },
         },
         required: ["content", "idempotencyKey"],
+        additionalProperties: false,
+      },
+    },
+    {
+      type: "function",
+      name: "hold_ball",
+      description:
+        "Keep custody while waiting for a named external condition. Requires grounded waitSourceRef; the platform persists the hold and wakes this Agent after wakeAfterMs.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          wakeAfterMs: { type: "number", minimum: 10, maximum: 86_400_000 },
+          waitSourceRef: {
+            type: "object",
+            properties: {
+              kind: { type: "string", minLength: 1 },
+              value: { type: "string", minLength: 1 },
+              expectedSignal: { type: "string", minLength: 1 },
+              slaUntil: { type: "string" },
+            },
+            required: ["kind", "value", "expectedSignal"],
+            additionalProperties: false,
+          },
+        },
+        required: ["wakeAfterMs", "waitSourceRef"],
         additionalProperties: false,
       },
     },
@@ -514,10 +541,14 @@ async function executeDynamicTool(
     if (!args) throw new Error("Tool arguments must be an object");
     if (tool === "post_message") {
       const intent = optionalString(args, "intent");
+      const collaborationIntent = optionalCollaborationIntent(args.collaborationIntent);
+      const routingMode = optionalRoutingMode(args.routingMode);
       const result = await request.postMessage({
         content: requiredString(args, "content"),
         idempotencyKey: requiredString(args, "idempotencyKey"),
         ...(intent ? { intent } : {}),
+        ...(collaborationIntent ? { collaborationIntent } : {}),
+        ...(routingMode ? { routingMode } : {}),
       });
       return toolResult(
         result.accepted,
@@ -526,6 +557,30 @@ async function executeDynamicTool(
             ? `Visible message routed to ${result.targets.map((id) => `@${id}`).join(", ")}.`
             : "Visible message posted without waking another Agent."
           : `Message routing rejected: ${result.reason ?? "unknown reason"}`,
+      );
+    }
+    if (tool === "hold_ball") {
+      const waitSourceRef = asRecord(args.waitSourceRef);
+      if (!waitSourceRef) throw new Error("waitSourceRef is required");
+      const wakeAfterMs = args.wakeAfterMs;
+      if (typeof wakeAfterMs !== "number" || !Number.isFinite(wakeAfterMs)) {
+        throw new Error("wakeAfterMs must be a number");
+      }
+      const slaUntil = optionalString(waitSourceRef, "slaUntil");
+      const result = await request.holdBall({
+        wakeAfterMs,
+        waitSourceRef: {
+          kind: requiredString(waitSourceRef, "kind"),
+          value: requiredString(waitSourceRef, "value"),
+          expectedSignal: requiredString(waitSourceRef, "expectedSignal"),
+          ...(slaUntil ? { slaUntil } : {}),
+        },
+      });
+      return toolResult(
+        result.accepted,
+        result.accepted
+          ? `Ball held until ${result.wakeAt}. End this turn; the platform will wake you.`
+          : `Ball hold rejected: ${result.reason ?? "unknown reason"}`,
       );
     }
     if (tool === "submit_review") {
@@ -740,6 +795,20 @@ function requiredString(record: Record<string, unknown>, key: string): string {
 function optionalString(record: Record<string, unknown>, key: string): string | undefined {
   const value = record[key];
   return typeof value === "string" && value ? value : undefined;
+}
+
+function optionalCollaborationIntent(
+  value: unknown,
+): "handoff" | "fyi" | "done_notify" | undefined {
+  if (value === undefined) return undefined;
+  if (value === "handoff" || value === "fyi" || value === "done_notify") return value;
+  throw new Error("collaborationIntent must be handoff, fyi, or done_notify");
+}
+
+function optionalRoutingMode(value: unknown): "serial" | "parallel" | undefined {
+  if (value === undefined) return undefined;
+  if (value === "serial" || value === "parallel") return value;
+  throw new Error("routingMode must be serial or parallel");
 }
 
 function optionalStringArray(record: Record<string, unknown>, key: string): string[] | undefined {

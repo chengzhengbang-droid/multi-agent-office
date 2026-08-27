@@ -238,6 +238,10 @@ const server = createServer(async (request, response) => {
         sendJson(response, 400, { error: "任务内容不能为空且不能超过 20,000 字符" });
         return;
       }
+      if (body.routingMode !== undefined && body.routingMode !== "serial" && body.routingMode !== "parallel") {
+        sendJson(response, 400, { error: "routingMode 必须是 serial 或 parallel" });
+        return;
+      }
       if (threadId && !(await threadExists(threadId))) {
         sendJson(response, 404, { error: "任务不存在或已无法恢复" });
         return;
@@ -264,6 +268,9 @@ const server = createServer(async (request, response) => {
           ...(attachments.length > 0 ? { attachments } : {}),
           ...(body.steer === true ? { steer: true } : {}),
           ...(body.planMode === true ? { planMode: true } : {}),
+          ...(body.routingMode === "serial" || body.routingMode === "parallel"
+            ? { routingMode: body.routingMode }
+            : {}),
         });
         void started.completion.catch((error: unknown) => {
           console.error("Background Agent chain failed", error);

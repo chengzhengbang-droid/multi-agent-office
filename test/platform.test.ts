@@ -150,8 +150,71 @@ test("runs read-only peers concurrently", async () => {
       ["codex", runtime("codex", handler)],
     ]),
   );
-  await platform.postUserMessage({ content: "@pi @codex research" });
+  await platform.postUserMessage({ content: "@pi @codex research", routingMode: "parallel" });
   assert.equal(maximum, 2);
+});
+
+test("defaults multi-Agent dispatch to an honest serial worklist", async () => {
+  let active = 0;
+  let maximum = 0;
+  const order: string[] = [];
+  const handler = async (request: RuntimeRequest): Promise<RuntimeResult> => {
+    active++;
+    maximum = Math.max(maximum, active);
+    order.push(request.agent.id);
+    assert.equal(request.routing?.mode, "serial");
+    await delay(20);
+    active--;
+    return emitOutput(request, request.agent.id);
+  };
+  const platform = createPlatform(
+    [agent("pi", "read-only"), agent("codex", "read-only")],
+    new Map([
+      ["pi", runtime("pi", handler)],
+      ["codex", runtime("codex", handler)],
+    ]),
+  );
+
+  await platform.postUserMessage({ content: "@pi @codex inspect in order" });
+  assert.equal(maximum, 1);
+  assert.deepEqual(order, ["pi", "codex"]);
+});
+
+test("hold_ball persists grounded custody and wakes the same Agent", async () => {
+  let calls = 0;
+  const platform = createPlatform(
+    [agent("pi", "read-only")],
+    new Map([
+      ["pi", runtime("pi", async (request) => {
+        calls++;
+        if (request.incoming.kind !== "wake") {
+          const held = await request.holdBall({
+            wakeAfterMs: 20,
+            waitSourceRef: {
+              kind: "ci",
+              value: "build-42",
+              expectedSignal: "terminal status",
+            },
+          });
+          assert.equal(held.accepted, true);
+        }
+        return emitOutput(request, request.incoming.kind);
+      })],
+    ]),
+    "pi",
+  );
+
+  const started = await platform.startUserMessage({ content: "@pi wait for CI" });
+  let completed = false;
+  void started.completion.then(() => { completed = true; });
+  await delay(10);
+  assert.equal(completed, false, "a persisted hold keeps the collaboration chain open");
+  await started.completion;
+  const events = await platform.getEvents();
+  assert.equal(calls, 2);
+  assert.equal(countEvents(events, "ball.held"), 1);
+  assert.equal(countEvents(events, "ball.wake_sent"), 1);
+  assert.equal(countEvents(events, "run.completed"), 2);
 });
 
 test("serializes writers in the same workspace", async () => {

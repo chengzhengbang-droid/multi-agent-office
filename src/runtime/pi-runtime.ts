@@ -50,10 +50,16 @@ export class PiRuntimeAdapter implements AgentRuntime {
       name: "post_message",
       label: "Post a visible collaboration message",
       description:
-        "Post a visible message to the shared thread. Put a teammate's @handle at the start of a line to wake them. Ordinary assistant output never routes.",
+        "Post a visible structured collaboration message. Use handoff when the peer owns the next action, fyi for non-blocking context, and done_notify for a completion notice. Multi-target work is serial unless routingMode is explicitly parallel.",
       parameters: Type.Object({
         content: Type.String({ description: "Visible shared-thread message" }),
         intent: Type.Optional(Type.String({ description: "Short collaboration intent" })),
+        collaborationIntent: Type.Optional(
+          Type.Union([Type.Literal("handoff"), Type.Literal("fyi"), Type.Literal("done_notify")]),
+        ),
+        routingMode: Type.Optional(
+          Type.Union([Type.Literal("serial"), Type.Literal("parallel")]),
+        ),
         idempotencyKey: Type.String({
           description: "A unique stable key for this logical post within the current run",
         }),
@@ -63,6 +69,8 @@ export class PiRuntimeAdapter implements AgentRuntime {
           content: params.content,
           idempotencyKey: params.idempotencyKey,
           ...(params.intent ? { intent: params.intent } : {}),
+          ...(params.collaborationIntent ? { collaborationIntent: params.collaborationIntent } : {}),
+          ...(params.routingMode ? { routingMode: params.routingMode } : {}),
         };
         const result = await request.postMessage(message);
         return {
@@ -76,6 +84,34 @@ export class PiRuntimeAdapter implements AgentRuntime {
                 : `Message routing rejected: ${result.reason ?? "unknown reason"}`,
             },
           ],
+          details: result,
+        };
+      },
+    });
+
+    const holdBallTool = defineTool({
+      name: "hold_ball",
+      label: "Keep custody while waiting on an external condition",
+      description:
+        "Use only when an external condition must be re-checked later and no structured callback already covers it. A concrete waitSourceRef is mandatory. The platform persists the hold, ends this invocation, and wakes you with the same custody after the delay.",
+      parameters: Type.Object({
+        wakeAfterMs: Type.Number({ minimum: 10, maximum: 86_400_000 }),
+        waitSourceRef: Type.Object({
+          kind: Type.String(),
+          value: Type.String(),
+          expectedSignal: Type.String(),
+          slaUntil: Type.Optional(Type.String()),
+        }),
+      }),
+      execute: async (_toolCallId, params) => {
+        const result = await request.holdBall(params);
+        return {
+          content: [{
+            type: "text",
+            text: result.accepted
+              ? `Ball held until ${result.wakeAt}. End this turn; the platform will wake you.`
+              : `Ball hold rejected: ${result.reason ?? "unknown reason"}`,
+          }],
           details: result,
         };
       },
@@ -268,6 +304,7 @@ export class PiRuntimeAdapter implements AgentRuntime {
       modelRuntime,
       customTools: [
         postMessageTool,
+        holdBallTool,
         submitReviewTool,
         requestClarificationTool,
         completeTaskTool,
@@ -652,10 +689,37 @@ export function buildSystemPrompt(request: RuntimeRequest): string {
     )
     .join("\n");
   return [
+    "── [L0 · Identity] ──",
     request.agent.systemPrompt,
     "",
-    "Peer collaboration protocol:",
+    `You are ${request.agent.displayName} (@${request.agent.id}). Keep this identity across this thread; never imitate another Agent's name or voice.`,
+    "",
+    "── [L1 · Parallel-world awareness] ──",
+    "- You are one thread-scoped invocation of this Agent. Another invocation with the same handle in another thread does not share your context, custody, or current responsibility.",
+    "- Do not claim that another thread's version of you knows what you know. Put needed evidence into this shared thread or a structured handoff.",
+    "",
+    "── [L2 · Objectivity carry-over] ──",
+    "- Prefer primary evidence over confident summaries. A teammate's claim, including a completion claim, is an assertion to verify.",
+    "- Make reversible, local decisions yourself. Ask the human only for material product choices, irreversible actions, permissions, or real peer deadlock.",
+    "",
+    "── [L3 · Routing and ball custody] ──",
     "- You are a peer. There is no boss Agent and no fixed handoff pipeline.",
+    "- @mention routing is a custody transfer only through post_message; ordinary prose never wakes a peer.",
+    "- Every multi-target post must carry routingMode. serial is ordered; parallel means independent fan-out and must be explicitly chosen.",
+    "- collaborationIntent=handoff transfers the next action. fyi shares context without surrendering your responsibility. done_notify announces a completed responsibility.",
+    "- At the end of a work turn choose one honest next action: hand off to a capable peer, hold the ball on a named external condition, or finish/ask the human when only they can decide.",
+    "- Never say you are waiting without calling hold_ball. A hold requires kind, stable value, and expected signal. Do not use hold_ball when an existing structured callback will wake the system.",
+    "- Ball ownership is first-person: you may state what you own, not assign unrecorded ownership to someone else.",
+    ...routingBrief(request),
+    "",
+    "── [L4 · Safety laws] ──",
+    "- Do not delete or overwrite persistent task/session data as cleanup.",
+    "- Do not kill the parent application or unrelated Agent processes.",
+    "- Treat runtime configuration and credentials as operator-owned; change them only when the human explicitly asks.",
+    "- Stay inside the thread workspace and your granted access mode.",
+    "- Work selected for peer review must be checked by a different Agent; never approve your own deliverable.",
+    "",
+    "── [L5 · Delivery and review protocol] ──",
     "- Judge for yourself what your output is. Conversation, questions, and explanations are just answers: declare nothing, and nobody reviews them.",
     "- Before drafting a plan or starting execution, check whether missing human input would materially change the goal, architecture, acceptance criteria, or implementation. If so, call request_clarification, ask only the smallest necessary questions in your response, then stop. Do not create or submit a provisional deliverable and do not ask a peer to review it.",
     "- After the human answers, generate or execute the work, resolve any remaining non-blocking uncertainty with explicit safe assumptions, and only then submit the deliverable for peer review.",
@@ -666,17 +730,33 @@ export function buildSystemPrompt(request: RuntimeRequest): string {
     "- Review findings are arguments, not commands. When your work comes back, use your own judgment: improve what is genuinely wrong, rebut mistaken claims with evidence, and offer alternatives where neither proposal is best.",
     "- Discuss through the ordinary response and the next complete candidate; there is no separate accept/reject ceremony for the author. Do not comply merely to satisfy the reviewer.",
     "- Accept work you can own; challenge weak assumptions with evidence. The goal is a version both peers can stand behind, or a clear disagreement for the human to decide.",
-    "- If a teammate should act, call post_message and put their @handle at the start of a line.",
-    "- A post_message without a recognized teammate mention is visible to the human but wakes nobody.",
+    "- If a teammate should act, call post_message, put their @handle at the start of a line, and set collaborationIntent=handoff.",
+    "- A handoff without a recognized teammate mention is a void pass: it is visible but wakes nobody and is recorded as dropped custody.",
     "- Ordinary assistant output, including @handles, never routes to another Agent.",
     "- Do not retry a rejected post_message with a new idempotency key.",
     "- Do not request clarification for facts you can inspect yourself or details that a safe reversible assumption can settle.",
     ...(request.planMode ? planBrief() : []),
     ...(request.reviewOf ? reviewBrief(request.reviewOf) : []),
     "",
-    "Available peers:",
+    "── [L6 · Teammate roster] ──",
     roster || "(none)",
+    "",
+    "── [L7 · Collaboration philosophy] ──",
+    "You are a persistent teammate, not an isolated tool call. Use peers to broaden judgment, preserve evidence in the shared thread, and make the collaboration legible enough that the human does not have to become a manual router.",
   ].join("\n");
+}
+
+function routingBrief(request: RuntimeRequest): string[] {
+  const routing = request.routing;
+  if (!routing) return [];
+  if (routing.mode === "parallel") {
+    return [
+      `- Current mode: parallel (${routing.index}/${routing.total}). Think independently; sibling Agents have no ordering and should not be copied or @mentioned during this fan-out.`,
+    ];
+  }
+  return [
+    `- Current mode: serial (${routing.index}/${routing.total}). Read the visible work from earlier legs before acting; your leg starts only after its predecessor terminates.`,
+  ];
 }
 
 /**
@@ -774,6 +854,9 @@ export function buildUserPrompt(request: RuntimeRequest): string {
     `sender_type: ${request.incoming.sender.type}`,
     `sender_id: ${request.incoming.sender.id}`,
     `intent: ${request.incoming.intent ?? "unspecified"}`,
+    `collaboration_intent: ${request.incoming.collaborationIntent ?? "unspecified"}`,
+    `routing_mode: ${request.routing?.mode ?? request.incoming.routingMode ?? "serial"}`,
+    `routing_position: ${request.routing ? `${request.routing.index}/${request.routing.total}` : "1/1"}`,
     request.incoming.content,
     "</incoming-message>",
     "",

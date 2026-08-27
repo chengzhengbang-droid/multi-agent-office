@@ -5,6 +5,13 @@ import type { ContextCompiler } from "./context-compiler.js";
 import type { EventStore } from "./event-store.js";
 import { parseAgentMentions, parseUserMentions } from "./mentions.js";
 import type {
+  A2ARoutingMode,
+  A2ARoutingProjection,
+  CollaborationIntent,
+  PendingBallHold,
+  WaitSourceRef,
+} from "./collaboration.js";
+import type {
   AccessMode,
   AgentDefinition,
   AgentRun,
@@ -28,6 +35,8 @@ import type {
   AgentRuntime,
   DeclareDeliverableInput,
   DeclareDeliverableResult,
+  HoldBallInput,
+  HoldBallResult,
   PostAgentMessageInput,
   PostAgentMessageResult,
   RequestClarificationInput,
@@ -89,6 +98,8 @@ export interface PostUserMessageInput {
    * before anything is built.
    */
   planMode?: boolean;
+  /** Structured multi-target scheduling. Defaults to serial. */
+  routingMode?: A2ARoutingMode;
   /**
    * Pre-assigned id for the message this call creates. The plan gate uses it to
    * record its decision before starting the follow-up, so a crash between the
@@ -214,6 +225,11 @@ export class MultiAgentPlatform {
   private readonly planDrafts = new Map<Id, PlanDraft>();
   /** taskRunId -> a plan parked in front of the human. Cleared when decided. */
   private readonly planApprovals = new Map<Id, PlanApproval>();
+  /** Durable, replayable external waits; timers are only a live projection. */
+  private readonly pendingHolds = new Map<Id, PendingBallHold>();
+  private readonly holdTimers = new Map<Id, ReturnType<typeof setTimeout>>();
+  /** A run must choose one next-action path: peer handoff, external hold, or human. */
+  private readonly runCustodyActions = new Map<Id, "handoff" | "hold" | "human">();
   private readonly maxA2ADepth: number;
   private readonly maxAgentRunsPerChain: number;
   private readonly maxMentionTargets: number;
@@ -233,7 +249,7 @@ export class MultiAgentPlatform {
     this.installRoster(options.agents, options.runtimes, options.defaultAgentId);
     this.maxA2ADepth = options.maxA2ADepth ?? 4;
     this.maxAgentRunsPerChain = options.maxAgentRunsPerChain ?? 8;
-    this.maxMentionTargets = options.maxMentionTargets ?? 2;
+    this.maxMentionTargets = options.maxMentionTargets ?? 3;
     this.maxPingPongHops = options.maxPingPongHops ?? 4;
     this.maxParallelReadRuns = options.maxParallelReadRuns ?? 4;
     this.reviewMode = options.reviewMode ?? "smart";
@@ -353,6 +369,8 @@ export class MultiAgentPlatform {
     const chainId = createId("chain");
     const causal: CausalMetadata = { chainId, depth: 0 };
     const planMode = input.planMode === true;
+    const routingMode = normalizeRoutingMode(input.routingMode);
+    const batchId = createId("batch");
     const message: ThreadMessage = {
       id: input.messageId ?? createId("msg"),
       threadId,
@@ -360,6 +378,7 @@ export class MultiAgentPlatform {
       kind: "chat",
       mentions: targets,
       content,
+      routingMode,
       createdAt: now(),
       causal,
       ...(input.attachments && input.attachments.length > 0
@@ -369,18 +388,33 @@ export class MultiAgentPlatform {
     await this.addMessage(message);
 
     const steered: Id[] = [];
-    for (const target of targets) {
+    let predecessorRunId: Id | undefined;
+    for (const [targetIndex, target] of targets.entries()) {
       const agent = this.agents.get(target);
       if (!agent) continue;
       // Steering drops a message into a run that is already executing, so it
       // cannot change that run's mode or its access. A plan-mode message must
       // start its own read-only run rather than land inside a writing one.
-      if (input.steer && !planMode && (await this.trySteer(threadId, target, message))) {
+      // A multi-recipient dispatch owns an explicit serial/parallel contract.
+      // Steering one member into an older run would make that batch impossible
+      // to order or observe faithfully, so steering is reserved for a single
+      // recipient message.
+      if (input.steer && targets.length === 1 && !planMode && (await this.trySteer(threadId, target, message))) {
         steered.push(target);
         continue;
       }
+      const runId = createId("run");
+      const routing: A2ARoutingProjection = {
+        mode: routingMode,
+        index: targetIndex + 1,
+        total: targets.length,
+        batchId,
+        ...(routingMode === "serial" && predecessorRunId
+          ? { predecessorRunId }
+          : {}),
+      };
       await this.enqueueRun({
-        id: createId("run"),
+        id: runId,
         threadId,
         agentId: target,
         incomingMessageId: message.id,
@@ -392,8 +426,10 @@ export class MultiAgentPlatform {
         causal,
         createdAt: now(),
         purpose: "task",
+        routing,
         ...(planMode ? { mode: "plan" as const } : {}),
       });
+      if (routingMode === "serial") predecessorRunId = runId;
     }
     this.startScheduler();
     const completion = this.waitForChain(chainId);
@@ -466,6 +502,20 @@ export class MultiAgentPlatform {
       if (index >= 0) this.queue.splice(index, 1);
       await this.recordCancelled(run, reason);
       this.finishPendingRun(run);
+    }
+
+    for (const hold of [...this.pendingHolds.values()]) {
+      if (hold.chainId !== chainId) continue;
+      this.clearHoldTimer(hold.id);
+      this.pendingHolds.delete(hold.id);
+      await this.record({
+        type: "ball.hold_cancelled",
+        threadId: hold.threadId,
+        chainId,
+        holdId: hold.id,
+        reason,
+      });
+      this.finishPendingChain(chainId);
     }
 
     const cancellations: Promise<void>[] = [];
@@ -558,6 +608,10 @@ export class MultiAgentPlatform {
         });
       } else if (event.type === "clarification.requested") {
         this.runClarifications.set(event.runId, event.questions);
+      } else if (event.type === "ball.held") {
+        this.pendingHolds.set(event.hold.id, event.hold);
+      } else if (event.type === "ball.wake_sent" || event.type === "ball.hold_cancelled") {
+        this.pendingHolds.delete(event.holdId);
       } else if (event.type === "review.requested") {
         this.reviewRounds.set(event.taskRunId, event.round);
         this.reviewAuthors.set(event.reviewRunId, event.authorAgentId);
@@ -603,6 +657,12 @@ export class MultiAgentPlatform {
       }
     }
     this.hydrated = true;
+    for (const hold of this.pendingHolds.values()) {
+      // A durable hold is a live unit of work even though no invocation is
+      // currently running. Keep completion waiters open across restarts.
+      this.incrementPending(hold.chainId);
+      this.scheduleHold(hold);
+    }
 
     const interrupted: AgentRun[] = [];
     for (const run of this.runs.values()) {
@@ -654,6 +714,7 @@ export class MultiAgentPlatform {
         void this.executeRun(active).finally(() => {
           this.activeRuns.delete(active.run.id);
           this.forgetRunGateState(active.run.id);
+          this.runCustodyActions.delete(active.run.id);
           this.finishPendingRun(active.run);
           this.wakeScheduler();
         });
@@ -668,6 +729,8 @@ export class MultiAgentPlatform {
 
   private isEligible(run: AgentRun): boolean {
     if (!this.isRoutable(run.agentId)) return true;
+    const predecessor = run.routing?.predecessorRunId;
+    if (predecessor && !isTerminal(this.runStatuses.get(predecessor))) return false;
     if ([...this.activeRuns.values()].some((active) => active.run.agentId === run.agentId)) {
       return false;
     }
@@ -738,6 +801,17 @@ export class MultiAgentPlatform {
       threadId: run.threadId,
       agentId: run.agentId,
     });
+    const routing = run.routing ?? singleRouting(run.id);
+    await this.record({
+      type: "ball.handed",
+      threadId: run.threadId,
+      chainId: run.causal.chainId,
+      runId: run.id,
+      messageId: incoming.id,
+      holderAgentId: run.agentId,
+      ...(incoming.sender.type === "agent" ? { fromAgentId: incoming.sender.id } : {}),
+      routing,
+    });
 
     let completedOutput: string | undefined;
     try {
@@ -756,6 +830,7 @@ export class MultiAgentPlatform {
         incoming,
         context,
         ...(run.mode === "plan" ? { planMode: true as const } : {}),
+        routing,
         ...(attachments.length > 0 ? { attachments } : {}),
         ...(images.length > 0 ? { images } : {}),
         signal: controller.signal,
@@ -770,6 +845,7 @@ export class MultiAgentPlatform {
           : {}),
         emit: (event) => this.recordRuntimeEvent(active, event),
         postMessage: (message) => this.acceptAgentMessage(run, message),
+        holdBall: (input) => this.acceptBallHold(run, input),
         requestClarification: (input) => this.acceptClarificationRequest(run, input),
         declareDeliverable: (input) => this.acceptDeliverableDeclaration(run, input),
       });
@@ -816,6 +892,14 @@ export class MultiAgentPlatform {
           error: errorMessage(error),
         });
         this.runStatuses.set(run.id, "failed");
+        await this.record({
+          type: "invocation.died",
+          threadId: run.threadId,
+          chainId: run.causal.chainId,
+          runId: run.id,
+          agentId: run.agentId,
+          reason: errorMessage(error),
+        });
         await this.escalateReviewRun(run, `审核运行失败：${errorMessage(error)}`);
       }
     }
@@ -826,6 +910,7 @@ export class MultiAgentPlatform {
     // finishPendingRun — the chain cannot resolve while a review is owed.
     if (completedOutput !== undefined) {
       await this.advanceReview(run, completedOutput);
+      await this.maybeResolveBall(run);
     }
   }
 
@@ -868,6 +953,11 @@ export class MultiAgentPlatform {
 
     const parsed = parseAgentMentions(content, [...this.agents.values()], this.maxMentionTargets);
     const targets = parsed.targets.filter((target) => target !== sourceRun.agentId);
+    const collaborationIntent = normalizeCollaborationIntent(
+      input.collaborationIntent ?? input.intent,
+      targets.length > 0 ? "handoff" : "fyi",
+    );
+    const routingMode = normalizeRoutingMode(input.routingMode);
     const depth = sourceRun.causal.depth + 1;
     const message: ThreadMessage = {
       id: createId("msg"),
@@ -876,6 +966,8 @@ export class MultiAgentPlatform {
       kind: "collaboration",
       mentions: targets,
       content,
+      collaborationIntent,
+      routingMode,
       createdAt: now(),
       causal: {
         chainId: sourceRun.causal.chainId,
@@ -897,7 +989,26 @@ export class MultiAgentPlatform {
       );
     }
     if (targets.length === 0) {
+      if (collaborationIntent === "handoff") {
+        await this.record({
+          type: "ball.void_pass",
+          threadId: sourceRun.threadId,
+          chainId: sourceRun.causal.chainId,
+          runId: sourceRun.id,
+          messageId: message.id,
+        });
+      }
       return { accepted: true, targets: [], messageId: message.id };
+    }
+    if (
+      collaborationIntent === "handoff" &&
+      this.runCustodyActions.has(sourceRun.id)
+    ) {
+      return reject(
+        `This run already chose ${this.runCustodyActions.get(sourceRun.id)} as its next custody action`,
+        undefined,
+        message.id,
+      );
     }
     if (this.cancelledChains.has(sourceRun.causal.chainId)) {
       return reject("Collaboration chain is cancelled", undefined, message.id);
@@ -909,6 +1020,8 @@ export class MultiAgentPlatform {
     if (currentRunCount + targets.length > this.maxAgentRunsPerChain) {
       return reject(`Agent run limit exceeded (${this.maxAgentRunsPerChain})`, undefined, message.id);
     }
+    const batchId = createId("batch");
+    let predecessorRunId: Id | undefined = routingMode === "serial" ? sourceRun.id : undefined;
     for (const target of targets) {
       if (!this.isRoutable(target)) {
         return reject(`Agent @${target} is disabled or unavailable`, target, message.id);
@@ -922,7 +1035,7 @@ export class MultiAgentPlatform {
       }
     }
 
-    for (const target of targets) {
+    for (const [targetIndex, target] of targets.entries()) {
       await this.record({
         type: "routing.accepted",
         runId: sourceRun.id,
@@ -933,8 +1046,16 @@ export class MultiAgentPlatform {
       });
       const agent = this.agents.get(target);
       if (!agent) continue;
+      const runId = createId("run");
+      const routing: A2ARoutingProjection = {
+        mode: routingMode,
+        index: targetIndex + 1,
+        total: targets.length,
+        batchId,
+        ...(predecessorRunId ? { predecessorRunId } : {}),
+      };
       await this.enqueueRun({
-        id: createId("run"),
+        id: runId,
         threadId: sourceRun.threadId,
         agentId: target,
         incomingMessageId: message.id,
@@ -943,10 +1064,152 @@ export class MultiAgentPlatform {
         causal: message.causal as CausalMetadata,
         createdAt: now(),
         purpose: "task",
+        routing,
       });
+      if (routingMode === "serial") predecessorRunId = runId;
+    }
+    if (collaborationIntent === "handoff") {
+      this.runCustodyActions.set(sourceRun.id, "handoff");
     }
     this.startScheduler();
     return { accepted: true, targets, messageId: message.id };
+  }
+
+  private async acceptBallHold(
+    sourceRun: AgentRun,
+    input: HoldBallInput,
+  ): Promise<HoldBallResult> {
+    if (sourceRun.purpose === "review") {
+      return { accepted: false, reason: "A reviewer must finish with a verdict; it cannot hold the task ball" };
+    }
+    const existing = this.runCustodyActions.get(sourceRun.id);
+    if (existing) {
+      return { accepted: false, reason: `This run already chose ${existing} as its next custody action` };
+    }
+    if (!Number.isFinite(input.wakeAfterMs) || input.wakeAfterMs < 10 || input.wakeAfterMs > 86_400_000) {
+      return { accepted: false, reason: "wakeAfterMs must be between 10 ms and 24 hours" };
+    }
+    const waitSourceRef = normalizeWaitSourceRef(input.waitSourceRef);
+    if (!waitSourceRef) {
+      return {
+        accepted: false,
+        reason: "waitSourceRef.kind, value, and expectedSignal are required; vague waiting cannot keep custody",
+      };
+    }
+    const hold: PendingBallHold = {
+      id: createId("hold"),
+      runId: sourceRun.id,
+      threadId: sourceRun.threadId,
+      chainId: sourceRun.causal.chainId,
+      agentId: sourceRun.agentId,
+      wakeAt: new Date(Date.now() + Math.floor(input.wakeAfterMs)).toISOString(),
+      waitSourceRef,
+      causal: {
+        ...sourceRun.causal,
+        parentRunId: sourceRun.id,
+      },
+    };
+    this.pendingHolds.set(hold.id, hold);
+    this.runCustodyActions.set(sourceRun.id, "hold");
+    await this.record({ type: "ball.held", hold });
+    this.incrementPending(hold.chainId);
+    this.scheduleHold(hold);
+    return { accepted: true, holdId: hold.id, wakeAt: hold.wakeAt };
+  }
+
+  private scheduleHold(hold: PendingBallHold): void {
+    this.clearHoldTimer(hold.id);
+    const delay = Math.max(0, new Date(hold.wakeAt).getTime() - Date.now());
+    const timer = setTimeout(() => {
+      void this.fireHold(hold.id);
+    }, Math.min(delay, 2_147_000_000));
+    (timer as NodeJS.Timeout).unref?.();
+    this.holdTimers.set(hold.id, timer);
+  }
+
+  private clearHoldTimer(holdId: Id): void {
+    const timer = this.holdTimers.get(holdId);
+    if (timer) clearTimeout(timer);
+    this.holdTimers.delete(holdId);
+  }
+
+  private async fireHold(holdId: Id): Promise<void> {
+    const hold = this.pendingHolds.get(holdId);
+    if (!hold) return;
+    const remaining = new Date(hold.wakeAt).getTime() - Date.now();
+    if (remaining > 0) {
+      this.scheduleHold(hold);
+      return;
+    }
+    this.clearHoldTimer(hold.id);
+    this.pendingHolds.delete(hold.id);
+    try {
+      const agent = this.agents.get(hold.agentId);
+      if (!agent || !this.isRoutable(hold.agentId) || this.cancelledChains.has(hold.chainId)) {
+        await this.record({
+          type: "ball.hold_cancelled",
+          threadId: hold.threadId,
+          chainId: hold.chainId,
+          holdId: hold.id,
+          reason: this.cancelledChains.has(hold.chainId) ? "Collaboration chain was cancelled" : `Agent @${hold.agentId} is unavailable`,
+        });
+        return;
+      }
+      const message: ThreadMessage = {
+        id: createId("msg"),
+        threadId: hold.threadId,
+        sender: { type: "agent", id: hold.agentId },
+        kind: "wake",
+        mentions: [hold.agentId],
+        content: buildHoldWakeContent(hold),
+        intent: "external-condition-recheck",
+        collaborationIntent: "handoff",
+        routingMode: "serial",
+        createdAt: now(),
+        causal: hold.causal,
+      };
+      await this.addMessage(message);
+      const runId = createId("run");
+      await this.record({
+        type: "ball.wake_sent",
+        threadId: hold.threadId,
+        chainId: hold.chainId,
+        holdId: hold.id,
+        runId,
+        messageId: message.id,
+        agentId: hold.agentId,
+      });
+      await this.enqueueRun({
+        id: runId,
+        threadId: hold.threadId,
+        agentId: hold.agentId,
+        incomingMessageId: message.id,
+        status: "queued",
+        accessMode: agent.accessMode,
+        causal: hold.causal,
+        createdAt: now(),
+        purpose: "task",
+        routing: singleRouting(runId),
+      });
+      this.startScheduler();
+    } finally {
+      // enqueueRun acquires the next pending token before the durable hold
+      // releases its own, so chain completion cannot flicker between them.
+      this.finishPendingChain(hold.chainId);
+    }
+  }
+
+  private async maybeResolveBall(run: AgentRun): Promise<void> {
+    const action = this.runCustodyActions.get(run.id);
+    if (action === "hold" || action === "human") return;
+    if ((this.chainPendingCounts.get(run.causal.chainId) ?? 0) > 1) return;
+    await this.record({
+      type: "task.done",
+      threadId: run.threadId,
+      chainId: run.causal.chainId,
+      runId: run.id,
+      agentId: run.agentId,
+    });
   }
 
   // ---------------------------------------------------------------------------
@@ -1401,11 +1664,22 @@ export class MultiAgentPlatform {
       ...(detail ? { detail } : {}),
       ...(reviewType ? { reviewType } : {}),
     });
+    if (outcome === "escalated" && reviewType !== "critique") {
+      this.runCustodyActions.set(run.id, "human");
+      await this.record({
+        type: "ball.handed_user",
+        threadId: run.threadId,
+        chainId: run.causal.chainId,
+        runId: run.id,
+        reason: "review-escalation",
+      });
+    }
     // A critique settling is not the end of a plan, only the end of the peer
     // round. Consensus or escalation both put the plan in front of the human:
     // peers deliberate, while the human retains the final product decision.
     // Cancellation is the operator's own doing and asks nothing of them.
     if (reviewType === "critique" && outcome !== "cancelled") {
+      this.runCustodyActions.set(run.id, "human");
       await this.awaitPlanApproval(
         run.threadId,
         taskRunId,
@@ -1500,6 +1774,17 @@ export class MultiAgentPlatform {
       ...(peerSummary ? { peerSummary } : {}),
       ...(escalation ? { escalation } : {}),
     });
+    const planRun = this.runs.get(approval.planRunId);
+    if (planRun) {
+      this.runCustodyActions.set(planRun.id, "human");
+      await this.record({
+        type: "ball.handed_user",
+        threadId,
+        chainId: planRun.causal.chainId,
+        runId: planRun.id,
+        reason: "plan-approval",
+      });
+    }
   }
 
   /**
@@ -1570,6 +1855,10 @@ export class MultiAgentPlatform {
         reason: "this run already changed the workspace; clarification must happen before execution",
       };
     }
+    const custodyAction = this.runCustodyActions.get(run.id);
+    if (custodyAction) {
+      return { accepted: false, reason: `this run already chose ${custodyAction} as its next custody action` };
+    }
     const questions = (input.questions ?? [])
       .map((question) => typeof question === "string"
         ? question.trim()
@@ -1594,6 +1883,14 @@ export class MultiAgentPlatform {
       threadId: run.threadId,
       agentId: run.agentId,
       questions,
+    });
+    this.runCustodyActions.set(run.id, "human");
+    await this.record({
+      type: "ball.handed_user",
+      threadId: run.threadId,
+      chainId: run.causal.chainId,
+      runId: run.id,
+      reason: "clarification",
     });
     return { accepted: true };
   }
@@ -1979,6 +2276,14 @@ export class MultiAgentPlatform {
       reason,
     });
     this.runStatuses.set(run.id, "cancelled");
+    await this.record({
+      type: "ball.cancelled",
+      threadId: run.threadId,
+      chainId: run.causal.chainId,
+      runId: run.id,
+      agentId: run.agentId,
+      reason,
+    });
     await this.escalateReviewRun(run, `审核被取消：${reason}`);
   }
 
@@ -1991,6 +2296,14 @@ export class MultiAgentPlatform {
       reason,
     });
     this.runStatuses.set(run.id, "interrupted");
+    await this.record({
+      type: "invocation.died",
+      threadId: run.threadId,
+      chainId: run.causal.chainId,
+      runId: run.id,
+      agentId: run.agentId,
+      reason,
+    });
     await this.escalateReviewRun(run, `审核被中断：${reason}`);
   }
 
@@ -2009,7 +2322,10 @@ export class MultiAgentPlatform {
   }
 
   private finishPendingRun(run: AgentRun): void {
-    const chainId = run.causal.chainId;
+    this.finishPendingChain(run.causal.chainId);
+  }
+
+  private finishPendingChain(chainId: Id): void {
     const next = Math.max(0, (this.chainPendingCounts.get(chainId) ?? 1) - 1);
     if (next > 0) {
       this.chainPendingCounts.set(chainId, next);
@@ -2326,6 +2642,60 @@ function cursorKey(threadId: Id, agentId: Id): string {
  */
 function countsTowardChainBudget(run: AgentRun): boolean {
   return (run.purpose ?? "task") === "task" && (run.reviewRound ?? 0) === 0;
+}
+
+function normalizeRoutingMode(value: unknown): A2ARoutingMode {
+  if (value === undefined) return "serial";
+  if (value === "serial" || value === "parallel") return value;
+  throw new Error("routingMode must be serial or parallel");
+}
+
+function normalizeCollaborationIntent(
+  value: unknown,
+  fallback: CollaborationIntent,
+): CollaborationIntent {
+  return value === "handoff" || value === "fyi" || value === "done_notify"
+    ? value
+    : fallback;
+}
+
+function normalizeWaitSourceRef(value: WaitSourceRef | undefined): WaitSourceRef | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const kind = typeof value.kind === "string" ? value.kind.trim() : "";
+  const stableValue = typeof value.value === "string" ? value.value.trim() : "";
+  const expectedSignal = typeof value.expectedSignal === "string"
+    ? value.expectedSignal.trim()
+    : "";
+  if (!kind || !stableValue || !expectedSignal) return undefined;
+  const slaUntil = typeof value.slaUntil === "string" && !Number.isNaN(Date.parse(value.slaUntil))
+    ? new Date(value.slaUntil).toISOString()
+    : undefined;
+  return {
+    kind: kind.slice(0, 120),
+    value: stableValue.slice(0, 1_000),
+    expectedSignal: expectedSignal.slice(0, 1_000),
+    ...(slaUntil ? { slaUntil } : {}),
+  };
+}
+
+function singleRouting(batchId: Id): A2ARoutingProjection {
+  return { mode: "serial", index: 1, total: 1, batchId };
+}
+
+function buildHoldWakeContent(hold: PendingBallHold): string {
+  return [
+    `@${hold.agentId} Your managed wait has fired. You still own the ball.`,
+    "",
+    "<wait-source>",
+    `kind: ${hold.waitSourceRef.kind}`,
+    `value: ${hold.waitSourceRef.value}`,
+    `expected_signal: ${hold.waitSourceRef.expectedSignal}`,
+    ...(hold.waitSourceRef.slaUntil ? [`sla_until: ${hold.waitSourceRef.slaUntil}`] : []),
+    `scheduled_wake_at: ${hold.wakeAt}`,
+    "</wait-source>",
+    "",
+    "Re-check the named external condition from primary evidence. Then choose exactly one next action: hand off to a peer, hold again with fresh grounding, or finish/ask the human when only they can decide.",
+  ].join("\n");
 }
 
 function unorderedPair(first: string, second: string): string {

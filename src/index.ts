@@ -1,6 +1,7 @@
 export * from "./config/agents.js";
 export * from "./config/agent-catalog.js";
 export * from "./core/context-compiler.js";
+export * from "./core/collaboration.js";
 export * from "./core/event-store.js";
 export * from "./core/mentions.js";
 export * from "./core/platform.js";
