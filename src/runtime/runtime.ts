@@ -74,7 +74,12 @@ export interface DeclareDeliverableResult {
 
 export interface RequestClarificationInput {
   /** The smallest set of human answers needed before work or planning can continue. */
-  questions: string[];
+  questions: Array<string | ClarificationQuestion>;
+}
+
+export interface ClarificationQuestion {
+  question: string;
+  options?: Array<{ label: string; value?: string; recommended?: boolean }>;
 }
 
 export interface RequestClarificationResult {

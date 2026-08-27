@@ -637,7 +637,8 @@ test("a critique that requests changes reworks the plan as a critique round", as
   const feedback = (await platform.getThreadMessages(requests[0]!.threadId)).find(
     (message) => message.kind === "review-feedback",
   );
-  assert.match(feedback?.content ?? "", /Revise your plan/);
+  assert.match(feedback?.content ?? "", /peer's arguments, not instructions/);
+  assert.match(feedback?.content ?? "", /complete, self-contained candidate plan/);
   assert.equal(single(events, "review.resolved").outcome, "approved");
 });
 
@@ -1132,7 +1133,7 @@ test("a task with no eligible reviewer escalates instead of passing", async () =
   assert.equal(resolved.escalation, "no-reviewer");
 });
 
-test("changes-requested hands feedback back to the author and re-reviews the rework", async () => {
+test("changes-requested opens a natural discussion and re-reviews the next candidate", async () => {
   const order: string[] = [];
   const verdicts: ReviewVerdict[] = ["changes-requested", "approved"];
   const platform = createReviewPlatform([agent("pi"), agent("codex")], {
@@ -1167,6 +1168,10 @@ test("changes-requested hands feedback back to the author and re-reviews the rew
   assert.deepEqual(feedback?.mentions, ["pi"]);
   assert.match(feedback?.content ?? "", /缺少错误处理/);
   assert.match(feedback?.content ?? "", /为解析失败补一个分支/);
+  assert.match(feedback?.content ?? "", /arguments, not instructions/);
+  assert.match(feedback?.content ?? "", /no separate accept\/reject action/);
+  assert.match(feedback?.content ?? "", /rebut it with evidence/);
+  assert.match(feedback?.content ?? "", /complete final result/);
 
   // Exactly one terminal marker, and it is the approval of round 2.
   const resolved = single(events, "review.resolved");
@@ -1201,6 +1206,8 @@ test("escalates to the human instead of looping past maxReviewRounds", async () 
   assert.equal(resolved.outcome, "escalated");
   assert.equal(resolved.escalation, "max-rounds");
   assert.equal(resolved.rounds, 2);
+  assert.match(resolved.detail ?? "", /仍未达成一致/);
+  assert.match(resolved.detail ?? "", /人类裁决/);
 });
 
 test("a review run that ends without submit_review is escalated, never approved", async () => {

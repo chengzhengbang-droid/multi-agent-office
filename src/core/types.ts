@@ -157,9 +157,9 @@ export type ReviewEscalation =
   | "inconclusive"
   /** The review run failed, was cancelled, or its reviewer became unavailable. */
   | "review-failed"
-  /** maxReviewRounds rounds of rework still did not satisfy the reviewer. */
+  /** maxReviewRounds rounds of peer discussion ended without consensus. */
   | "max-rounds"
-  /** The author stopped rework because a material human decision is missing. */
+  /** The author stopped discussion because a material human decision is missing. */
   | "clarification-needed";
 
 export interface ReviewSubmission {
@@ -376,7 +376,7 @@ export type PlatformEventPayload =
       runId: Id;
       threadId: Id;
       agentId: Id;
-      questions: string[];
+      questions: Array<string | { question: string; options?: Array<{ label: string; value?: string; recommended?: boolean }> }>;
     }
   | {
       type: "review.requested";
@@ -403,6 +403,7 @@ export type PlatformEventPayload =
       checks?: string[];
     }
   | {
+      /** A review objection opened another natural-language deliberation round. */
       type: "review.rework";
       threadId: Id;
       taskRunId: Id;

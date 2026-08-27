@@ -449,7 +449,7 @@ function codexDynamicTools(): Array<Record<string, unknown>> {
       type: "function",
       name: "submit_review",
       description:
-        "Record your verdict on work you were asked to review. Call exactly once. Approve only what you checked yourself.",
+        "Record your current verdict in a peer discussion. Call exactly once. Approve only a final candidate you checked and can stand behind; changes-requested states evidence-backed objections, not orders.",
       inputSchema: {
         type: "object",
         properties: {
@@ -466,13 +466,16 @@ function codexDynamicTools(): Array<Record<string, unknown>> {
       type: "function",
       name: "request_clarification",
       description:
-        "Ask the human before planning or executing when missing input would materially change the outcome. Ask the same focused questions in your response, then stop without submitting a deliverable.",
+        "Ask the human before planning or executing when missing input would materially change the outcome. questions may be strings, or objects with question and optional options [{label,value,recommended}]; use recommended for the best default. Ask the same focused questions in your response, then stop without submitting a deliverable.",
       inputSchema: {
         type: "object",
         properties: {
           questions: {
             type: "array",
-            items: { type: "string", minLength: 1, maxLength: 2_000 },
+            items: { anyOf: [
+              { type: "string", minLength: 1, maxLength: 2_000 },
+              { type: "object", properties: { question: { type: "string", minLength: 1, maxLength: 2_000 }, options: { type: "array", items: { type: "object", properties: { label: { type: "string" }, value: { type: "string" }, recommended: { type: "boolean" } }, required: ["label"], additionalProperties: false } } }, required: ["question"], additionalProperties: false },
+            ] },
             minItems: 1,
             maxItems: 5,
           },
@@ -549,8 +552,12 @@ async function executeDynamicTool(
       );
     }
     if (tool === "request_clarification") {
-      const questions = optionalStringArray(args, "questions");
-      if (!questions) throw new Error("questions is required");
+      const rawQuestions = args.questions;
+      if (!Array.isArray(rawQuestions)) throw new Error("questions is required");
+      const questions = rawQuestions.map((question) => typeof question === "string" ? question : {
+        question: requiredString(question as Record<string, unknown>, "question"),
+        ...(Array.isArray((question as Record<string, unknown>).options) ? { options: ((question as Record<string, unknown>).options as unknown[]).filter((option): option is Record<string, unknown> => Boolean(option && typeof option === "object") && typeof (option as Record<string, unknown>).label === "string").map((option) => ({ label: option.label as string, ...(typeof option.value === "string" ? { value: option.value } : {}), ...(typeof option.recommended === "boolean" ? { recommended: option.recommended } : {}) })) } : {}),
+      });
       const result = await request.requestClarification({ questions });
       return toolResult(
         result.accepted,

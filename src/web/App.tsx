@@ -143,7 +143,14 @@ type TranscriptItem =
       replyToHuman?: boolean;
       replyToAgentId?: string;
       incomingKind?: ThreadMessageKind;
+      clarification?: ClarificationRequest;
     };
+
+interface ClarificationQuestion {
+  question: string;
+  options?: Array<{ label: string; value?: string; recommended?: boolean }>;
+}
+interface ClarificationRequest { runId: string; agentId: string; questions: Array<string | ClarificationQuestion>; }
 
 interface ReviewState {
   status: "pending" | "approved" | "changes-requested" | "escalated" | "cancelled";
@@ -364,6 +371,19 @@ export function App() {
     }
   };
 
+  const answerClarification = async (request: ClarificationRequest, answers: string[]) => {
+    if (sending || !selectedThreadId) return false;
+    setSending(true);
+    setActionError("");
+    try {
+      const content = `@${request.agentId} ` + answers.map((answer, index) => `第 ${index + 1} 题：${answer}`).join("\n");
+      const response = await fetch("/api/messages", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ content, threadId: selectedThreadId }) });
+      const result = (await response.json()) as { error?: string };
+      if (!response.ok) throw new Error(result.error ?? "回复失败");
+      return true;
+    } catch (error) { setActionError(errorMessage(error)); return false; } finally { setSending(false); }
+  };
+
   const decidePlan = async (taskRunId: string, decision: PlanDecision, note: string) => {
     if (decidingPlan) return;
     setDecidingPlan(taskRunId);
@@ -537,6 +557,7 @@ export function App() {
                     <RunActivity item={item} />
                     <div className={`markdown-body ${item.status === "running" ? "markdown-body--streaming" : ""}`}>{item.content ? <ReactMarkdown remarkPlugins={[remarkGfm]}>{item.content}</ReactMarkdown> : <div className="thinking-line"><span /><span /><span /></div>}</div>
                     {item.usage && <RunUsageBar usage={item.usage} />}
+                    {item.clarification && <ClarificationCard request={item.clarification} busy={sending} onSubmit={(answers) => answerClarification(item.clarification!, answers)} />}
                     {item.review && !reviewNeedsAttention && <ReviewCard review={item.review} agents={data.agents} />}
                     {item.plan && !planNeedsAttention && <PlanCard plan={item.plan} agents={data.agents} busy={decidingPlan === item.plan.taskRunId} onDecide={decidePlan} />}
                   </article>
@@ -1350,11 +1371,11 @@ function describeEvent(event: StoredPlatformEvent, agents: AgentSummary[]) {
   if (event.type === "run.steered") return { title: `已向 ${agentName(agents, event.agentId)} 插话`, detail: shortId(event.messageId), icon: SendHorizontal, tone: "active" };
   if (event.type === "routing.accepted") return { title: `结构化转交给 ${agentName(agents, event.targetAgentId)}`, detail: "post_message 已接受", icon: ArrowRight, tone: "active" };
   if (event.type === "routing.rejected") return { title: "Agent 路由被拒绝", detail: event.reason, icon: XCircle, tone: "danger" };
-  if (event.type === "clarification.requested") return { title: `${agentName(agents, event.agentId)} 先向你确认`, detail: event.questions.join("；").slice(0, 120), icon: MessageSquare, tone: "active" };
+  if (event.type === "clarification.requested") return { title: `${agentName(agents, event.agentId)} 先向你确认`, detail: event.questions.map((question) => typeof question === "string" ? question : question.question).join("；").slice(0, 120), icon: MessageSquare, tone: "active" };
   if (event.type === "deliverable.declared") return { title: event.kind === "plan" ? `${agentName(agents, event.agentId)} 提交了方案` : `${agentName(agents, event.agentId)} 声明任务完成`, detail: event.summary.slice(0, 120), icon: SendHorizontal, tone: "active" };
   if (event.type === "review.requested") return { title: `已送${reviewTypeLabel(event.reviewType)} ${agentName(agents, event.reviewerAgentId)}`, detail: `${agentName(agents, event.authorAgentId)} 的交付 · 第 ${event.round} 轮`, icon: ArrowRight, tone: "active" };
-  if (event.type === "review.submitted") return { title: event.verdict === "approved" ? `${agentName(agents, event.reviewerAgentId)} 审核通过` : `${agentName(agents, event.reviewerAgentId)} 要求修改`, detail: event.summary, icon: event.verdict === "approved" ? Check : RefreshCw, tone: event.verdict === "approved" ? "success" : "danger" };
-  if (event.type === "review.rework") return { title: `已打回 ${agentName(agents, event.authorAgentId)} 返工`, detail: `第 ${event.round} 轮审核未通过`, icon: RefreshCw, tone: "active" };
+  if (event.type === "review.submitted") return { title: event.verdict === "approved" ? "作者与审核者达成共识" : `${agentName(agents, event.reviewerAgentId)} 提出异议`, detail: event.summary, icon: event.verdict === "approved" ? Check : RefreshCw, tone: event.verdict === "approved" ? "success" : "danger" };
+  if (event.type === "review.rework") return { title: `${agentName(agents, event.authorAgentId)} 继续协商`, detail: `回应第 ${event.round} 轮审核意见`, icon: RefreshCw, tone: "active" };
   if (event.type === "review.resolved") return { title: reviewOutcomeTitle(event.outcome), detail: event.detail ?? `共 ${event.rounds} 轮审核`, icon: event.outcome === "approved" ? Check : XCircle, tone: event.outcome === "approved" ? "success" : event.outcome === "cancelled" ? "neutral" : "danger" };
   if (event.type === "plan.awaiting-approval") return { title: `${agentName(agents, event.authorAgentId)} 的计划等待你确认`, detail: PLAN_PEER_LABELS[event.peerOutcome], icon: ListChecks, tone: "active" };
   if (event.type === "plan.decided") return { title: event.decision === "approved" ? "你通过了计划，开始执行" : "你打回了计划，重新规划", detail: event.note ?? shortId(event.taskRunId), icon: event.decision === "approved" ? ThumbsUp : ThumbsDown, tone: event.decision === "approved" ? "success" : "active" };
@@ -1372,7 +1393,7 @@ function collaborationLabel(kind: ThreadMessageKind): string {
 }
 
 function reviewOutcomeTitle(outcome: "approved" | "escalated" | "cancelled"): string {
-  if (outcome === "approved") return "审核通过，任务完成";
+  if (outcome === "approved") return "双方达成共识，任务完成";
   if (outcome === "cancelled") return "审核已随协作链取消";
   return "审核未通过，需要人工介入";
 }
@@ -1386,7 +1407,7 @@ const REVIEW_ESCALATION_LABELS: Record<ReviewEscalation, string> = {
   "no-reviewer": "没有可用于审核的其他 Agent",
   inconclusive: "审核 Agent 未登记正式结论",
   "review-failed": "审核未能完成",
-  "max-rounds": "返工轮数已用完，仍未通过",
+  "max-rounds": "协商轮数已用完，双方仍有分歧，请你裁决",
   "clarification-needed": "Agent 需要你先补充关键信息",
 };
 
@@ -1395,10 +1416,11 @@ function ReviewCard({ review, agents }: { review: ReviewState; agents: AgentSumm
   const kind = reviewTypeLabel(review.reviewType);
   const title =
     review.status === "pending" ? `等待 ${reviewer} ${kind}（第 ${review.round} 轮）`
-    : review.status === "approved" ? (review.reviewType === "critique" ? `${reviewer} 认可该方案` : `${reviewer} 核对通过`)
-    : review.status === "changes-requested" ? `${reviewer} 要求修改（第 ${review.round} 轮）`
+    : review.status === "approved" ? (review.reviewType === "critique" ? `双方就方案达成共识` : `双方就交付结果达成共识`)
+    : review.status === "changes-requested" ? `${reviewer} 提出异议，正在协商（第 ${review.round} 轮）`
     : review.status === "cancelled" ? `${kind}已随协作链取消`
     : review.unstructured ? `${reviewer} 已给出文字意见，等待你处理`
+    : review.escalation === "max-rounds" ? "双方仍有分歧，需要你裁决"
     : "需要人工介入";
   return (
     <div className={`review-card review-card--${review.status}`}>
@@ -1425,8 +1447,28 @@ function ReviewCard({ review, agents }: { review: ReviewState; agents: AgentSumm
   );
 }
 
+function ClarificationCard({ request, busy, onSubmit }: { request: ClarificationRequest; busy: boolean; onSubmit(answers: string[]): Promise<boolean> }) {
+  const [step, setStep] = useState(0);
+  const [answers, setAnswers] = useState<string[]>([]);
+  const [custom, setCustom] = useState("");
+  const [submitted, setSubmitted] = useState(false);
+  const current = request.questions[step];
+  if (!current) return null;
+  const question = typeof current === "string" ? { question: current } : current;
+  const choose = (answer: string) => {
+    const next = [...answers, answer];
+    if (step + 1 < request.questions.length) { setAnswers(next); setStep(step + 1); setCustom(""); }
+    else { setSubmitted(true); void onSubmit(next).then((success) => { if (!success) setSubmitted(false); }); }
+  };
+  return <div className="clarification-card">
+    <div className="clarification-title"><MessageSquare size={14} /><strong>需要你确认</strong><span>{step + 1} / {request.questions.length}</span></div>
+    <p className="clarification-question">{question.question}</p>
+    {submitted ? <p className="clarification-submitted"><Check size={13} />已提交，等待 Agent 继续</p> : <><div className="clarification-options">{question.options?.map((option) => <button type="button" key={`${option.label}-${option.value ?? ""}`} disabled={busy} onClick={() => choose(option.value ?? option.label)}>{option.label}{option.recommended && <em>推荐</em>}</button>)}</div><div className="clarification-custom"><input value={custom} disabled={busy} onChange={(event) => setCustom(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && custom.trim()) choose(custom.trim()); }} placeholder={question.options?.length ? "或输入其他答案…" : "输入你的答案…"} /><button type="button" disabled={busy || !custom.trim()} onClick={() => choose(custom.trim())}>{step + 1 === request.questions.length ? "提交" : "下一题"}<ArrowRight size={13} /></button></div></>}
+  </div>;
+}
+
 const PLAN_PEER_LABELS: Record<PlanPeerOutcome, string> = {
-  approved: "同伴评审已通过",
+  approved: "作者与同伴已达成共识",
   escalated: "同伴评审没有通过",
   skipped: "没有同伴评审（评审开关已关闭）",
 };
@@ -1572,7 +1614,7 @@ function AgentRouteChip({ agentId, agents }: { agentId: string; agents: AgentSum
 
 function agentReplyLabel(item: Extract<TranscriptItem, { type: "agent" }>, agents: AgentSummary[]): string {
   if (item.purpose === "review") return item.replyToAgentId ? `审核 ${agentName(agents, item.replyToAgentId)} 的交付` : "同行审核";
-  if (item.replyToAgentId && item.incomingKind === "review-feedback") return `根据 ${agentName(agents, item.replyToAgentId)} 的审核意见返工`;
+  if (item.replyToAgentId && item.incomingKind === "review-feedback") return `与 ${agentName(agents, item.replyToAgentId)} 继续协商`;
   if (item.replyToAgentId && item.incomingKind === "collaboration") return `回应 ${agentName(agents, item.replyToAgentId)} 的转交`;
   if (item.replyToAgentId) return `回复 ${agentName(agents, item.replyToAgentId)}`;
   return item.replyToHuman ? "回复你" : "独立运行";
@@ -1661,6 +1703,12 @@ export function buildTranscript(events: StoredPlatformEvent[], threadId?: string
       applyPlanEvent(runs.get(event.taskRunId), event);
       continue;
     }
+    if (event.type === "clarification.requested") {
+      if (event.threadId !== threadId) continue;
+      const run = runs.get(event.runId);
+      if (run) run.clarification = { runId: event.runId, agentId: event.agentId, questions: event.questions };
+      continue;
+    }
     if (!("runId" in event) || event.threadId !== threadId) continue;
     const run = runs.get(event.runId);
     if (!run) continue;
@@ -1710,7 +1758,7 @@ type ReviewEvent = Extract<
   { type: "review.requested" | "review.submitted" | "review.rework" | "review.resolved" }
 >;
 
-/** Review state lives on the originating task run, across every rework round. */
+/** Review state lives on the originating task run, across every discussion round. */
 function applyReviewEvent(
   run: Extract<TranscriptItem, { type: "agent" }> | undefined,
   event: ReviewEvent,

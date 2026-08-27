@@ -59,6 +59,31 @@ test("the collaboration prompt makes human clarification a pre-review gate", () 
   assert.match(prompt, /only then submit the deliverable for peer review/);
 });
 
+test("peer review prompts make later rounds a discussion instead of reviewer commands", () => {
+  const authorPrompt = buildSystemPrompt(request("author-discussion", []));
+  assert.match(authorPrompt, /Review findings are arguments, not commands/);
+  assert.match(authorPrompt, /no separate accept\/reject ceremony/);
+  assert.match(authorPrompt, /Do not comply merely to satisfy the reviewer/);
+
+  const reviewRequest: RuntimeRequest = {
+    ...request("review-discussion", []),
+    reviewOf: {
+      taskRunId: "task-1",
+      authorAgentId: "pi",
+      round: 2,
+      maxRounds: 2,
+      reviewType: "verify",
+      independent: true,
+    },
+    submitReview: async () => ({ accepted: true }),
+  };
+  const reviewerPrompt = buildSystemPrompt(reviewRequest);
+  assert.match(reviewerPrompt, /continued discussion, not a compliance inspection/);
+  assert.match(reviewerPrompt, /rebut.*earlier suggestion/i);
+  assert.match(reviewerPrompt, /Either peer is allowed to change their mind/);
+  assert.match(reviewerPrompt, /human decides/);
+});
+
 test("DeepSeek runtime requires and recognizes its API key", () => {
   const spec = {
     kind: "pi" as const,
@@ -238,7 +263,7 @@ process.on("SIGTERM", () => process.exit(0));
     assert.equal(secondEvents.find((event) => event.type === "tool_start")?.toolName, "submit_review");
 
     process.env.FAKE_CODEX_TOOL = "request_clarification";
-    let clarificationQuestions: string[] | undefined;
+    let clarificationQuestions: Array<string | { question: string; options?: Array<{ label: string; value?: string; recommended?: boolean }> }> | undefined;
     const thirdEvents: RuntimeEvent[] = [];
     const thirdRequest = request("run-3", thirdEvents);
     thirdRequest.requestClarification = async (input) => {

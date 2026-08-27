@@ -88,7 +88,7 @@ export class PiRuntimeAdapter implements AgentRuntime {
       name: "submit_review",
       label: "Submit a peer-review verdict",
       description:
-        "Record your verdict on the work you were asked to review. Only available while reviewing another Agent's deliverable. Call it exactly once.",
+        "Record your current verdict in a peer discussion. Only available while reviewing another Agent's deliverable. Approve a final candidate you checked and can stand behind; changes-requested states objections for continued discussion. Call it exactly once.",
       parameters: Type.Object({
         verdict: Type.Union([Type.Literal("approved"), Type.Literal("changes-requested")], {
           description: "approved when the work can ship as is",
@@ -143,9 +143,9 @@ export class PiRuntimeAdapter implements AgentRuntime {
       name: "request_clarification",
       label: "Ask the human before planning or executing",
       description:
-        "Call before submit_plan or complete_task when missing human input would materially change the goal, architecture, acceptance criteria, or implementation. Ask only the smallest focused set of questions, put the same questions in your assistant response, then stop and wait. Do not use this for details you can discover locally or resolve with a safe reversible assumption.",
+        "Call before submit_plan or complete_task when missing human input would materially change the goal, architecture, acceptance criteria, or implementation. Each question may include options with label/value/recommended to give the human a choice. Ask only the smallest focused set of questions, put the same questions in your assistant response, then stop and wait. Do not use this for details you can discover locally or resolve with a safe reversible assumption.",
       parameters: Type.Object({
-        questions: Type.Array(Type.String(), {
+        questions: Type.Array(Type.Union([Type.String(), Type.Object({ question: Type.String(), options: Type.Optional(Type.Array(Type.Object({ label: Type.String(), value: Type.Optional(Type.String()), recommended: Type.Optional(Type.Boolean()) }))) })]), {
           minItems: 1,
           maxItems: 5,
           description: "The focused questions the human must answer before the task can continue",
@@ -663,7 +663,9 @@ export function buildSystemPrompt(request: RuntimeRequest): string {
     "- A plan, design, or proposal is a deliverable too: call submit_plan so a peer pressure-tests it and the human decides before anyone builds it.",
     "- What you declare is reviewed by a different peer before it counts as delivered. The reviewer is a peer, not a supervisor.",
     "- Your own word that the work is done does not settle it. Neither does a teammate's: when you review, disbelieve first and check the artifacts yourself.",
-    "- Accept work you can own; challenge weak assumptions with evidence.",
+    "- Review findings are arguments, not commands. When your work comes back, use your own judgment: improve what is genuinely wrong, rebut mistaken claims with evidence, and offer alternatives where neither proposal is best.",
+    "- Discuss through the ordinary response and the next complete candidate; there is no separate accept/reject ceremony for the author. Do not comply merely to satisfy the reviewer.",
+    "- Accept work you can own; challenge weak assumptions with evidence. The goal is a version both peers can stand behind, or a clear disagreement for the human to decide.",
     "- If a teammate should act, call post_message and put their @handle at the start of a line.",
     "- A post_message without a recognized teammate mention is visible to the human but wakes nobody.",
     "- Ordinary assistant output, including @handles, never routes to another Agent.",
@@ -708,7 +710,7 @@ function reviewBrief(assignment: ReviewAssignment): string[] {
         "- Start from not-ready. The plan has to convince you; your doubt needs no justification.",
         "- Judge it against the human's original task, not against the author's framing of that task.",
         "- Attack the assumptions it never argues for, the failure modes it skips, the work it hides behind one line.",
-        "- approved means you would put your own name on executing it as written; changes-requested returns concrete suggestions.",
+        "- approved means both peers have reached a plan you would put your own name on executing as written; changes-requested states concrete objections for continued discussion.",
       ]
     : [
         "- Start from not-approved. The author's claim is the thing under test, not evidence for itself.",
@@ -716,12 +718,21 @@ function reviewBrief(assignment: ReviewAssignment): string[] {
         "- Treat the author's evidence list as a set of assertions to reproduce, not a report to summarize.",
         "- Hunt for what a confident claim would hide: dropped requirements, untouched edge cases, error paths, tests that assert nothing, changes it never mentioned.",
         "- Anything you could not check with the access you have is unverified: say so, and never approve on it.",
-        "- Do not redo the work yourself. Say concretely what must change.",
+        "- Do not redo the work yourself. State concrete objections and the evidence behind them.",
       ];
   return [
     "",
     header,
     ...body,
+    ...(assignment.round > 1
+      ? [
+          "- This is a continued discussion, not a compliance inspection. Read the author's latest reasoning and candidate on their merits.",
+          "- The author may adopt, rebut, or replace your earlier suggestion. Reconsider it honestly; do not repeat a finding without answering the author's evidence.",
+          "- Withdraw or refine an objection when the author has resolved it. Either peer is allowed to change their mind.",
+        ]
+      : [
+          "- Your findings are peer arguments, not orders. The author may adopt them, rebut them with evidence, or propose a better alternative.",
+        ]),
     ...(assignment.independent
       ? []
       : [
@@ -732,9 +743,10 @@ function reviewBrief(assignment: ReviewAssignment): string[] {
     "- changes-requested requires at least one concrete finding.",
     "- approved requires listing in checks what you ran yourself; an approval that cannot name one is rejected.",
     "- Ending without submit_review is not an approval: the task is escalated to the human.",
-    "- Do not manufacture agreement to close the loop. A review that finds nothing has usually not looked.",
+    "- The goal is a final candidate both peers can stand behind, not obedience to you and not victory for either side.",
+    "- Do not manufacture agreement to close the loop. If material disagreement remains in the final round, request changes so the human decides.",
     ...(assignment.round >= assignment.maxRounds
-      ? ["- This is the final round. Rejecting now escalates to the human instead of another rework."]
+      ? ["- This is the final round. If material disagreement remains, request changes so the human decides."]
       : []),
   ];
 }

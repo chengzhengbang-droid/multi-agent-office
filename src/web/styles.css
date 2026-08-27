@@ -251,6 +251,20 @@ button, .thread-item, .provider-option, .runtime-choice, .suggestion-grid button
    Conversation
    ============================================================ */
 .conversation { min-height: 0; flex: 1; overflow-y: auto; scrollbar-gutter: stable; }
+.clarification-card { margin: 16px 0 4px 42px; max-width: 620px; padding: 16px; border: 1px solid color-mix(in srgb, var(--accent) 36%, var(--border)); border-radius: var(--radius-lg); background: color-mix(in srgb, var(--accent-soft) 48%, var(--surface)); box-shadow: var(--shadow-sm); }
+.clarification-title { display: flex; align-items: center; gap: 7px; color: var(--accent); font-size: 12px; }
+.clarification-title strong { color: var(--text); font-weight: 700; }
+.clarification-title span { margin-left: auto; color: var(--faint); font-size: 10px; }
+.clarification-question { margin: 12px 0; color: var(--text); font-size: 13px; line-height: 1.55; font-weight: 600; }
+.clarification-options { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; }
+.clarification-options button { display: inline-flex; align-items: center; gap: 7px; min-height: 34px; padding: 0 11px; border: 1px solid var(--border); border-radius: 9px; background: var(--surface); color: var(--text); cursor: pointer; font-size: 11.5px; }
+.clarification-options button:hover { border-color: var(--accent); background: var(--accent-soft); color: var(--accent-strong); }
+.clarification-options em { padding: 2px 5px; border-radius: 999px; background: var(--accent-soft); color: var(--accent); font-size: 9px; font-style: normal; font-weight: 700; }
+.clarification-custom { display: flex; gap: 7px; }
+.clarification-custom input { min-width: 0; flex: 1; height: 34px; padding: 0 10px; border: 1px solid var(--border); border-radius: 9px; background: var(--surface); color: var(--text); font-size: 11.5px; }
+.clarification-custom button { display: inline-flex; align-items: center; gap: 5px; height: 34px; padding: 0 10px; border: 0; border-radius: 9px; background: var(--ink); color: var(--on-ink); cursor: pointer; font-size: 11px; font-weight: 650; }
+.clarification-custom button:disabled, .clarification-options button:disabled { opacity: .45; cursor: not-allowed; }
+.clarification-submitted { display: flex; align-items: center; gap: 6px; margin: 12px 0 0; color: var(--success); font-size: 11.5px; font-weight: 650; }
 .transcript { width: min(840px, calc(100% - 48px)); margin: 0 auto; padding: 38px 0 72px; }
 .conversation-intro { width: 100%; display: flex; align-items: center; gap: 10px; color: var(--muted); margin-bottom: 24px; padding: 0 2px 18px; border-bottom: 1px solid var(--border-soft); }
 .intro-icon { width: 34px; height: 34px; display: grid; place-items: center; border: 1px solid color-mix(in srgb, var(--accent) 18%, var(--border-soft)); border-radius: 11px; background: color-mix(in srgb, var(--accent-soft) 72%, var(--surface)); color: var(--accent); box-shadow: var(--shadow-xs); }

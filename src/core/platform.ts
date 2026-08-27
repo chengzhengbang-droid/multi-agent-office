@@ -205,8 +205,8 @@ export class MultiAgentPlatform {
   /** runIds that changed the workspace, declared or not. */
   private readonly runWriteEffects = new Set<Id>();
   /** runId -> material questions the Agent chose to ask before delivery. */
-  private readonly runClarifications = new Map<Id, string[]>();
-  /** taskRunId -> what its review rounds judge, stable across rework. */
+  private readonly runClarifications = new Map<Id, Array<string | { question: string; options?: Array<{ label: string; value?: string; recommended?: boolean }> }>>();
+  /** taskRunId -> what its review rounds judge, stable across discussion rounds. */
   private readonly taskReviewTypes = new Map<Id, ReviewType>();
   /** reviewRunId -> the claim that review is checking, if the author made one. */
   private readonly reviewDeclarations = new Map<Id, DeliverableDeclaration>();
@@ -958,7 +958,7 @@ export class MultiAgentPlatform {
   // all escalate to the human), and nothing with side effects is auto-retried.
   // ---------------------------------------------------------------------------
 
-  /** The stable id of the task a run serves, across every rework round. */
+  /** The stable id of the task a run serves, across every discussion round. */
   private taskRunIdOf(run: AgentRun): Id {
     return run.taskRunId ?? run.id;
   }
@@ -969,7 +969,7 @@ export class MultiAgentPlatform {
    * "required" gates every such run, which is what made a greeting cost a full
    * review round-trip. "smart" additionally asks what the run actually
    * produced: an Agent that declared a deliverable, a run that wrote files
-   * without declaring one, or a rework round already inside the gate. Plain
+   * without declaring one, or a discussion round already inside the gate. Plain
    * conversation declares nothing, touches nothing, and is reviewed by nobody.
    */
   private isReviewGated(run: AgentRun): boolean {
@@ -1036,7 +1036,7 @@ export class MultiAgentPlatform {
     const taskRunId = this.taskRunIdOf(run);
     if (this.isClarificationOnly(run)) {
       // Initial questions simply end this conversational turn. If a material
-      // question surfaced during rework, close the old review task explicitly
+      // question surfaced during discussion, close the old review task explicitly
       // so it cannot keep cycling or leave a stale pending gate behind.
       if ((run.reviewRound ?? 0) > 0) {
         await this.resolveClarificationDuringRework(run);
@@ -1115,7 +1115,7 @@ export class MultiAgentPlatform {
       intent: "review-request",
       createdAt: now(),
       // Review runs keep the author's depth. Spending A2A depth on the gate
-      // would leave a reworking Agent unable to collaborate at all.
+      // would leave an author in discussion unable to collaborate at all.
       causal: {
         chainId: run.causal.chainId,
         parentRunId: run.id,
@@ -1265,7 +1265,7 @@ export class MultiAgentPlatform {
   /**
    * Agents that produced work in this collaboration chain. Review runs are not
    * counted: a reviewer that already rejected round 1 is exactly who should
-   * judge the rework, and counting its own review would disqualify it.
+   * judge the next candidate, and counting its own review would disqualify it.
    */
   private chainContributors(chainId: Id): Set<Id> {
     const contributors = new Set<Id>();
@@ -1307,7 +1307,7 @@ export class MultiAgentPlatform {
         "escalated",
         round,
         "max-rounds",
-        `${round} 轮审核后仍未通过，需要人工判断`,
+        `${round} 轮协商后作者与审核者仍未达成一致，需要人类裁决`,
       );
       return;
     }
@@ -1320,7 +1320,7 @@ export class MultiAgentPlatform {
         "escalated",
         round,
         "review-failed",
-        `执行者 @${authorAgentId ?? "unknown"} 已不可用，无法返工`,
+        `作者 @${authorAgentId ?? "unknown"} 已不可用，无法继续协商`,
       );
       return;
     }
@@ -1402,9 +1402,9 @@ export class MultiAgentPlatform {
       ...(reviewType ? { reviewType } : {}),
     });
     // A critique settling is not the end of a plan, only the end of the peer
-    // round. Approved or escalated, the plan now goes to the human — the peers
-    // advise, the human decides. Cancellation is the operator's own doing and
-    // asks nothing of them.
+    // round. Consensus or escalation both put the plan in front of the human:
+    // peers deliberate, while the human retains the final product decision.
+    // Cancellation is the operator's own doing and asks nothing of them.
     if (reviewType === "critique" && outcome !== "cancelled") {
       await this.awaitPlanApproval(
         run.threadId,
@@ -1438,7 +1438,7 @@ export class MultiAgentPlatform {
       rounds: run.reviewRound ?? 0,
       escalation: "clarification-needed",
       detail: questions.length > 0
-        ? `执行者需要你先补充：${questions.join("；")}`
+        ? `执行者需要你先补充：${questions.map((question) => typeof question === "string" ? question : question.question).join("；")}`
         : "执行者需要你先补充关键信息，再继续方案或执行",
       ...(run.reviewType ? { reviewType: run.reviewType } : {}),
     });
@@ -1571,15 +1571,17 @@ export class MultiAgentPlatform {
       };
     }
     const questions = (input.questions ?? [])
-      .map((question) => question.trim())
-      .filter(Boolean);
+      .map((question) => typeof question === "string"
+        ? question.trim()
+        : { ...question, question: question.question.trim(), ...(question.options ? { options: question.options.filter((option) => option.label.trim()).map((option) => ({ ...option, label: option.label.trim() })) } : {}) })
+      .filter((question) => typeof question === "string" ? Boolean(question) : Boolean(question.question));
     if (questions.length === 0) {
       return { accepted: false, reason: "at least one clarification question is required" };
     }
     if (questions.length > 5) {
       return { accepted: false, reason: "ask at most five focused clarification questions" };
     }
-    if (questions.some((question) => question.length > 2_000)) {
+    if (questions.some((question) => (typeof question === "string" ? question : question.question).length > 2_000)) {
       return { accepted: false, reason: "each clarification question must be at most 2,000 characters" };
     }
     if (this.runClarifications.has(run.id)) {
@@ -2181,7 +2183,8 @@ function buildReviewRequestContent(input: {
   // The two briefs differ in what counts as doing the job: a plan is judged on
   // its reasoning, finished work on the artifacts it claims to have produced.
   // Both start from disbelief: an author's "done" is a claim to test, never a
-  // fact to take on trust, and agreement is what has to be earned here.
+  // fact to take on trust. Later rounds are deliberation, though, not an order
+  // followed by a compliance check: both peers may change their minds.
   const brief =
     input.reviewType === "critique"
       ? [
@@ -2189,7 +2192,7 @@ function buildReviewRequestContent(input: {
           "This is a plan, not finished work. Try to break it before anyone builds it.",
           "Judge it against the human's original task above, not against the author's framing of that task.",
           "Attack the assumptions it never argues for, the failure modes it skips, and the work it hides behind one line.",
-          "approved means you would put your own name on executing it as written. changes-requested returns concrete suggestions for one revision round.",
+          "approved means you and the author have reached a version you would put your own name on executing as written. changes-requested states concrete objections for the next discussion round.",
         ]
       : [
           "Your default position is not-approved. The burden of proof is on the author's claim, not on your doubt.",
@@ -2197,8 +2200,17 @@ function buildReviewRequestContent(input: {
           "Go to the primary sources yourself: open the files it says it changed, run the commands it says it ran, read the real output.",
           "Look for what the claim would hide: dropped requirements from the original task, untouched edge cases, error paths, tests that assert nothing, changes it never mentioned.",
           "Anything you could not check with the access you have is unverified. Say so plainly, and never approve on it.",
-          "Do not redo the work yourself. Say concretely what must change.",
+          "Do not redo the work yourself. State concrete objections and the evidence behind them.",
         ];
+  const deliberation = input.round > 1
+    ? [
+        "This is a continued peer discussion, not a compliance inspection.",
+        "Read the author's latest response and candidate on their merits. They may have changed the work, rebutted your earlier objection with evidence, or proposed a better alternative.",
+        "Acknowledge sound reasoning and withdraw or refine objections when warranted. Never repeat an earlier finding without addressing the author's answer to it.",
+      ]
+    : [
+        "Your findings are peer arguments, not orders. The author may adopt them, rebut them with evidence, or propose an alternative in the next round.",
+      ];
   const independence = input.independent
     ? []
     : [
@@ -2218,10 +2230,12 @@ function buildReviewRequestContent(input: {
     "</deliverable>",
     "",
     ...brief,
+    ...deliberation,
     ...independence,
     "Finish by calling submit_review exactly once: approved, or changes-requested with concrete findings.",
     "approved requires listing at least one check you ran yourself; an approval that cannot name one is rejected.",
-    "Do not manufacture agreement to close the loop. A review that finds nothing has usually not looked.",
+    "The goal is a final candidate both peers can stand behind, not obedience to the reviewer and not victory for either side.",
+    "Do not manufacture agreement to close the loop. If material disagreement remains in the final round, request changes so the platform asks the human to decide.",
     "Ending without submit_review is not an approval — it escalates the task to the human.",
   ].join("\n");
 }
@@ -2284,15 +2298,19 @@ function buildReviewFeedbackContent(input: {
   const findings = input.submission.findings ?? [];
   const closing =
     input.reviewType === "critique"
-      ? `Revise your plan to address these. Round ${input.round + 1} will review the revision.`
-      : `Fix these and deliver again. Round ${input.round + 1} will verify your update.`;
+      ? `Continue the discussion and then submit a complete, self-contained candidate plan for round ${input.round + 1}.`
+      : `Continue the discussion and then present the complete candidate delivery for round ${input.round + 1}.`;
   return [
-    `@${input.authorAgentId} Review round ${input.round} of ${input.maxRounds}: changes requested.`,
+    `@${input.authorAgentId} Peer review round ${input.round} of ${input.maxRounds}: the reviewer raised objections.`,
     "",
     input.submission.summary,
     ...(findings.length > 0 ? ["", "Findings:", ...findings.map((f) => `- ${f}`)] : []),
     "",
+    "These are a peer's arguments, not instructions. Judge each one yourself: adopt it when it is right, rebut it with evidence when it is wrong, or propose a better alternative.",
+    "Respond naturally in your next delivery; no separate accept/reject action or point-by-point form is required. Explain the reasoning that matters so the reviewer can reconsider rather than merely check compliance.",
+    "Your next output is the candidate the reviewer will judge, so include the complete final result, not only a rebuttal or a change list.",
     closing,
+    `If you still disagree after round ${input.maxRounds}, preserve the disputed reasoning clearly; the platform will ask the human to decide rather than forcing either peer to yield.`,
   ].join("\n");
 }
 
@@ -2302,7 +2320,7 @@ function cursorKey(threadId: Id, agentId: Id): string {
 
 /**
  * The per-chain run budget bounds Agent-initiated fan-out, which is unbounded
- * and adversarial. Review and rework runs are platform-initiated and already
+ * and adversarial. Review and discussion runs are platform-initiated and already
  * bounded by maxReviewRounds, so counting them would let an Agent's A2A spend
  * strand a task mid-gate.
  */
