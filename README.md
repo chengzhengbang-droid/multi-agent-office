@@ -146,11 +146,45 @@ MAO_SETUP_COMPLETED=1
 - Windows：`%APPDATA%\Multi-Agent Office\`
 - Linux：`~/.config/Multi-Agent Office/`
 
-其中 `config.env` 保存密钥，`data/` 保存 Agent 花名册、事件和 session，`desktop.log` 用于排查启动问题。不要把 `config.env` 发给别人或提交到 Git。
+其中 `config.env` 保存密钥，`data/` 保存 Agent 花名册、事件和 session，`desktop.log` 用于排查启动问题，`graphics-mode.json` 记录本机可用的图形模式。不要把 `config.env` 发给别人或提交到 Git。
 
 Windows 旧版曾错误地把这些文件放在 `%APPDATA%\multi-agent-pi-mvp\`。新版首次启动时会把旧配置、数据和日志复制到正确目录；已存在的新目录内容不会被覆盖，旧目录也会保留以便恢复。
 
 Windows 版运行时会在通知区域保留图标，以便重新打开窗口、在默认浏览器中打开、查看配置或日志以及退出应用。关闭窗口只会隐藏到通知区域，不会停止本地服务；要完全退出，请右键通知区域图标并选择“退出”。
+
+### 启动闪退或黑屏（GPU 进程报错）
+
+少数 Windows 机器上，Chromium 的 GPU 进程会在第一帧之前被显卡驱动或安全软件结束，双击快捷方式后窗口一闪而过，命令行里是这样的日志：
+
+```
+ERROR:gpu_process_host.cc GPU process exited unexpectedly: exit_code=-2147483645
+FATAL:gpu_data_manager_impl_private.cc GPU process isn't usable. Goodbye.
+```
+
+这种情况由应用自己处理，用户不需要改用命令行启动，继续双击快捷方式即可：
+
+1. 每次启动会先把本次使用的图形模式写进 `graphics-mode.json`，窗口显示出来后才标记为“已验证”。
+2. GPU 进程崩溃时应用会自动重启一次，降到下一档模式；如果连重启的机会都没有（进程被直接结束），下一次双击快捷方式会读到未验证的记录并自动降档。三档依次是：
+   - `hardware`：默认，保留硬件加速，绝大多数机器一直停在这一档；
+   - `software`：`--disable-gpu --disable-gpu-compositing --disable-gpu-sandbox --in-process-gpu`；
+   - `compatibility`：在上一档基础上再加 `--no-sandbox`。
+3. 可用的模式会被记住，之后每次启动都直接使用它，不会再闪退，也不会反复重启。
+
+正常机器不受影响：窗口成功显示过一次，就一直停留在硬件加速。
+
+更新显卡驱动后想恢复硬件加速，或者画面显示异常想手动切到软件渲染，可以在菜单 **配置 → 图形兼容模式** 点击切换（Windows 也可以右键通知区域图标），应用会重启并记住新的选择。临时覆盖（不写入记录）用命令行参数或环境变量：
+
+```
+Multi-Agent-Office.exe --graphics-mode=hardware
+Multi-Agent-Office.exe --graphics-mode=software
+Multi-Agent-Office.exe --safe-graphics      # 等价于 --graphics-mode=compatibility
+```
+
+```dotenv
+MAO_GRAPHICS_MODE=compatibility
+```
+
+降级和重启的原因都会写进 `desktop.log`，排查时可以从菜单里的“打开运行日志”查看。
 
 ### 应用内更新
 
