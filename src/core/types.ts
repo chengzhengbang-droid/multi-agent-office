@@ -5,6 +5,7 @@ import type {
   PendingBallHold,
 } from "./collaboration.js";
 import type { ReviewerDegradeReason } from "./reviewer-routing.js";
+import type { PriorArtEntry, PriorArtLedger } from "./prior-art.js";
 
 export type Id = string;
 
@@ -236,6 +237,12 @@ export interface PlanApproval {
   peerSummary?: string;
   /** Why the critique stopped short of an approval, when it did. */
   escalation?: ReviewEscalation;
+  /**
+   * The precedents the author examined before proposing this, if any. Absent
+   * when the author recorded nothing — which the card says out loud rather
+   * than leaving the section empty and ambiguous.
+   */
+  priorArt?: PriorArtLedger;
   requestedAt: string;
 }
 
@@ -477,6 +484,21 @@ export type PlatformEventPayload =
       evidence?: string[];
     }
   | {
+      /**
+       * The author reported what prior art it examined before proposing a plan,
+       * or why it examined none. Recorded against the task rather than the run
+       * so a precedent survives the critique rounds that revise the plan.
+       */
+      type: "prior-art.recorded";
+      runId: Id;
+      threadId: Id;
+      taskRunId: Id;
+      agentId: Id;
+      entries: PriorArtEntry[];
+      /** Present instead of entries when the author examined none and said why. */
+      abstained?: string;
+    }
+  | {
       /** The Agent stopped before delivery because material human input is missing. */
       type: "clarification.requested";
       runId: Id;
@@ -554,6 +576,8 @@ export type PlatformEventPayload =
       reviewerAgentId?: Id;
       peerSummary?: string;
       escalation?: ReviewEscalation;
+      /** What the author examined before proposing this. Absent when nothing was recorded. */
+      priorArt?: PriorArtLedger;
     }
   | {
       /** The human's answer on a plan. Approval executes it; rejection replans. */

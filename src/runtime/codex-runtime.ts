@@ -1,6 +1,7 @@
 import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createInterface, type Interface as ReadLineInterface } from "node:readline";
 import type { AccessMode, CodexRuntimeSpec, RuntimeAvailability } from "../core/types.js";
+import type { PriorArtEntry } from "../core/prior-art.js";
 import { buildSystemPrompt, buildUserPrompt } from "./pi-runtime.js";
 import type { AgentRuntime, RuntimeEvent, RuntimeRequest, RuntimeResult } from "./runtime.js";
 import type { RuntimeSessionStore } from "./session-store.js";
@@ -44,7 +45,7 @@ interface TurnCompletion {
  * changes so sessions created by the old `codex exec` + MCP adapter are not
  * resumed without the native tools.
  */
-export const CODEX_SESSION_PROTOCOL = "app-server-dynamic-tools-v3-clowder-routing";
+export const CODEX_SESSION_PROTOCOL = "app-server-dynamic-tools-v4-prior-art";
 
 export class CodexRuntimeAdapter implements AgentRuntime {
   public readonly id: string;
@@ -519,6 +520,36 @@ function codexDynamicTools(): Array<Record<string, unknown>> {
         additionalProperties: false,
       },
     },
+    {
+      type: "function",
+      name: "record_prior_art",
+      description:
+        "While planning, before submit_plan: record how comparable systems solve this and what you decided about each. Pass entries you actually examined, or abstained with the reason you examined none (nothing comparable, unreachable from this run, or too local to inform). adopt requires a firsthand look (sourceKind source or docs) plus checked naming the file or command that proved the claim; adapt and reject require tradeoff. Declining to copy a precedent is a valid answer; saying nothing is not.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          entries: {
+            type: "array",
+            maxItems: 20,
+            items: {
+              type: "object",
+              properties: {
+                source: { type: "string", minLength: 1, maxLength: 2_000 },
+                sourceKind: { type: "string", enum: ["source", "docs", "marketing", "secondhand"] },
+                claim: { type: "string", minLength: 1, maxLength: 2_000 },
+                verdict: { type: "string", enum: ["adopt", "adapt", "reject"] },
+                checked: { type: "string", maxLength: 2_000 },
+                tradeoff: { type: "string", maxLength: 2_000 },
+              },
+              required: ["source", "sourceKind", "claim", "verdict"],
+              additionalProperties: false,
+            },
+          },
+          abstained: { type: "string", minLength: 1, maxLength: 2_000 },
+        },
+        additionalProperties: false,
+      },
+    },
     ...(["complete_task", "submit_plan"] as const).map((name) => ({
       type: "function",
       name,
@@ -627,6 +658,19 @@ async function executeDynamicTool(
         result.accepted
           ? "Clarification requested. Ask the questions in your response, do not submit a deliverable, and stop."
           : `Clarification request rejected: ${result.reason ?? "unknown reason"}`,
+      );
+    }
+    if (tool === "record_prior_art") {
+      const abstained = args.abstained;
+      const result = await request.recordPriorArt({
+        ...(Array.isArray(args.entries) ? { entries: args.entries as PriorArtEntry[] } : {}),
+        ...(typeof abstained === "string" ? { abstained } : {}),
+      });
+      return toolResult(
+        result.accepted,
+        result.accepted
+          ? "Prior art recorded. It travels with this plan to the peer critique and to the human's approval card."
+          : `Prior art rejected: ${result.reason ?? "unknown reason"}`,
       );
     }
     if (tool === "complete_task" || tool === "submit_plan") {

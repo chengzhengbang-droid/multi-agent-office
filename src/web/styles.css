@@ -809,6 +809,26 @@ button, .thread-item, .provider-option, .runtime-choice, .suggestion-grid button
 .plan-card-title svg { color: var(--accent-strong); }
 .plan-card p { margin: 6px 0 0; color: var(--muted); line-height: 1.55; }
 .plan-card-peer { font-weight: 600; }
+/* The plan's reading list. The "nothing recorded" state is styled as a warning
+   rather than hidden, because an absent section reads as "not applicable" when
+   what it actually means is that nobody checked. */
+.plan-prior-art { margin-top: 11px; padding: 10px 12px; border: 1px solid var(--border-soft); border-radius: 10px; background: var(--surface); }
+.plan-card p.plan-prior-art--none,
+.plan-card p.plan-prior-art--abstained { display: flex; align-items: flex-start; gap: 6px; margin-top: 11px; padding: 9px 11px; border-radius: 10px; line-height: 1.5; }
+.plan-card p.plan-prior-art--none { border: 1px solid var(--warning-line); background: var(--warning-soft); color: var(--warning); font-weight: 570; }
+.plan-card p.plan-prior-art--abstained { border: 1px solid var(--border-soft); background: var(--surface); }
+.plan-prior-art--none svg, .plan-prior-art--abstained svg { flex: none; margin-top: 2px; }
+.plan-card p.plan-prior-art-title { display: flex; align-items: center; gap: 6px; margin: 0 0 8px; color: var(--text); font-weight: 620; }
+.plan-prior-art-list { display: flex; flex-direction: column; gap: 8px; margin: 0; padding: 0; list-style: none; }
+.plan-prior-art-entry { padding-left: 9px; border-left: 2px solid var(--line); }
+.plan-prior-art-entry--adopt { border-left-color: var(--success); }
+.plan-prior-art-entry--adapt { border-left-color: var(--accent); }
+.plan-prior-art-entry--reject { border-left-color: var(--faint); }
+.plan-prior-art-verdict { display: inline-block; margin-right: 6px; color: var(--text); font-size: 11px; font-weight: 640; }
+.plan-prior-art-source { color: var(--muted); font-size: 11px; word-break: break-all; }
+.plan-prior-art-depth { margin-left: 6px; color: var(--faint); font-size: 10.5px; }
+.plan-card .plan-prior-art-claim { margin-top: 3px; font-size: 11.5px; }
+.plan-card .plan-prior-art-meta { margin-top: 2px; color: var(--faint); font-size: 10.5px; }
 .plan-card-body { margin-top: 11px; padding: 12px 13px; max-height: 340px; overflow-y: auto; border: 1px solid var(--border-soft); border-radius: 10px; background: var(--surface); }
 .plan-card-input { margin-top: 10px; width: 100%; resize: vertical; padding: 9px 11px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); color: var(--text); font: inherit; font-size: 12px; }
 .plan-card-input:focus { outline: none; border-color: var(--accent); }

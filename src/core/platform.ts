@@ -16,6 +16,14 @@ import {
   type ReviewerCandidate,
   type ReviewerDegradeReason,
 } from "./reviewer-routing.js";
+import {
+  mergePriorArt,
+  priorArtCritiqueBrief,
+  summarizePriorArt,
+  validatePriorArt,
+  type PriorArtLedger,
+  type PriorArtSummary,
+} from "./prior-art.js";
 import type {
   A2ARoutingMode,
   A2ARoutingProjection,
@@ -52,6 +60,8 @@ import type {
   HoldBallResult,
   PostAgentMessageInput,
   PostAgentMessageResult,
+  RecordPriorArtInput,
+  RecordPriorArtResult,
   RequestClarificationInput,
   RequestClarificationResult,
   ReviewAssignment,
@@ -243,6 +253,12 @@ export class MultiAgentPlatform {
    * a reviewer who never read round 1.
    */
   private readonly taskReviewers = new Map<Id, { agentId: Id; match?: ReviewerMatchRecord }>();
+  /**
+   * taskRunId -> the precedents its author examined, accumulated across
+   * critique rounds. Keyed by task rather than run because revising a plan
+   * does not unread what was read for the first draft.
+   */
+  private readonly taskPriorArt = new Map<Id, PriorArtLedger>();
   /** taskRunId -> the newest plan text, until its critique settles. */
   private readonly planDrafts = new Map<Id, PlanDraft>();
   /** taskRunId -> a plan parked in front of the human. Cleared when decided. */
@@ -664,6 +680,18 @@ export class MultiAgentPlatform {
       } else if (event.type === "review.resolved") {
         this.resolvedTaskRuns.add(event.taskRunId);
         this.forgetReviewState(event.taskRunId);
+      } else if (event.type === "prior-art.recorded") {
+        this.taskPriorArt.set(
+          event.taskRunId,
+          mergePriorArt(this.taskPriorArt.get(event.taskRunId), {
+            taskRunId: event.taskRunId,
+            authorAgentId: event.agentId,
+            outcome: event.entries.length > 0 ? "recorded" : "abstained",
+            entries: event.entries,
+            ...(event.abstained ? { abstainedReason: event.abstained } : {}),
+            recordedAt: event.recordedAt,
+          }),
+        );
       } else if (event.type === "plan.awaiting-approval") {
         this.planApprovals.set(event.taskRunId, {
           threadId: event.threadId,
@@ -685,8 +713,10 @@ export class MultiAgentPlatform {
           ...(event.reviewerAgentId ? { reviewerAgentId: event.reviewerAgentId } : {}),
           ...(event.peerSummary ? { peerSummary: event.peerSummary } : {}),
           ...(event.escalation ? { escalation: event.escalation } : {}),
+          ...(event.priorArt ? { priorArt: event.priorArt } : {}),
           requestedAt: event.recordedAt,
         });
+        this.taskPriorArt.delete(event.taskRunId);
       } else if (event.type === "plan.decided") {
         this.planApprovals.delete(event.taskRunId);
       }
@@ -895,6 +925,7 @@ export class MultiAgentPlatform {
         postMessage: (message) => this.acceptAgentMessage(run, message),
         holdBall: (input) => this.acceptBallHold(run, input),
         requestClarification: (input) => this.acceptClarificationRequest(run, input),
+        recordPriorArt: (input) => this.acceptPriorArt(run, input),
         declareDeliverable: (input) => this.acceptDeliverableDeclaration(run, input),
       });
 
@@ -1399,6 +1430,11 @@ export class MultiAgentPlatform {
       independent: match.independent,
       degradeReasons: match.degradeReasons,
       ...(declaration ? { declaration } : {}),
+      // A critique judges an approach, so what the author read before choosing
+      // it is part of what is under review. A verification judges artifacts.
+      ...((run.reviewType ?? this.taskReviewTypes.get(run.taskRunId)) === "critique"
+        ? { priorArt: summarizePriorArt(this.taskPriorArt.get(run.taskRunId)) }
+        : {}),
     };
   }
 
@@ -1486,6 +1522,9 @@ export class MultiAgentPlatform {
         reviewType,
         degradeReasons: match.degradeReasons,
         ...(declaration ? { declaration } : {}),
+        ...(reviewType === "critique"
+          ? { priorArt: summarizePriorArt(this.taskPriorArt.get(taskRunId)) }
+          : {}),
       }),
       intent: "review-request",
       createdAt: now(),
@@ -1931,6 +1970,11 @@ export class MultiAgentPlatform {
     if (!draft) return;
     if (this.planApprovals.has(taskRunId)) return;
     this.planDrafts.delete(taskRunId);
+    // Consumed here the same way the draft is: it has been copied onto the
+    // approval and into the event, and a rejected plan starts a new task run
+    // whose own reading is what that proposal has to stand on.
+    const priorArt = this.taskPriorArt.get(taskRunId);
+    this.taskPriorArt.delete(taskRunId);
     const approval: PlanApproval = {
       threadId,
       taskRunId,
@@ -1943,6 +1987,7 @@ export class MultiAgentPlatform {
       ...(reviewerAgentId ? { reviewerAgentId } : {}),
       ...(peerSummary ? { peerSummary } : {}),
       ...(escalation ? { escalation } : {}),
+      ...(priorArt ? { priorArt } : {}),
       requestedAt: now(),
     };
     this.planApprovals.set(taskRunId, approval);
@@ -1965,6 +2010,7 @@ export class MultiAgentPlatform {
       ...(reviewerAgentId ? { reviewerAgentId } : {}),
       ...(peerSummary ? { peerSummary } : {}),
       ...(escalation ? { escalation } : {}),
+      ...(priorArt ? { priorArt } : {}),
     });
     const planRun = this.runs.get(approval.planRunId);
     if (planRun) {
@@ -2001,8 +2047,12 @@ export class MultiAgentPlatform {
     this.taskReviewTypes.delete(taskRunId);
     this.taskReviewers.delete(taskRunId);
     // Normally consumed by awaitPlanApproval; a cancelled critique never gets
-    // there, and a draft nobody will read is just a leak.
+    // there, and a draft nobody will read is just a leak. The same holds for
+    // the ledger: a plan that ends in a clarification never reaches the
+    // approval gate at all. Safe on replay too, because a replayed approval
+    // reads its ledger off the event rather than out of this map.
     this.planDrafts.delete(taskRunId);
+    this.taskPriorArt.delete(taskRunId);
     // Per-run state is dropped as each run leaves the scheduler; the
     // originating run keys itself, so replay reaches it here too.
     this.forgetRunGateState(taskRunId);
@@ -2084,6 +2134,59 @@ export class MultiAgentPlatform {
       chainId: run.causal.chainId,
       runId: run.id,
       reason: "clarification",
+    });
+    return { accepted: true };
+  }
+
+  /**
+   * Backs record_prior_art. The platform does not decide which plans deserve a
+   * look at how others solved this — it cannot read that intent, and inventing
+   * an expectation it cannot justify is how a forcing function ends up aimed at
+   * the wrong failure. What it does enforce is that a recorded precedent is
+   * checkable: adopting someone's design requires having read it, and declining
+   * to copy one requires saying why. Whether the ledger exists at all is not
+   * blocked here; it is reported to the critique reviewer and to the human.
+   */
+  private async acceptPriorArt(
+    run: AgentRun,
+    input: RecordPriorArtInput,
+  ): Promise<RecordPriorArtResult> {
+    if (run.purpose === "review") {
+      return {
+        accepted: false,
+        reason: "a reviewer judges the author's prior art; it does not record its own",
+      };
+    }
+    if (run.mode !== "plan") {
+      return {
+        accepted: false,
+        reason: "record_prior_art belongs to plan mode, where an approach is still being chosen",
+      };
+    }
+    const taskRunId = this.taskRunIdOf(run);
+    if (this.resolvedTaskRuns.has(taskRunId)) {
+      return { accepted: false, reason: "this task has already been resolved" };
+    }
+    const validation = validatePriorArt(input);
+    if (!validation.ok) return { accepted: false, reason: validation.reason };
+
+    const ledger: PriorArtLedger = {
+      taskRunId,
+      authorAgentId: run.agentId,
+      outcome: validation.entries.length > 0 ? "recorded" : "abstained",
+      entries: validation.entries,
+      ...(validation.abstained ? { abstainedReason: validation.abstained } : {}),
+      recordedAt: now(),
+    };
+    this.taskPriorArt.set(taskRunId, mergePriorArt(this.taskPriorArt.get(taskRunId), ledger));
+    await this.record({
+      type: "prior-art.recorded",
+      runId: run.id,
+      threadId: run.threadId,
+      taskRunId,
+      agentId: run.agentId,
+      entries: validation.entries,
+      ...(validation.abstained ? { abstained: validation.abstained } : {}),
     });
     return { accepted: true };
   }
@@ -2672,6 +2775,8 @@ function buildReviewRequestContent(input: {
   /** Why the routing had to settle for this reviewer, when it did. */
   degradeReasons: ReviewerDegradeReason[];
   declaration?: DeliverableDeclaration;
+  /** What the author examined before choosing this approach. Critique only. */
+  priorArt?: PriorArtSummary;
 }): string {
   const evidence = input.declaration?.evidence ?? [];
   const claim = input.declaration
@@ -2723,6 +2828,11 @@ function buildReviewRequestContent(input: {
   // A degraded match is stated, not hidden: a reviewer that does not know how
   // it is compromised cannot compensate for it.
   const independence = input.degradeReasons.flatMap((reason) => REVIEWER_DEGRADE_BRIEF[reason]);
+  // A plan's reading list is part of the plan. Whether the author examined
+  // prior art, declined with a reason, or said nothing at all changes what
+  // this reviewer should press on, so all three are stated rather than only
+  // the flattering one.
+  const priorArt = input.priorArt ? priorArtCritiqueBrief(input.priorArt).map((line) => line.replace(/^- /, "")) : [];
   return [
     header,
     "",
@@ -2736,6 +2846,7 @@ function buildReviewRequestContent(input: {
     "</deliverable>",
     "",
     ...brief,
+    ...priorArt,
     ...deliberation,
     ...independence,
     "Finish by calling submit_review exactly once: approved, or changes-requested with concrete findings.",
