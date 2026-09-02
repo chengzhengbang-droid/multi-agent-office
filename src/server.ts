@@ -97,6 +97,7 @@ const platform = new MultiAgentPlatform({
   maxParallelReadRuns: Number(process.env.MAO_MAX_PARALLEL_READ_RUNS ?? 4),
   reviewMode: parseReviewMode(process.env.MAO_REVIEW_GATE),
   maxReviewRounds: Number(process.env.MAO_MAX_REVIEW_ROUNDS ?? 2),
+  approvalStaleAfterMs: Number(process.env.MAO_APPROVAL_STALE_HOURS ?? 24) * 60 * 60 * 1000,
 });
 
 const vite = isDev
@@ -422,6 +423,17 @@ const server = createServer(async (request, response) => {
         sendJson(response, 400, { error: errorMessage(error) });
         return;
       }
+    }
+
+    // Every gate waiting on a human, across every thread. Clowder's Approval
+    // Hub exists because an approval raised in one thread is invisible from
+    // another; this is the same index, read straight off the event log.
+    if (url.pathname === "/api/approvals" && request.method === "GET") {
+      const threadId = url.searchParams.get("threadId");
+      sendJson(response, 200, {
+        approvals: await platform.getPendingApprovals(threadId ?? undefined),
+      });
+      return;
     }
 
     if (url.pathname === "/api/plans" && request.method === "GET") {

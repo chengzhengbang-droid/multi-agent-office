@@ -839,3 +839,35 @@ button, .thread-item, .provider-option, .runtime-choice, .suggestion-grid button
 .review-card-unstructured-note { font-weight: 620; }
 .review-card-unstructured { margin-top: 8px; padding: 9px 10px; max-height: 280px; overflow-y: auto; border: 1px solid var(--border-soft); border-radius: var(--radius-sm); background: var(--surface); }
 :root[data-theme="dark"] .thread-attention { border-color: #65472e; background: color-mix(in srgb, #382d24 72%, var(--surface)); }
+
+/* ============================================================
+   Approval index — every gate waiting on a human, across tasks
+   ============================================================ */
+.approvals-button { margin-left: 0; position: relative; }
+.approvals-button--waiting { border-color: color-mix(in srgb, var(--accent) 48%, var(--border)); color: var(--accent); }
+.approvals-badge { min-width: 17px; height: 17px; display: inline-grid; place-items: center; padding: 0 5px; border-radius: 999px; background: var(--accent); color: var(--surface); font-size: 10px; font-style: normal; font-weight: 700; }
+.approval-panel { position: fixed; z-index: 45; top: 8px; right: 8px; bottom: 8px; width: min(408px, calc(100vw - 32px)); display: flex; flex-direction: column; overflow: hidden; border: 1px solid var(--border); border-radius: 18px; background: var(--surface-elevated); box-shadow: var(--shadow-lg); backdrop-filter: saturate(140%) blur(18px); }
+.approval-panel > header { height: 60px; flex: 0 0 60px; display: flex; align-items: center; gap: 12px; padding: 0 14px 0 18px; border-bottom: 1px solid var(--border-soft); }
+.approval-panel > header > div { min-width: 0; display: flex; flex: 1; flex-direction: column; gap: 3px; }
+.approval-panel > header strong { font-size: 13px; letter-spacing: -.01em; }
+.approval-panel > header span { color: var(--faint); font-size: 10.5px; }
+.approval-empty { margin: 0; padding: 22px 18px; color: var(--faint); font-size: 11.5px; line-height: 1.6; }
+.approval-list { min-height: 0; margin: 0; padding: 14px; overflow-y: auto; list-style: none; display: flex; flex-direction: column; gap: 10px; }
+.approval-item { padding: 12px; border: 1px solid var(--border-soft); border-radius: var(--radius-md); background: var(--surface-soft); }
+.approval-item--plan-approval { border-color: color-mix(in srgb, var(--accent) 34%, var(--border)); }
+.approval-item--stale { border-style: dashed; }
+.approval-item-head { display: flex; align-items: center; gap: 7px; margin-bottom: 8px; }
+.approval-item-head time { margin-left: auto; color: var(--faint); font-size: 10px; }
+.approval-kind { padding: 2px 7px; border-radius: 999px; background: var(--accent-soft); color: var(--accent); font-size: 10px; font-weight: 640; }
+.approval-kind--runtime-failure, .approval-kind--review-escalation { background: color-mix(in srgb, var(--danger) 16%, transparent); color: var(--danger); }
+.approval-stale { padding: 2px 7px; border: 1px dashed var(--border); border-radius: 999px; color: var(--faint); font-size: 10px; }
+.approval-summary { margin: 0; color: var(--text); font-size: 12px; font-weight: 600; line-height: 1.5; }
+.approval-detail { margin: 6px 0 0; color: var(--muted); font-size: 11px; line-height: 1.55; }
+.approval-item-foot { display: flex; align-items: center; gap: 8px; margin-top: 11px; }
+.approval-source { min-width: 0; display: flex; flex: 1; align-items: center; gap: 5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--faint); font-size: 10.5px; }
+.approval-source i { font-style: normal; }
+.approval-source em { padding: 1px 6px; border-radius: 999px; background: var(--accent-soft); color: var(--accent); font-style: normal; font-size: 9.5px; }
+.approval-actions { display: flex; align-items: center; gap: 8px; }
+.approval-origin { color: var(--faint); font-size: 10px; }
+.approval-actions button { height: 28px; display: inline-flex; align-items: center; gap: 5px; padding: 0 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); color: var(--text); cursor: pointer; font-size: 11px; font-weight: 600; }
+.approval-actions button:hover { border-color: var(--accent); background: var(--accent-soft); color: var(--accent-strong); }

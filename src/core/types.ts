@@ -4,6 +4,7 @@ import type {
   CollaborationIntent,
   PendingBallHold,
 } from "./collaboration.js";
+import type { ReviewerDegradeReason } from "./reviewer-routing.js";
 
 export type Id = string;
 
@@ -155,6 +156,19 @@ export interface DeliverableDeclaration {
   summary: string;
   /** How a reviewer can check the claim: files touched, commands to run. */
   evidence?: string[];
+}
+
+/**
+ * What the reviewer routing settled on, kept in the log so a replayed review
+ * round pins the same reviewer and repeats the same brief. A degraded match is
+ * recorded rather than hidden: an approval from a peer that is not neutral, or
+ * that shares the author's model family, is worth less and has to say so.
+ */
+export interface ReviewerMatchRecord {
+  independent: boolean;
+  crossFamily: boolean;
+  degraded: boolean;
+  degradeReasons: ReviewerDegradeReason[];
 }
 
 export type ReviewVerdict = "approved" | "changes-requested";
@@ -481,6 +495,11 @@ export type PlatformEventPayload =
       messageId: Id;
       /** Absent in pre-smart-gate logs; replay treats that as "verify". */
       reviewType?: ReviewType;
+      /**
+       * How good a match the reviewer was. Absent in pre-routing-policy logs,
+       * where only chain independence was recorded and only in the brief.
+       */
+      reviewerMatch?: ReviewerMatchRecord;
     }
   | {
       type: "review.submitted";
