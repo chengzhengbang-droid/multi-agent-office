@@ -12,6 +12,7 @@ import { Type } from "typebox";
 import { providerEnvKeys } from "../config/provider-presets.js";
 import type { PiRuntimeSpec, RuntimeAvailability } from "../core/types.js";
 import { REVIEWER_DEGRADE_BRIEF } from "../core/reviewer-routing.js";
+import { PRIOR_ART_AUTHOR_BRIEF, priorArtCritiqueBrief } from "../core/prior-art.js";
 import { PiSharedRuntime, RequestResourceLoader } from "./pi-shared.js";
 import type {
   AgentRuntime,
@@ -231,6 +232,79 @@ export class PiRuntimeAdapter implements AgentRuntime {
       };
     };
 
+    // Prior art belongs to plan mode: it is a record of what the author read
+    // before choosing an approach, so a critique reviewer and the human can see
+    // whether the plan was chosen against how comparable systems solve this or
+    // in a vacuum. Declared on every run for a stable resumable tool surface;
+    // the platform refuses it outside plan mode.
+    const recordPriorArtTool = defineTool({
+      name: "record_prior_art",
+      label: "Record the precedents you examined before proposing this plan",
+      description:
+        "Call while planning, before submit_plan, to record how comparable systems solve this and what you decided about each. Pass entries you actually examined, or pass abstained with the reason you examined none (nothing comparable exists, you cannot reach any source from this run, or the change is too local for prior art to inform it). Adopting an approach requires having read its implementation or real documentation and naming what you read; a README or someone's summary is not a firsthand look. Not adopting is a valid answer as long as tradeoff says why.",
+      parameters: Type.Object({
+        entries: Type.Optional(
+          Type.Array(
+            Type.Object({
+              source: Type.String({ description: "URL, repository, paper, or local path you examined" }),
+              sourceKind: Type.Union(
+                [
+                  Type.Literal("source"),
+                  Type.Literal("docs"),
+                  Type.Literal("marketing"),
+                  Type.Literal("secondhand"),
+                ],
+                {
+                  description:
+                    "How deep you actually looked: source = the implementation itself, docs = official documentation or a paper's body, marketing = README/landing page/release post, secondhand = someone else's summary or your own recall",
+                },
+              ),
+              claim: Type.String({ description: "What this source does, stated so it could be proved wrong" }),
+              verdict: Type.Union(
+                [Type.Literal("adopt"), Type.Literal("adapt"), Type.Literal("reject")],
+                { description: "adopt = build it this way, adapt = take the shape and change something, reject = deliberately do not follow" },
+              ),
+              checked: Type.Optional(
+                Type.String({
+                  description:
+                    "What you read or ran that proved the claim to you: the file, path, or command. Required to adopt.",
+                }),
+              ),
+              tradeoff: Type.Optional(
+                Type.String({
+                  description: "Why this is not copied as-is. Required to adapt or reject.",
+                }),
+              ),
+            }),
+            { maxItems: 20, description: "The precedents you examined" },
+          ),
+        ),
+        abstained: Type.Optional(
+          Type.String({
+            description:
+              "Why you examined no prior art. Use instead of entries, never alongside them.",
+          }),
+        ),
+      }),
+      execute: async (_toolCallId, params) => {
+        const result = await request.recordPriorArt({
+          ...(params.entries ? { entries: params.entries } : {}),
+          ...(params.abstained ? { abstained: params.abstained } : {}),
+        });
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: result.accepted
+                ? "Prior art recorded. It travels with this plan to the peer critique and to the human's approval card."
+                : `Prior art rejected: ${result.reason ?? "unknown reason"}`,
+            },
+          ],
+          details: result,
+        };
+      },
+    });
+
     const completeTaskTool = defineTool({
       name: "complete_task",
       label: "Declare the task finished and submit it for verification",
@@ -308,6 +382,7 @@ export class PiRuntimeAdapter implements AgentRuntime {
         holdBallTool,
         submitReviewTool,
         requestClarificationTool,
+        recordPriorArtTool,
         completeTaskTool,
         submitPlanTool,
       ],
@@ -771,6 +846,7 @@ function planBrief(): string[] {
     "Plan mode is on for this run — the human asked for a plan, not the work:",
     "- You are read-only here. Editing and shell tools are withheld deliberately, not by accident.",
     "- Investigate first. Read the code, the tests, and the configuration you would touch, and plan against what is actually there.",
+    ...PRIOR_ART_AUTHOR_BRIEF,
     "- Write the plan so someone else could execute it: the files to change, the order to change them in, and how each step is verified.",
     "- Resolve uncertainty before submission: ask the human first when an answer would materially change the plan; otherwise state the safe non-blocking assumptions you made.",
     "- Finish by calling submit_plan only when the plan is executable as written and contains no blocking questions. A peer critiques it, then the human decides whether it is built.",
@@ -792,6 +868,7 @@ function reviewBrief(assignment: ReviewAssignment): string[] {
         "- Judge it against the human's original task, not against the author's framing of that task.",
         "- Attack the assumptions it never argues for, the failure modes it skips, the work it hides behind one line.",
         "- approved means both peers have reached a plan you would put your own name on executing as written; changes-requested states concrete objections for continued discussion.",
+        ...(assignment.priorArt ? priorArtCritiqueBrief(assignment.priorArt) : []),
       ]
     : [
         "- Start from not-approved. The author's claim is the thing under test, not evidence for itself.",

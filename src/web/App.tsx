@@ -20,6 +20,7 @@ import {
   EyeOff,
   Folder,
   KeyRound,
+  BookOpen,
   ListChecks,
   Menu,
   MessageSquare,
@@ -61,6 +62,7 @@ import {
 } from "../config/custom-providers";
 import { agentAvatarTone, agentInitials } from "./agent-identity";
 import type { A2ARoutingMode, CollaborationIntent } from "../core/collaboration";
+import type { PriorArtLedger, PriorArtSourceKind, PriorArtVerdict } from "../core/prior-art";
 import {
   projectCollaborationChains,
   projectHandoffDeliveries,
@@ -194,6 +196,8 @@ interface PlanState {
   reviewerAgentId?: string;
   peerSummary?: string;
   escalation?: ReviewEscalation;
+  /** What the author examined before proposing this. Absent when it recorded nothing. */
+  priorArt?: PriorArtLedger;
   /** Absent while the plan is still waiting on the human. */
   decision?: PlanDecision;
   note?: string;
@@ -1628,6 +1632,62 @@ function ClarificationCard({ request, busy, onSubmit }: { request: Clarification
   </div>;
 }
 
+const PRIOR_ART_VERDICT_LABELS: Record<PriorArtVerdict, string> = {
+  adopt: "照做",
+  adapt: "改造后采用",
+  reject: "不跟",
+};
+
+const PRIOR_ART_SOURCE_LABELS: Record<PriorArtSourceKind, string> = {
+  source: "读了实现",
+  docs: "读了官方文档",
+  marketing: "只看了项目自述",
+  secondhand: "二手转述",
+};
+
+/**
+ * The plan's reading list. It is rendered before the plan text, not after,
+ * because "谁已经解决过这个问题、作者看了没有" changes how the rest of the card
+ * should be read. The empty case is the one that has to be loud: a section that
+ * silently disappears when nothing was examined would make 没查 look identical
+ * to 没这回事.
+ */
+function PriorArtSection({ ledger }: { ledger?: PriorArtLedger }) {
+  if (!ledger) {
+    return (
+      <p className="plan-prior-art plan-prior-art--none">
+        <BookOpen size={12} />未记录业界先例——这个方案没有对照过别人怎么解决，也没有说明为什么不用对照。
+      </p>
+    );
+  }
+  if (ledger.outcome === "abstained") {
+    return (
+      <p className="plan-prior-art plan-prior-art--abstained">
+        <BookOpen size={12} />未查业界先例，作者给出的理由：{ledger.abstainedReason ?? "（未填写）"}
+      </p>
+    );
+  }
+  return (
+    <div className="plan-prior-art">
+      <p className="plan-prior-art-title">
+        <BookOpen size={12} />作者查过的 {ledger.entries.length} 个先例
+      </p>
+      <ul className="plan-prior-art-list">
+        {ledger.entries.map((entry) => (
+          <li key={entry.source} className={`plan-prior-art-entry plan-prior-art-entry--${entry.verdict}`}>
+            <span className="plan-prior-art-verdict">{PRIOR_ART_VERDICT_LABELS[entry.verdict]}</span>
+            <span className="plan-prior-art-source">{entry.source}</span>
+            <span className="plan-prior-art-depth">{PRIOR_ART_SOURCE_LABELS[entry.sourceKind]}</span>
+            <p className="plan-prior-art-claim">{entry.claim}</p>
+            {entry.checked && <p className="plan-prior-art-meta">核验：{entry.checked}</p>}
+            {entry.tradeoff && <p className="plan-prior-art-meta">不照抄的理由：{entry.tradeoff}</p>}
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
 const PLAN_PEER_LABELS: Record<PlanPeerOutcome, string> = {
   approved: "作者与同伴已达成共识",
   escalated: "同伴评审没有通过",
@@ -1677,6 +1737,7 @@ function PlanCard({
         {plan.escalation ? ` · ${REVIEW_ESCALATION_LABELS[plan.escalation]}` : ""}
       </p>
       {plan.peerSummary && <p className="plan-card-summary">{plan.peerSummary}</p>}
+      <PriorArtSection {...(plan.priorArt ? { ledger: plan.priorArt } : {})} />
       <div className="plan-card-body markdown-body">
         <ReactMarkdown remarkPlugins={[remarkGfm]}>{plan.plan}</ReactMarkdown>
       </div>
@@ -1935,6 +1996,7 @@ function applyPlanEvent(
       ...(event.reviewerAgentId ? { reviewerAgentId: event.reviewerAgentId } : {}),
       ...(event.peerSummary ? { peerSummary: event.peerSummary } : {}),
       ...(event.escalation ? { escalation: event.escalation } : {}),
+      ...(event.priorArt ? { priorArt: event.priorArt } : {}),
     };
     return;
   }
