@@ -15,6 +15,7 @@ import {
   CirclePlus,
   Clock3,
   Download,
+  Inbox,
   Eye,
   EyeOff,
   Folder,
@@ -66,6 +67,12 @@ import {
   type CollaborationChainProjection,
   type HandoffDeliveryProjection,
 } from "../core/collaboration-read-model";
+import {
+  countPendingApprovals,
+  projectApprovals,
+  type ApprovalItem,
+  type ApprovalKind,
+} from "../core/approval-index";
 import type {
   AccessMode,
   AgentCatalogV1,
@@ -233,6 +240,7 @@ export function App() {
   const [cancelling, setCancelling] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [drawerOpen, setDrawerOpen] = useState(false);
+  const [approvalsOpen, setApprovalsOpen] = useState(false);
   const [connectionState, setConnectionState] = useState<"connecting" | "connected" | "reconnecting">("connecting");
   const [theme, setTheme] = useState<"light" | "dark">(() => {
     const saved = window.localStorage.getItem("mao-theme");
@@ -306,6 +314,7 @@ export function App() {
       }
       if (event.key === "Escape") {
         setDrawerOpen(false);
+        setApprovalsOpen(false);
         setSidebarOpen(false);
         setWorkspacePickerOpen(false);
         setCatalogOpen(false);
@@ -333,6 +342,11 @@ export function App() {
     [data?.events, selectedThreadId],
   );
   const latestCollaboration = collaborationChains[0];
+  // The cross-thread approval index. It is deliberately not filtered by the
+  // selected thread: the whole reason it exists is that a gate raised in one
+  // thread is invisible from another.
+  const approvals = useMemo(() => projectApprovals(data?.events ?? []), [data?.events]);
+  const pendingApprovals = countPendingApprovals(approvals);
   const attentionRuns = useMemo(() => transcript.filter(isAttentionRun), [transcript]);
   const attentionKey = attentionRuns.map((item) => `${item.id}:${item.review?.status ?? ""}:${item.plan?.decision ?? "pending"}`).join("|");
   const activeChainId = useMemo(() => findActiveChain(data?.events ?? [], selectedThreadId), [data?.events, selectedThreadId]);
@@ -536,6 +550,7 @@ export function App() {
               <span className="presence-avatars">{(data?.agents ?? []).filter((agent) => agent.enabled && agent.availability.available).slice(0, 3).map((agent) => <AgentAvatar agentId={agent.id} key={agent.id} />)}</span>
               <span className="presence-copy"><strong>{onlineCount} Agent</strong><small>{activeChainId ? "协作进行中" : "在线待命"}</small></span>
             </div>
+            <button className={`details-button approvals-button ${approvalsOpen ? "details-button--active" : ""} ${pendingApprovals > 0 ? "approvals-button--waiting" : ""}`} type="button" onClick={() => setApprovalsOpen(!approvalsOpen)} title="所有等待你处理的事项，跨任务汇总"><Inbox size={16} />待我处理{pendingApprovals > 0 && <i className="approvals-badge">{pendingApprovals}</i>}</button>
             <button className={`details-button ${drawerOpen ? "details-button--active" : ""}`} type="button" onClick={() => setDrawerOpen(!drawerOpen)}><PanelRight size={16} />运行面板</button>
           </div>
         </header>
@@ -605,6 +620,21 @@ export function App() {
         <Composer planMode={planMode} onPlanModeChange={setPlanMode} routingMode={routingMode} onRoutingModeChange={setRoutingMode} agents={data?.agents ?? []} fallbackAgent={fallbackAgent} configured={configured} value={draft} onChange={setDraft} onSend={sendTask} onCancel={cancelTask} attachments={attachments} onAttachmentsChange={setAttachments} sending={sending} cancelling={cancelling} active={Boolean(activeChainId)} workspace={activeWorkspace} onWorkspaceClick={() => setWorkspacePickerOpen(true)} />
       </main>
 
+      <ApprovalPanel
+        open={approvalsOpen}
+        onClose={() => setApprovalsOpen(false)}
+        approvals={approvals}
+        agents={data?.agents ?? []}
+        threads={threads}
+        selectedThreadId={selectedThreadId}
+        onOpenItem={(item) => {
+          setSelectedThreadId(item.threadId);
+          const path = threads.find((thread) => thread.id === item.threadId)?.workingDirectory ?? data?.workspace.path;
+          if (path) setSelectedWorkspace({ name: workspaceName(path), path });
+          setApprovalsOpen(false);
+          setSidebarOpen(false);
+        }}
+      />
       <DetailsDrawer open={drawerOpen} onClose={() => setDrawerOpen(false)} thread={selectedThread} agents={data?.agents ?? []} workspace={activeWorkspace} events={data?.events ?? []} />
       <WorkspacePicker open={workspacePickerOpen} current={activeWorkspace} recent={recentWorkspaces} onClose={() => setWorkspacePickerOpen(false)} onSelect={(workspace) => { setSelectedWorkspace(workspace); setSelectedThreadId(undefined); setDrawerOpen(false); setSidebarOpen(false); setWorkspacePickerOpen(false); }} />
       {data && <AgentCatalogEditor open={catalogOpen} catalog={data.catalog} agents={data.agents} onClose={() => setCatalogOpen(false)} onSave={saveCatalog} onAgentsRefreshed={refreshAgents} />}
@@ -1312,6 +1342,80 @@ function WorkspacePicker({ open, current, recent, onClose, onSelect }: Workspace
   const choose = async (requestedPath: string) => { if (!requestedPath.trim() || checking) return; setChecking(true); setError(""); try { const response = await fetch("/api/workspaces/validate", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ path: requestedPath }) }); const result = (await response.json()) as WorkspaceSummary & { error?: string }; if (!response.ok || !result.path) throw new Error(result.error ?? "无法使用该目录"); onSelect({ name: result.name, path: result.path }); } catch (validationError) { setError(errorMessage(validationError)); } finally { setChecking(false); } };
   if (!open) return null;
   return <div className="workspace-picker-scrim" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><section className="workspace-picker" role="dialog" aria-modal="true" aria-labelledby="workspace-picker-title"><header><div><strong id="workspace-picker-title">选择工作目录</strong><span>更换目录后会开始一个新对话</span></div><button className="icon-button" type="button" onClick={onClose} aria-label="关闭目录选择器"><X size={18} /></button></header><form onSubmit={(event) => { event.preventDefault(); void choose(path); }}><label htmlFor="workspace-path-input">目录路径</label><div className="workspace-path-input"><Folder size={16} /><input ref={inputRef} id="workspace-path-input" value={path} onChange={(event) => setPath(event.target.value)} placeholder="/Users/you/Documents/project" spellCheck={false} autoComplete="off" /></div>{error && <p className="workspace-error"><XCircle size={13} />{error}</p>}<p className="workspace-help">目录必须已经存在，并且当前用户拥有读取权限。对话创建后，其工作目录将保持不变。</p><button className="workspace-submit" type="submit" disabled={!path.trim() || checking}>{checking ? <span className="button-spinner" /> : <Folder size={14} />}使用此目录并新建对话</button></form>{recent.length > 0 && <div className="recent-workspaces"><h2>最近使用</h2>{recent.map((workspace) => <button type="button" key={workspace.path} onClick={() => void choose(workspace.path)} disabled={checking}><span className="recent-workspace-icon"><Folder size={14} /></span><span><strong>{workspace.name}</strong><small>{workspace.path}</small></span>{workspace.path === current?.path && <Check size={14} />}</button>)}</div>}</section></div>;
+}
+
+const APPROVAL_KIND_LABELS: Record<ApprovalKind, string> = {
+  "plan-approval": "方案待拍板",
+  "review-escalation": "审核需裁决",
+  clarification: "等你补充信息",
+  "runtime-failure": "执行链失败",
+};
+
+interface ApprovalPanelProps {
+  open: boolean;
+  onClose(): void;
+  approvals: ApprovalItem[];
+  agents: AgentSummary[];
+  threads: ThreadSummary[];
+  selectedThreadId?: string;
+  onOpenItem(item: ApprovalItem): void;
+}
+
+/**
+ * The Approval Hub surface: everything waiting on the human, in one list, no
+ * matter which task raised it. A stale item is still an open item — it is
+ * flagged as out of date, never dismissed — and an item whose trigger has no
+ * message anchor says "事件来源" instead of offering a jump that would only
+ * land at the top of a thread and pretend to be the original.
+ */
+function ApprovalPanel({ open, onClose, approvals, agents, threads, selectedThreadId, onOpenItem }: ApprovalPanelProps) {
+  if (!open) return null;
+  const waiting = approvals.filter((item) => item.status !== "settled");
+  return (
+    <aside className="approval-panel" aria-label="待我处理">
+      <header>
+        <div><strong>待我处理</strong><span>{waiting.length > 0 ? `${waiting.length} 项等待你的决定` : "没有等待你的事项"}</span></div>
+        <button className="icon-button" type="button" onClick={onClose} aria-label="关闭待办面板"><X size={18} /></button>
+      </header>
+      {waiting.length === 0 ? (
+        <p className="approval-empty">Agent 没有把球交回给你。有需要你拍板的方案、无法收敛的审核或缺失的信息时，会出现在这里。</p>
+      ) : (
+        <ul className="approval-list">
+          {waiting.map((item) => {
+            const thread = threads.find((candidate) => candidate.id === item.threadId);
+            return (
+              <li className={`approval-item approval-item--${item.kind} ${item.status === "stale" ? "approval-item--stale" : ""}`} key={item.id}>
+                <div className="approval-item-head">
+                  <span className={`approval-kind approval-kind--${item.kind}`}>{APPROVAL_KIND_LABELS[item.kind]}</span>
+                  {item.status === "stale" && <span className="approval-stale" title="等待过久，上下文可能已经变化；它没有被自动拒绝">上下文可能已过期</span>}
+                  <time>{formatRelativeTime(item.requestedAt)}</time>
+                </div>
+                <p className="approval-summary">{item.summary}</p>
+                {item.detail && <p className="approval-detail">{item.detail}</p>}
+                <div className="approval-item-foot">
+                  <span className="approval-source">
+                    <AgentAvatar agentId={item.requesterAgentId} />
+                    {agentName(agents, item.requesterAgentId)}
+                    <i>·</i>
+                    {thread ? cleanTitle(thread.title) : "未知任务"}
+                    {item.threadId === selectedThreadId && <em>当前任务</em>}
+                  </span>
+                  <span className="approval-actions">
+                    <span className="approval-origin" title={item.origin.kind === "message" ? "这条审批由该任务的原始指令触发" : "这条审批由运行事件触发，没有对应的原文消息"}>
+                      {item.origin.kind === "message" ? "有触发原文" : "事件来源"}
+                    </span>
+                    <button type="button" onClick={() => onOpenItem(item)}>
+                      {item.inlineApprovable ? "去拍板" : "去处理"}<ArrowRight size={13} />
+                    </button>
+                  </span>
+                </div>
+              </li>
+            );
+          })}
+        </ul>
+      )}
+    </aside>
+  );
 }
 
 interface DetailsDrawerProps { open: boolean; onClose(): void; thread?: ThreadSummary; agents: AgentSummary[]; workspace?: WorkspaceSummary; events: StoredPlatformEvent[] }

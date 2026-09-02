@@ -74,6 +74,7 @@ test("peer review prompts make later rounds a discussion instead of reviewer com
       maxRounds: 2,
       reviewType: "verify",
       independent: true,
+      degradeReasons: [],
     },
     submitReview: async () => ({ accepted: true }),
   };
@@ -250,6 +251,7 @@ process.on("SIGTERM", () => process.exit(0));
       maxRounds: 2,
       reviewType: "verify",
       independent: true,
+      degradeReasons: [],
     };
     secondRequest.submitReview = async (input) => {
       review = input;

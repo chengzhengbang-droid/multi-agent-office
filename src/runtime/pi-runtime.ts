@@ -11,6 +11,7 @@ import {
 import { Type } from "typebox";
 import { providerEnvKeys } from "../config/provider-presets.js";
 import type { PiRuntimeSpec, RuntimeAvailability } from "../core/types.js";
+import { REVIEWER_DEGRADE_BRIEF } from "../core/reviewer-routing.js";
 import { PiSharedRuntime, RequestResourceLoader } from "./pi-shared.js";
 import type {
   AgentRuntime,
@@ -813,12 +814,9 @@ function reviewBrief(assignment: ReviewAssignment): string[] {
       : [
           "- Your findings are peer arguments, not orders. The author may adopt them, rebut them with evidence, or propose a better alternative.",
         ]),
-    ...(assignment.independent
-      ? []
-      : [
-          "- You already worked in this chain, so you are not a neutral party: no uninvolved peer was available.",
-          "- Hold your own contribution to the standard you would apply to anyone else's.",
-        ]),
+    ...assignment.degradeReasons.flatMap((reason) =>
+      REVIEWER_DEGRADE_BRIEF[reason].map((line) => `- ${line}`),
+    ),
     "- Finish by calling submit_review exactly once, approved or changes-requested.",
     "- changes-requested requires at least one concrete finding.",
     "- approved requires listing in checks what you ran yourself; an approval that cannot name one is rejected.",
