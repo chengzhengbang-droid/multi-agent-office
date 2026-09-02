@@ -75,10 +75,6 @@ MAO_SETUP_COMPLETED=0
 
 # Maximum concurrent read-only Agent runs.
 MAO_MAX_PARALLEL_READ_RUNS=4
-
-# Composer opens in plan mode (read-only, plan first). Set to off to start in
-# ordinary execution mode.
-MAO_PLAN_MODE_DEFAULT=on
 `;
 
 const LOADING_PAGE = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>Multi-Agent Office</title><style>

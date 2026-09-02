@@ -102,8 +102,6 @@ interface BootstrapData {
   catalog: AgentCatalogV1;
   agents: AgentSummary[];
   workspace: WorkspaceSummary;
-  /** Server-side composer defaults. Absent when talking to an older server. */
-  defaults?: { planMode: boolean };
   events: StoredPlatformEvent[];
   cursor?: string;
 }
@@ -238,11 +236,7 @@ export function App() {
   const [updateActionRunning, setUpdateActionRunning] = useState(false);
   const [updateActionError, setUpdateActionError] = useState("");
   const [draft, setDraft] = useState("");
-  // Plan mode starts on unless the server says otherwise (MAO_PLAN_MODE_DEFAULT
-  // = off). Only the opening state comes from the server: switching it off in
-  // the composer holds for the rest of the session, so the default never
-  // reasserts itself mid-conversation.
-  const [planMode, setPlanMode] = useState(true);
+  const [planMode, setPlanMode] = useState(false);
   const [routingMode, setRoutingMode] = useState<A2ARoutingMode>("serial");
   const [decidingPlan, setDecidingPlan] = useState<string>();
   const [attachments, setAttachments] = useState<ComposerAttachment[]>([]);
@@ -290,7 +284,6 @@ export function App() {
       })
       .then((next) => {
         setData(next);
-        setPlanMode(next.defaults?.planMode ?? true);
         const firstThread = buildThreads(next.events)[0];
         setSelectedThreadId(firstThread?.id);
         const firstPath = firstThread?.workingDirectory ?? next.workspace.path;
@@ -483,7 +476,6 @@ export function App() {
 
   const finishSetup = (next: BootstrapData) => {
     setData(next);
-    setPlanMode(next.defaults?.planMode ?? true);
     const firstThread = buildThreads(next.events)[0];
     setSelectedThreadId(firstThread?.id);
     const firstPath = firstThread?.workingDirectory ?? next.workspace.path;

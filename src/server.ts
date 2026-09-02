@@ -58,13 +58,6 @@ if (existsSync(configPath)) loadEnvFile(configPath);
 let setupRequired = isFirstRunSetupRequired();
 
 const port = Number(process.env.PORT ?? 4173);
-/**
- * Whether the composer starts in plan mode. On by default: proposing before
- * building is the safer opening move, and the toggle is one click away for the
- * turns that do not need it. Only the initial state is set here — turning it
- * off in the composer holds for the rest of that session.
- */
-const planModeDefault = process.env.MAO_PLAN_MODE_DEFAULT !== "off";
 const isDev = process.argv.includes("--dev");
 const catalogStore = new FileAgentCatalogStore(
   resolve(dataRoot, "agents.json"),
@@ -593,7 +586,6 @@ async function buildBootstrapData() {
     catalog,
     agents: buildAgentViews(catalog, runtimes, events),
     workspace: { name: basename(defaultWorkspaceRoot), path: defaultWorkspaceRoot },
-    defaults: { planMode: planModeDefault },
     events,
     cursor: events.at(-1)?.eventId,
   };
