@@ -4,6 +4,18 @@ import { createId } from "./ids.js";
 import type { ContextCompiler } from "./context-compiler.js";
 import type { EventStore } from "./event-store.js";
 import { parseAgentMentions, parseUserMentions } from "./mentions.js";
+import {
+  DEFAULT_APPROVAL_STALE_AFTER_MS,
+  projectApprovals,
+  type ApprovalItem,
+} from "./approval-index.js";
+import {
+  modelFamilyOf,
+  REVIEWER_DEGRADE_BRIEF,
+  resolveReviewerMatch,
+  type ReviewerCandidate,
+  type ReviewerDegradeReason,
+} from "./reviewer-routing.js";
 import type {
   A2ARoutingMode,
   A2ARoutingProjection,
@@ -25,6 +37,7 @@ import type {
   PlatformEventPayload,
   ReviewEscalation,
   ReviewOutcome,
+  ReviewerMatchRecord,
   ReviewSubmission,
   ReviewType,
   StoredPlatformEvent,
@@ -67,6 +80,8 @@ export interface MultiAgentPlatformOptions {
    */
   reviewMode?: ReviewMode;
   maxReviewRounds?: number;
+  /** How long a pending human gate stays fresh in the approval index. */
+  approvalStaleAfterMs?: number;
 }
 
 export type ReviewMode = "smart" | "required" | "off";
@@ -221,6 +236,13 @@ export class MultiAgentPlatform {
   private readonly taskReviewTypes = new Map<Id, ReviewType>();
   /** reviewRunId -> the claim that review is checking, if the author made one. */
   private readonly reviewDeclarations = new Map<Id, DeliverableDeclaration>();
+  /**
+   * taskRunId -> the reviewer routing settled on for this task. Kept across
+   * discussion rounds so the peer that raised an objection is the peer that
+   * judges the answer to it; re-matching every round would let round 2 land on
+   * a reviewer who never read round 1.
+   */
+  private readonly taskReviewers = new Map<Id, { agentId: Id; match?: ReviewerMatchRecord }>();
   /** taskRunId -> the newest plan text, until its critique settles. */
   private readonly planDrafts = new Map<Id, PlanDraft>();
   /** taskRunId -> a plan parked in front of the human. Cleared when decided. */
@@ -237,6 +259,7 @@ export class MultiAgentPlatform {
   private readonly maxParallelReadRuns: number;
   private readonly reviewMode: ReviewMode;
   private readonly maxReviewRounds: number;
+  private readonly approvalStaleAfterMs: number;
   private defaultAgentId: Id;
   private hydrated = false;
   private hydratePromise: Promise<void> | undefined;
@@ -254,6 +277,10 @@ export class MultiAgentPlatform {
     this.maxParallelReadRuns = options.maxParallelReadRuns ?? 4;
     this.reviewMode = options.reviewMode ?? "smart";
     this.maxReviewRounds = Math.max(1, options.maxReviewRounds ?? 2);
+    this.approvalStaleAfterMs = Math.max(
+      60_000,
+      options.approvalStaleAfterMs ?? DEFAULT_APPROVAL_STALE_AFTER_MS,
+    );
   }
 
   public async initialize(): Promise<void> {
@@ -615,6 +642,14 @@ export class MultiAgentPlatform {
       } else if (event.type === "review.requested") {
         this.reviewRounds.set(event.taskRunId, event.round);
         this.reviewAuthors.set(event.reviewRunId, event.authorAgentId);
+        // Pre-routing-policy logs recorded who reviewed but not how good a
+        // match they were. The pin is restored either way; a missing match is
+        // left missing rather than filled in with a clean bill of health, and
+        // is described from the roster when a resumed round needs it.
+        this.taskReviewers.set(event.taskRunId, {
+          agentId: event.reviewerAgentId,
+          ...(event.reviewerMatch ? { match: event.reviewerMatch } : {}),
+        });
         // Pre-smart-gate logs carry no reviewType; those reviews were all
         // completion checks, which is exactly what "verify" means.
         this.taskReviewTypes.set(event.taskRunId, event.reviewType ?? "verify");
@@ -1352,13 +1387,17 @@ export class MultiAgentPlatform {
     const authorAgentId = this.reviewAuthors.get(run.id);
     if (!authorAgentId) return undefined;
     const declaration = this.reviewDeclarations.get(run.id);
+    const match =
+      this.taskReviewers.get(run.taskRunId)?.match ??
+      this.describeReviewer(run.causal.chainId, authorAgentId, run.agentId);
     return {
       taskRunId: run.taskRunId,
       authorAgentId,
       round: run.reviewRound ?? 1,
       maxRounds: this.maxReviewRounds,
       reviewType: run.reviewType ?? this.taskReviewTypes.get(run.taskRunId) ?? "verify",
-      independent: this.isIndependentReviewer(run.causal.chainId, run.agentId),
+      independent: match.independent,
+      degradeReasons: match.degradeReasons,
       ...(declaration ? { declaration } : {}),
     };
   }
@@ -1413,7 +1452,7 @@ export class MultiAgentPlatform {
     this.taskReviewTypes.set(taskRunId, reviewType);
     const declaration = this.runDeliverables.get(run.id);
 
-    const reviewerAgentId = this.resolveReviewer(run.agentId, run.causal.chainId);
+    const { reviewerAgentId, match } = this.routeReviewer(run, taskRunId);
     const reviewer = reviewerAgentId ? this.agents.get(reviewerAgentId) : undefined;
     if (!reviewerAgentId || !reviewer) {
       await this.resolveReview(
@@ -1445,7 +1484,7 @@ export class MultiAgentPlatform {
         round,
         maxRounds: this.maxReviewRounds,
         reviewType,
-        independent: this.isIndependentReviewer(run.causal.chainId, reviewerAgentId),
+        degradeReasons: match.degradeReasons,
         ...(declaration ? { declaration } : {}),
       }),
       intent: "review-request",
@@ -1476,6 +1515,7 @@ export class MultiAgentPlatform {
     };
     this.reviewRounds.set(taskRunId, round);
     this.reviewAuthors.set(reviewRun.id, run.agentId);
+    this.taskReviewers.set(taskRunId, { agentId: reviewerAgentId, match });
     if (declaration) this.reviewDeclarations.set(reviewRun.id, declaration);
     await this.record({
       type: "review.requested",
@@ -1487,9 +1527,24 @@ export class MultiAgentPlatform {
       round,
       messageId: message.id,
       reviewType,
+      reviewerMatch: match,
     });
     await this.enqueueRun(reviewRun);
     this.startScheduler();
+  }
+
+  /**
+   * Every gate currently waiting on a human, across every thread — plans to
+   * decide, escalated reviews, unanswered clarifications and stalled chains.
+   * Projected from the event log rather than tracked separately, so an item
+   * cannot survive the gate it stands for.
+   */
+  public async getPendingApprovals(threadId?: Id): Promise<ApprovalItem[]> {
+    await this.ensureHydrated();
+    return projectApprovals(await this.getEvents(), {
+      ...(threadId ? { threadId } : {}),
+      staleAfterMs: this.approvalStaleAfterMs,
+    });
   }
 
   /** Plans waiting on a human, newest last. */
@@ -1572,30 +1627,94 @@ export class MultiAgentPlatform {
   }
 
   /**
-   * Picks the most independent peer available. An Agent that already produced
-   * work in this chain has its own judgment invested in the result: asking it
-   * to review is asking it to find fault with a plan it helped make, so a peer
-   * that touched nothing here outranks even the configured reviewer. A
-   * compromised reviewer still beats no reviewer — the last fallback keeps the
-   * old behaviour rather than escalating a task nobody looked at.
+   * Who reviews this round, and how good a match they are.
+   *
+   * A task keeps its reviewer across discussion rounds: the peer that raised an
+   * objection is the peer that has to weigh the author's answer to it, and
+   * re-matching each round would hand round 2 to someone who never read round
+   * 1. The pin is dropped only when that peer can no longer run, which is the
+   * one case where a fresh match beats continuity.
    */
-  private resolveReviewer(authorAgentId: Id, chainId: Id): Id | undefined {
-    // Roster order throughout, so every fallback stays deterministic.
-    const candidates = [...this.agents.keys()].filter(
-      (id) => id !== authorAgentId && this.isRoutable(id),
-    );
-    const contributors = this.chainContributors(chainId);
-    const independent = candidates.filter((id) => !contributors.has(id));
-    const preferred = this.agents.get(authorAgentId)?.reviewerAgentId;
-    if (preferred && independent.includes(preferred)) return preferred;
-    if (independent.length > 0) return independent[0];
-    if (preferred && candidates.includes(preferred)) return preferred;
-    return candidates[0];
+  private routeReviewer(
+    run: AgentRun,
+    taskRunId: Id,
+  ): { reviewerAgentId?: Id; match: ReviewerMatchRecord } {
+    const pinned = this.taskReviewers.get(taskRunId);
+    if (pinned && pinned.agentId !== run.agentId && this.isRoutable(pinned.agentId)) {
+      return {
+        reviewerAgentId: pinned.agentId,
+        match: pinned.match ?? this.describeReviewer(run.causal.chainId, run.agentId, pinned.agentId),
+      };
+    }
+    const preferredReviewerId = this.agents.get(run.agentId)?.reviewerAgentId;
+    const match = resolveReviewerMatch({
+      authorAgentId: run.agentId,
+      ...(preferredReviewerId ? { preferredReviewerId } : {}),
+      candidates: this.reviewerCandidates(run),
+    });
+    return {
+      ...(match.reviewerAgentId ? { reviewerAgentId: match.reviewerAgentId } : {}),
+      match: {
+        independent: match.independent,
+        crossFamily: match.crossFamily,
+        degraded: match.degraded,
+        degradeReasons: match.degradeReasons,
+      },
+    };
   }
 
-  /** True when the reviewer produced no work of its own in this chain. */
-  private isIndependentReviewer(chainId: Id, reviewerAgentId: Id): boolean {
-    return !this.chainContributors(chainId).has(reviewerAgentId);
+  /**
+   * The roster as the routing policy sees it, in roster order so that every
+   * fallback stays deterministic.
+   */
+  private reviewerCandidates(run: AgentRun): ReviewerCandidate[] {
+    const contributors = this.chainContributors(run.causal.chainId);
+    const lastActive = this.threadActivity(run.threadId);
+    return [...this.agents.values()].map((agent) => ({
+      agent,
+      routable: this.isRoutable(agent.id),
+      contributor: contributors.has(agent.id),
+      ...(lastActive.has(agent.id) ? { lastActiveAt: lastActive.get(agent.id) as number } : {}),
+    }));
+  }
+
+  /**
+   * How good a match a reviewer already chosen is. Used when the routing did
+   * not choose it this time — a pinned reviewer from a log written before the
+   * policy existed — so the brief still says what the pairing costs instead of
+   * silently claiming a clean match.
+   */
+  private describeReviewer(
+    chainId: Id,
+    authorAgentId: Id,
+    reviewerAgentId: Id,
+  ): ReviewerMatchRecord {
+    const author = this.agents.get(authorAgentId);
+    const reviewer = this.agents.get(reviewerAgentId);
+    const independent = !this.chainContributors(chainId).has(reviewerAgentId);
+    const crossFamily = Boolean(
+      author &&
+        reviewer &&
+        modelFamilyOf(author.runtime) !== modelFamilyOf(reviewer.runtime),
+    );
+    const degradeReasons: ReviewerDegradeReason[] = [
+      ...(independent ? [] : (["chain-contributor"] as const)),
+      ...(crossFamily ? [] : (["same-family"] as const)),
+    ];
+    return { independent, crossFamily, degraded: degradeReasons.length > 0, degradeReasons };
+  }
+
+  /** When each Agent last spoke in this thread, for the activity tie-break. */
+  private threadActivity(threadId: Id): Map<Id, number> {
+    const activity = new Map<Id, number>();
+    for (const message of this.threadMessages.get(threadId) ?? []) {
+      if (message.sender.type !== "agent") continue;
+      const at = new Date(message.createdAt).getTime();
+      if (Number.isNaN(at)) continue;
+      const previous = activity.get(message.sender.id) ?? 0;
+      if (at > previous) activity.set(message.sender.id, at);
+    }
+    return activity;
   }
 
   /**
@@ -1880,6 +1999,7 @@ export class MultiAgentPlatform {
    */
   private forgetReviewState(taskRunId: Id): void {
     this.taskReviewTypes.delete(taskRunId);
+    this.taskReviewers.delete(taskRunId);
     // Normally consumed by awaitPlanApproval; a cancelled critique never gets
     // there, and a draft nobody will read is just a leak.
     this.planDrafts.delete(taskRunId);
@@ -2549,8 +2669,8 @@ function buildReviewRequestContent(input: {
   round: number;
   maxRounds: number;
   reviewType: ReviewType;
-  /** False when no peer outside this chain was available to review. */
-  independent: boolean;
+  /** Why the routing had to settle for this reviewer, when it did. */
+  degradeReasons: ReviewerDegradeReason[];
   declaration?: DeliverableDeclaration;
 }): string {
   const evidence = input.declaration?.evidence ?? [];
@@ -2600,12 +2720,9 @@ function buildReviewRequestContent(input: {
     : [
         "Your findings are peer arguments, not orders. The author may adopt them, rebut them with evidence, or propose an alternative in the next round.",
       ];
-  const independence = input.independent
-    ? []
-    : [
-        "You already worked in this chain, so you are not a neutral party here — no uninvolved peer was available.",
-        "Hold your own contribution to the same standard you would apply to anyone else's.",
-      ];
+  // A degraded match is stated, not hidden: a reviewer that does not know how
+  // it is compromised cannot compensate for it.
+  const independence = input.degradeReasons.flatMap((reason) => REVIEWER_DEGRADE_BRIEF[reason]);
   return [
     header,
     "",

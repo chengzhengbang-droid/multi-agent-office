@@ -12,6 +12,7 @@ import {
 import type {
   AccessMode,
   AgentDefinition,
+  PlatformEventPayload,
   ReviewVerdict,
   RuntimeAvailability,
   StoredPlatformEvent,
@@ -1134,6 +1135,115 @@ test("the configured reviewerAgentId wins over roster order", async () => {
   assert.deepEqual(seen, ["research"]);
 });
 
+test("a peer from another model family reviews before a peer sharing the author's", async () => {
+  const seen: string[] = [];
+  // "pi" and "sibling" run the same provider; "codex" is another family.
+  const sibling = agent("sibling");
+  const platform = createReviewPlatform([agent("pi"), sibling, agent("codex")], {
+    pi: async (request) => emitOutput(request, "草稿"),
+    sibling: approving(seen),
+    codex: approving(seen),
+  });
+
+  await platform.postUserMessage({ content: "@pi 起草" });
+  const events = await platform.getEvents();
+
+  const requested = single(events, "review.requested");
+  assert.equal(requested.reviewerAgentId, "codex");
+  assert.equal(requested.reviewerMatch?.crossFamily, true);
+  assert.equal(requested.reviewerMatch?.degraded, false);
+  assert.deepEqual(seen, ["codex"]);
+});
+
+test("a same-family review is still run, and the brief says what it cost", async () => {
+  const platform = createReviewPlatform([agent("pi"), agent("sibling")], {
+    pi: async (request) => emitOutput(request, "草稿"),
+    sibling: approving([]),
+  });
+
+  const result = await platform.postUserMessage({ content: "@pi 起草" });
+  const events = await platform.getEvents();
+
+  const requested = single(events, "review.requested");
+  assert.equal(requested.reviewerAgentId, "sibling");
+  assert.deepEqual(requested.reviewerMatch?.degradeReasons, ["same-family"]);
+
+  const messages = await platform.getThreadMessages(result.threadId);
+  const brief = messages.find((message) => message.kind === "review-request");
+  assert.match(brief?.content ?? "", /same model family/);
+});
+
+test("a task keeps its reviewer across discussion rounds", async () => {
+  const verdicts: ReviewVerdict[] = ["changes-requested", "approved"];
+  const reviewers: string[] = [];
+  const review = async (request: RuntimeRequest): Promise<RuntimeResult> => {
+    reviewers.push(request.agent.id);
+    await request.submitReview?.({
+      verdict: verdicts.shift() ?? "approved",
+      summary: "还缺一个分支",
+      findings: ["补上解析失败的处理"],
+      checks: ["自己读了改动文件"],
+    });
+    return emitOutput(request, "审毕");
+  };
+  // The peer that raised the objection is the peer that has to weigh the
+  // author's answer to it — a reviewer that never read round 1 cannot.
+  const platform = createReviewPlatform([agent("pi"), agent("codex"), agent("second")], {
+    pi: async (request) => emitOutput(request, "候选稿"),
+    codex: review,
+    second: review,
+  });
+
+  await platform.postUserMessage({ content: "@pi 实现" });
+  const events = await platform.getEvents();
+
+  assert.equal(reviewers.length, 2);
+  assert.equal(reviewers[0], reviewers[1]);
+  const requested = events.filter((event) => event.type === "review.requested");
+  assert.equal(requested.length, 2);
+  assert.equal(requested[0]?.reviewerAgentId, requested[1]?.reviewerAgentId);
+  assert.deepEqual(requested[0]?.reviewerMatch, requested[1]?.reviewerMatch);
+});
+
+test("the approval index collects gates from every thread until a human answers", async () => {
+  const asked = new Set<string>();
+  const platform = createReviewPlatform([agent("pi"), agent("codex")], {
+    pi: async (request) => {
+      // Ask once per thread, so answering closes the gate instead of opening
+      // an identical one behind it.
+      if (!asked.has(request.threadId)) {
+        asked.add(request.threadId);
+        await request.requestClarification({ questions: ["先用哪个后端？"] });
+        return emitOutput(request, "需要确认");
+      }
+      return emitOutput(request, "已按你的答复实现");
+    },
+    codex: approving([]),
+  });
+
+  const first = await platform.postUserMessage({ content: "@pi 实现缓存" });
+  const second = await platform.postUserMessage({ content: "@pi 实现索引" });
+
+  const pending = await platform.getPendingApprovals();
+  assert.equal(pending.length, 2);
+  assert.deepEqual(
+    [...new Set(pending.map((item) => item.kind))],
+    ["clarification"],
+  );
+  assert.deepEqual(
+    pending.map((item) => item.threadId).sort(),
+    [first.threadId, second.threadId].sort(),
+  );
+  // Every item can name the message that triggered it.
+  assert.ok(pending.every((item) => item.origin.kind === "message"));
+
+  assert.equal((await platform.getPendingApprovals(first.threadId)).length, 1);
+
+  await platform.postUserMessage({ threadId: first.threadId, content: "用 Redis" });
+  const afterAnswer = await platform.getPendingApprovals();
+  assert.deepEqual(afterAnswer.map((item) => item.threadId), [second.threadId]);
+});
+
 test("an offline configured reviewer falls back to another routable peer", async () => {
   const author = { ...agent("pi"), reviewerAgentId: "research" };
   const platform = createReviewPlatform([author, agent("codex"), agent("research")], {
@@ -1623,6 +1733,121 @@ test("an interrupted review escalates on restart instead of being retried", asyn
   assert.equal(resolved.escalation, "review-failed");
   assert.equal(countEvents(events, "review.submitted"), 0);
   void started;
+});
+
+test("a pre-routing-policy log keeps its reviewer and describes the pairing from the roster", async () => {
+  const store = new InMemoryEventStore();
+  const seeded: PlatformEventPayload[] = [
+    { type: "thread.created", thread: { id: "thread-1", title: "旧任务", createdAt: "2026-01-01T00:00:00.000Z" } },
+    {
+      type: "message.created",
+      message: {
+        id: "msg-1",
+        threadId: "thread-1",
+        sender: { type: "human", id: "operator" },
+        kind: "chat",
+        mentions: ["pi"],
+        content: "@pi 实现",
+        createdAt: "2026-01-01T00:00:00.000Z",
+      },
+    },
+    {
+      type: "run.queued",
+      run: {
+        id: "run-task",
+        threadId: "thread-1",
+        agentId: "pi",
+        incomingMessageId: "msg-1",
+        status: "queued",
+        accessMode: "read-only",
+        causal: { chainId: "chain-1", depth: 0 },
+        createdAt: "2026-01-01T00:00:00.000Z",
+        purpose: "task",
+      },
+    },
+    { type: "run.started", runId: "run-task", threadId: "thread-1", agentId: "pi" },
+    { type: "run.completed", runId: "run-task", threadId: "thread-1", agentId: "pi", output: "交付" },
+    {
+      type: "message.created",
+      message: {
+        id: "msg-2",
+        threadId: "thread-1",
+        sender: { type: "agent", id: "pi" },
+        kind: "review-request",
+        mentions: ["sibling"],
+        content: "@sibling 请审核",
+        createdAt: "2026-01-01T00:00:01.000Z",
+        causal: { chainId: "chain-1", parentRunId: "run-task", depth: 0 },
+      },
+    },
+    // The old event carries no reviewerMatch: the policy did not exist yet.
+    {
+      type: "review.requested",
+      threadId: "thread-1",
+      taskRunId: "run-task",
+      reviewRunId: "run-review",
+      authorAgentId: "pi",
+      reviewerAgentId: "sibling",
+      round: 1,
+      messageId: "msg-2",
+    },
+    {
+      type: "run.queued",
+      run: {
+        id: "run-review",
+        threadId: "thread-1",
+        agentId: "sibling",
+        incomingMessageId: "msg-2",
+        status: "queued",
+        accessMode: "read-only",
+        causal: { chainId: "chain-1", parentRunId: "run-task", depth: 0 },
+        createdAt: "2026-01-01T00:00:01.000Z",
+        purpose: "review",
+        taskRunId: "run-task",
+        reviewRound: 1,
+      },
+    },
+  ];
+  for (const [index, event] of seeded.entries()) {
+    await store.append({
+      ...event,
+      eventId: `seed-${index}`,
+      recordedAt: `2026-01-01T00:00:0${index % 10}.000Z`,
+    } as StoredPlatformEvent);
+  }
+
+  let assignment: RuntimeRequest["reviewOf"];
+  // "pi" and "sibling" share a provider, so the resumed round is same-family.
+  const peers = [agent("pi"), agent("sibling"), agent("codex")];
+  const platform = new MultiAgentPlatform({
+    agents: peers,
+    defaultAgentId: "pi",
+    runtimes: new Map(peers.map((peer) => [
+      peer.id,
+      runtime(peer.id, async (request) => {
+        if (request.reviewOf) {
+          assignment = request.reviewOf;
+          await request.submitReview?.({
+            verdict: "approved",
+            summary: "看过了",
+            checks: ["自己读了产出的文件"],
+          });
+        }
+        return emitOutput(request, "审毕");
+      }),
+    ])),
+    eventStore: store,
+    contextCompiler: new RecentContextCompiler(),
+    reviewMode: "required",
+  });
+  await platform.initialize();
+  await waitFor(async () => (await platform.getEvents()).some((event) => event.type === "review.resolved"));
+
+  // The pinned reviewer is kept, and the pairing is described from the roster
+  // rather than reported as a clean match nobody ever scored.
+  assert.equal(assignment?.authorAgentId, "pi");
+  assert.deepEqual(assignment?.degradeReasons, ["same-family"]);
+  assert.equal(assignment?.independent, true);
 });
 
 test("a pre-review event log replays without retro-requesting reviews", async () => {

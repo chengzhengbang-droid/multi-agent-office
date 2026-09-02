@@ -15,6 +15,7 @@ import type {
   CollaborationIntent,
   WaitSourceRef,
 } from "../core/collaboration.js";
+import type { ReviewerDegradeReason } from "../core/reviewer-routing.js";
 
 export type RuntimeLifecyclePhase =
   | "retry_start"
@@ -126,6 +127,12 @@ export interface ReviewAssignment {
    * compromised reviewer beats none — but says so in the brief.
    */
   independent: boolean;
+  /**
+   * Every way this reviewer is a worse match than the routing policy asks for:
+   * it worked in this chain, or it shares the author's model family. Empty when
+   * the policy got what it wanted.
+   */
+  degradeReasons: ReviewerDegradeReason[];
   /** The author's own claim, for a reviewer to check rather than trust. */
   declaration?: DeliverableDeclaration;
 }
