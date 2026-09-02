@@ -65,7 +65,7 @@ Agent 交付的成果要由**另一个** Agent 把关后才算完成：自称做
 
 原有的计划模式、写锁和深度/乒乓保护继续作为本地策略层运行；它们不替代路由和球权协议。
 
-这仍是轻量本地实现，不等同于完整 Clowder。**审核时机**上仍然缺少 Clowder 的多验证源分流（本项目只有本地同侪，没有云端 review，也没有终态的「愿景守护」）、按行为/数据/安全/契约/不可逆五轴风险选择验证深度，以及 `skip` / `reuse` / `continuityProof` 这类「机械变化不重开 reviewer」的凭据；本项目改用一条更机械也更保守的触发口径：声明了交付物、或动过工作区，就送审。**人工介入**上仍然缺少 Clowder 的跨 Thread 任务派发审批（`assign_work` effect-class）与多用户权限域——单机对等工作台里只有一个 operator，跨 Thread 派发也不是本项目的协作形态。其余差异同前：当前没有跨 Thread/跨项目共享记忆与证据索引、按需 Skills/SOP Guardian、分布式队列租约与多进程恢复，或外部平台网关。这些能力应按本项目“单机、对等 Agent 工作台”的边界逐项引入，而不是直接复制 Clowder 的 Redis/服务化架构。
+这仍是轻量本地实现，不等同于完整 Clowder。**审核时机**上仍然缺少 Clowder 的多验证源分流（本项目只有本地同侪，没有云端 review，也没有终态的「愿景守护」）、按行为/数据/安全/契约/不可逆五轴风险选择验证深度，以及 `skip` / `reuse` / `continuityProof` 这类「机械变化不重开 reviewer」的凭据；本项目改用一条更机械也更保守的触发口径：声明了交付物、或动过工作区，就送审。**人工介入**上仍然缺少 Clowder 的跨 Thread 任务派发审批（`assign_work` effect-class）与多用户权限域——单机对等工作台里只有一个 operator，跨 Thread 派发也不是本项目的协作形态。**计划前的业界调研**上已按留痕口径落成一层（见下面的「业界先例」），但仍然缺少 clowder 的多路 Deep Research 管线与开源拆解流程本身——本项目只规定先例怎么算数，不提供去查的执行面。其余差异同前：当前没有跨 Thread/跨项目共享记忆与证据索引、按需 Skills/SOP Guardian、分布式队列租约与多进程恢复，或外部平台网关。这些能力应按本项目“单机、对等 Agent 工作台”的边界逐项引入，而不是直接复制 Clowder 的 Redis/服务化架构。
 
 ## 同侪审核
 
@@ -116,6 +116,20 @@ Agent 正在运行时，用户可以直接插话：消息会送进当前这一�
 - 计划模式的消息不会插话进正在运行的 run——插话进的那一轮是可写的，模式和权限都改不了，所以它总是另起一轮只读的 run。
 
 整个过程在 Thread 里可见：`plan.awaiting-approval` / `plan.decided` 事件，界面上是方案原文加通过/打回按钮的确认卡片——看不到的方案谈不上批准。
+
+### 业界先例：方案的"读过什么"也是方案的一部分
+
+一个方案值不值得建，一半看它自己论证得怎么样，另一半看它有没有对照过别人已经解决过的同一个问题。这一层对齐 clowder 的调研车道（`deep-research` / `open-source-teardown` / `source-audit`），但**平台不判定哪个方案该查业界**——它读不到那个意图，硬猜出来的期待正是 clowder 筛子 0 警告的"给一个以为自己没这工具的猫弹提示"。平台管的是另外两件事：交出来的先例必须可核验，以及**查没查都要留痕**。
+
+- **计划模式的 Agent 多一个 `record_prior_art` 工具**。每条记录写清四件事：`source`（看的是哪个仓库/文档/论文/路径）、`sourceKind`（看到了多深）、`claim`（它到底怎么做的，写成一句能被证伪的话）、`verdict`（`adopt` 照做 / `adapt` 改造后采用 / `reject` 不跟）。这是台账，不是一段自信的综述——同侪可以一条一条核，而不是重新调研一遍。
+- **`adopt` 要有一手证据**。`sourceKind` 只有 `source`（读了实现）和 `docs`（读了官方文档/论文正文）才允许 `adopt`；只看了 `marketing`（README、落地页、发布稿）或 `secondhand`（别人的转述、自己的印象）就想照做，平台直接拒收，并提示改记成 `adapt` / `reject` 并写明取舍——这正是 clowder teardown 的铁律"不许只看 README 下判断"。`adopt` 还必须填 `checked`：读了哪个文件、跑了什么命令。这跟本项目要求审核者 `approved` 必须列出自查动作是同一条口径——**举证责任落在那个错了代价更大的判断上，保守的那一档永远不该更费力**。
+- **不跟也要说理由**。`adapt` 和 `reject` 必须填 `tradeoff`。不写理由的"不跟"教不会下一轮任何事，同一个先例下轮还会被重新提出来——和"打回方案必须写明要改什么"是同一个道理。
+- **三态留痕，沉默是唯一交代不过去的答案**。`recorded`（查了）/ `abstained`（明说没查，并给出理由：没有可比先例、这一轮够不着任何来源、改动太局部）/ `none`（什么都没说）。`abstained` 是一等公民而不是缺省值，因为 clowder 筛子 0 那条教训是——"一个你以为够不着的能力，miss 不是因为懒，是从没进考虑"。得让"够不着"能被便宜地说出口，它才不会伪装成沉默。
+- **留痕不拦路**。没记台账的方案照样送到同侪、照样送到人面前；变的是评审简报和审批卡片上会明写"未记录业界先例——这个方案没有对照过别人怎么解决，也没有说明为什么不用对照"。同侪拿到的是三态里的哪一态就按哪一态压：查了就抽查它最吃重的那几条，弃权就先判理由成不成立，什么都没说就把"这个设计是自然而然的"当成未论证的断言。
+- **台账挂在任务上，不挂在这一轮 run 上**。协商轮改方案不等于把读过的东西忘了；同一个 `source` 再记一次是修正上一轮的结论，不是并排堆两条。一旦有任何一轮记了实打实的先例，之前的 `abstained` 就不再成立，卡片上不会再显示"没查"。
+- 记录以 `prior-art.recorded` 事件落盘，随 `plan.awaiting-approval` 一起进审批卡片；重启回放重建出来的是同一份台账。
+
+**和 clowder 的差距**：clowder 的调研是真的会出去查——三路 Deep Research 并行加云端模型审阅（`deep-research`），拆解明星项目时要 clone 下来追到代码路径、记 commit SHA、做算法剥皮表（`open-source-teardown`）。本项目没有这套管线，也没有跨 Thread 的证据索引来复用往次调研；能查多深完全取决于这只 Agent 自己的 harness 够得到什么。所以这里落的是**契约层不是执行层**：平台规定什么样的先例算数、什么样的结论必须留证据，具体去哪儿查、查得动查不动，由 Agent 自己交代。
 
 ## 统一待办：人工介入的唯一入口
 
@@ -303,7 +317,7 @@ pnpm demo -- --plan --reject
 - `GET /api/agents/:agentId/session?threadId=`：该 Agent 在此 Thread 的 session 统计。
 - `POST /api/agents/:agentId/session?threadId=&action=compact|export&format=html|jsonl`：手动压缩上下文或导出 session。
 
-Codex 通过 app-server 的原生动态 tool 暴露 `post_message`、`hold_ball`、`submit_review`、`request_clarification`、`complete_task` 与 `submit_plan`，tool handler 在同一进程内直接调用平台能力，不再启动自建 MCP server，也不再经过本机 HTTP callback。Pi Agent 同样使用进程内 tool；所有路由、等待、澄清请求、verdict、checks、findings 与交付声明都直接交给平台校验。Codex 会话协议有独立版本标记，升级 tool contract 后不会误续接缺少新工具的旧会话。
+Codex 通过 app-server 的原生动态 tool 暴露 `post_message`、`hold_ball`、`submit_review`、`request_clarification`、`record_prior_art`、`complete_task` 与 `submit_plan`，tool handler 在同一进程内直接调用平台能力，不再启动自建 MCP server，也不再经过本机 HTTP callback。Pi Agent 同样使用进程内 tool；所有路由、等待、澄清请求、verdict、checks、findings 与交付声明都直接交给平台校验。Codex 会话协议有独立版本标记，升级 tool contract 后不会误续接缺少新工具的旧会话。
 
 ## 验证
 
@@ -313,7 +327,7 @@ pnpm test
 pnpm build
 ```
 
-测试覆盖花名册、mention 解析、显式串行/并行路由、球权事件投影、`hold_ball` 唤醒、A2A、幂等与乒乓限制、读写调度、整链取消、上下文游标、session 隔离、Codex app-server 首次执行与 resume、原生动态 tool 调用、Pi 凭据判定、多 provider 凭据互不覆盖、Agent 头像标识去重、可观测性事件投影、运行中插话与回退、图片附件，以及现有历史事件的完整兼容回放。
+测试覆盖花名册、mention 解析、显式串行/并行路由、球权事件投影、`hold_ball` 唤醒、A2A、幂等与乒乓限制、读写调度、整链取消、上下文游标、业界先例台账的校验与三态留痕、session 隔离、Codex app-server 首次执行与 resume、原生动态 tool 调用、Pi 凭据判定、多 provider 凭据互不覆盖、Agent 头像标识去重、可观测性事件投影、运行中插话与回退、图片附件，以及现有历史事件的完整兼容回放。
 
 审核相关覆盖：强制送审与审核者选取（配置优先、离线回退、同链共作者让位给未参与的同侪、无人可让时仍然送审并标记为不中立）、怀疑立场与平等协商（审核简报要求自己查一手材料、意见不是命令、作者可自然反驳、后续轮必须重新评价、`approved` 缺少自查项被拒、`changes-requested` 不要求自查项）、达成共识后终结、存在异议时继续协商、轮数上限交给人类裁决、无结论/无审核者/审核失败一律不通过、审核中取消、重启后中断的审核升级、审核 run 不占用链额度与深度、审核者不会变成 Thread 的默认应答者，以及旧日志回放不补发审核。smart 门另有覆盖：闲聊不送审、阻塞性问题先澄清且不送审、计划模式与强制门同样尊重澄清、协商时发现人类决策会终止审核循环、声明完成走 verify 且证据进入审核简报、提交方案走 critique 且协商轮仍是 critique、改文件不声明也送审、只读运行与 shell 读命令不触发、审核者不能自我声明、声明不能改口径，以及带声明的日志回放。
 

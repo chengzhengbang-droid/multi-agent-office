@@ -16,6 +16,7 @@ import type {
   WaitSourceRef,
 } from "../core/collaboration.js";
 import type { ReviewerDegradeReason } from "../core/reviewer-routing.js";
+import type { PriorArtInput, PriorArtSummary } from "../core/prior-art.js";
 
 export type RuntimeLifecyclePhase =
   | "retry_start"
@@ -112,6 +113,13 @@ export interface RequestClarificationResult {
   reason?: string;
 }
 
+export type RecordPriorArtInput = PriorArtInput;
+
+export interface RecordPriorArtResult {
+  accepted: boolean;
+  reason?: string;
+}
+
 /** What a review run is reviewing. Present only on review runs. */
 export interface ReviewAssignment {
   taskRunId: Id;
@@ -135,6 +143,12 @@ export interface ReviewAssignment {
   degradeReasons: ReviewerDegradeReason[];
   /** The author's own claim, for a reviewer to check rather than trust. */
   declaration?: DeliverableDeclaration;
+  /**
+   * What the author examined before proposing the plan under critique, and
+   * whether it examined anything at all. Present on critique rounds only: a
+   * completion is judged on the artifacts it produced, not on its reading.
+   */
+  priorArt?: PriorArtSummary;
 }
 
 /** An image attachment already read off disk, ready to hand to a model. */
@@ -180,6 +194,12 @@ export interface RuntimeRequest {
    * materially change the goal, plan, acceptance criteria, or implementation.
    */
   requestClarification(input: RequestClarificationInput): Promise<RequestClarificationResult>;
+  /**
+   * Report the precedents examined before proposing a plan, or the reason none
+   * were. Accepted only on plan-mode task runs; the ledger it builds travels
+   * with the task through critique and onto the human's approval card.
+   */
+  recordPriorArt(input: RecordPriorArtInput): Promise<RecordPriorArtResult>;
   /** Present only alongside reviewOf. */
   submitReview?(input: SubmitReviewInput): Promise<SubmitReviewResult>;
   /**
