@@ -1,5 +1,5 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { createWriteStream, existsSync, mkdirSync } from "node:fs";
+import { appendFileSync, createWriteStream, existsSync, mkdirSync } from "node:fs";
 import { appendFile, mkdir, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { homedir } from "node:os";
@@ -24,6 +24,17 @@ import {
   type AppUpdateState,
   type UpdateClient,
 } from "./desktop/app-updater.js";
+import {
+  describeGraphicsMode,
+  GRAPHICS_MODE_FILE,
+  graphicsModeSwitches,
+  nextGraphicsMode,
+  parseGraphicsMode,
+  readGraphicsModeState,
+  resolveGraphicsMode,
+  writeGraphicsModeState,
+  type GraphicsMode,
+} from "./desktop/graphics-mode.js";
 import {
   isDeveloperIdSignedMacApp,
   macApplicationBundlePath,
@@ -109,6 +120,19 @@ app.setName(APP_NAME);
 app.setPath("userData", userDataDirectory.path);
 const desktopLogPath = join(userDataDirectory.path, "desktop.log");
 
+// Graphics mode is decided before anything is drawn: the switches it appends
+// only take effect while the application is not ready yet.
+const graphicsStatePath = join(userDataDirectory.path, GRAPHICS_MODE_FILE);
+const graphicsOverride = parseGraphicsMode(process.argv, process.env);
+const graphicsDecision = resolveGraphicsMode(
+  readGraphicsModeState(graphicsStatePath),
+  graphicsOverride,
+);
+const graphicsMode = graphicsDecision.mode;
+let graphicsModeConfirmed = graphicsDecision.overridden;
+let graphicsRestartScheduled = false;
+applyGraphicsMode(graphicsMode);
+
 // A double-click on the shortcut must never be silently swallowed: any crash the
 // launcher itself did not anticipate is logged and surfaced before exiting.
 process.on("uncaughtException", (error) => {
@@ -120,13 +144,27 @@ process.on("unhandledRejection", (reason) => {
 
 const hasSingleInstanceLock = app.requestSingleInstanceLock();
 if (!hasSingleInstanceLock) app.quit();
+// Only the instance that owns the window records graphics attempts; a second
+// double-click must not leave a trial marker behind for the running one.
+if (hasSingleInstanceLock) beginGraphicsModeTrial();
+else graphicsModeConfirmed = true;
 
 app.on("second-instance", () => {
   showMainWindow();
 });
 
+// A GPU process that dies on its own is the failure this launcher recovers
+// from: Electron kills the whole application after a handful of those.
+app.on("child-process-gone", (_event, details) => {
+  if (details.type !== "GPU") return;
+  recoverFromGraphicsFailure(
+    `GPU process gone (${details.reason}, exit ${details.exitCode})`,
+  );
+});
+
 app.on("before-quit", () => {
   quitting = true;
+  confirmGraphicsMode();
   desktopUpdater?.dispose();
   stopServer();
 });
@@ -183,7 +221,9 @@ async function startDesktopApp(): Promise<void> {
       );
     }
   }
-  await writeDesktopLog("Desktop launcher starting");
+  await writeDesktopLog(
+    `Desktop launcher starting (graphics mode: ${graphicsMode})`,
+  );
   await ensureConfigFile(configPath);
   await mkdir(dataRoot, { recursive: true });
 
@@ -291,7 +331,12 @@ function createMainWindow(): BrowserWindow {
       ),
     },
   });
-  window.once("ready-to-show", () => window.show());
+  window.once("ready-to-show", () => {
+    // A visible window is the proof that this graphics mode works on this
+    // machine, so the next launch can start in the very same mode.
+    confirmGraphicsMode();
+    window.show();
+  });
   window.on("close", (event) => {
     // On Windows the tray owns the lifecycle: closing the window hides it and
     // keeps the local server running, matching the documented behavior.
@@ -402,6 +447,7 @@ function installWindowsTray(paths: DesktopPaths): void {
         label: "打开运行日志",
         click: () => void openLocalFile(paths.logPath),
       },
+      graphicsMenuItem(),
       { type: "separator" },
       {
         label: updateItem.label,
@@ -460,6 +506,7 @@ function installApplicationMenu(paths: DesktopPaths): void {
           click: () => void openLocalFile(paths.logPath),
         },
         { type: "separator" },
+        graphicsMenuItem(),
         {
           label: "重启以应用配置",
           click: () => {
@@ -773,6 +820,97 @@ function desktopPath(): string {
   return [...candidates.filter(Boolean), process.env.PATH ?? ""].join(delimiter);
 }
 
+function applyGraphicsMode(mode: GraphicsMode): void {
+  const switches = graphicsModeSwitches(mode);
+  if (switches.length === 0) return;
+  app.disableHardwareAcceleration();
+  for (const name of switches) app.commandLine.appendSwitch(name);
+}
+
+function beginGraphicsModeTrial(): void {
+  if (graphicsDecision.escalatedFrom) {
+    writeDesktopLogSync(
+      `Previous launch in ${graphicsDecision.escalatedFrom} graphics mode never showed a window; starting in ${graphicsMode} mode`,
+    );
+  }
+  if (graphicsDecision.overridden) {
+    writeDesktopLogSync(`Graphics mode forced to ${graphicsMode}`);
+    return;
+  }
+  // Written before the first window exists: a launch that dies in between is
+  // exactly the one the next start has to escalate away from.
+  writeGraphicsModeState(graphicsStatePath, {
+    mode: graphicsMode,
+    pending: true,
+    ...(graphicsDecision.escalatedFrom
+      ? { reason: `escalated from ${graphicsDecision.escalatedFrom}` }
+      : {}),
+  });
+}
+
+function confirmGraphicsMode(): void {
+  if (graphicsModeConfirmed) return;
+  graphicsModeConfirmed = true;
+  writeGraphicsModeState(graphicsStatePath, {
+    mode: graphicsMode,
+    pending: false,
+    ...(graphicsDecision.escalatedFrom
+      ? { reason: `escalated from ${graphicsDecision.escalatedFrom}` }
+      : {}),
+  });
+}
+
+function recoverFromGraphicsFailure(reason: string): void {
+  if (graphicsRestartScheduled || !hasSingleInstanceLock) return;
+  writeDesktopLogSync(`Graphics failure in ${graphicsMode} mode: ${reason}`);
+  const escalated = nextGraphicsMode(graphicsMode);
+  if (graphicsDecision.overridden || !escalated) return;
+  graphicsRestartScheduled = true;
+  const windowAlreadyShown = graphicsModeConfirmed;
+  graphicsModeConfirmed = true;
+  writeGraphicsModeState(graphicsStatePath, {
+    mode: escalated,
+    pending: false,
+    reason,
+  });
+  if (windowAlreadyShown) {
+    // Chromium survives an occasional GPU crash once the window is up; taking a
+    // working session away from the user would be worse than the crash itself.
+    writeDesktopLogSync(`Next launch will use ${escalated} graphics mode`);
+    return;
+  }
+  writeDesktopLogSync(`Restarting in ${escalated} graphics mode`);
+  quitting = true;
+  stopServer();
+  // Electron aborts the whole application once the GPU process has failed a few
+  // times, so the restart has to happen now rather than after an async quit.
+  app.relaunch();
+  app.exit(0);
+}
+
+function restartWithGraphicsMode(mode: GraphicsMode): void {
+  graphicsModeConfirmed = true;
+  writeGraphicsModeState(graphicsStatePath, {
+    mode,
+    pending: false,
+    reason: "chosen from the menu",
+  });
+  quitting = true;
+  app.relaunch();
+  app.quit();
+}
+
+function graphicsMenuItem(): MenuItemConstructorOptions {
+  const compatible = graphicsMode !== "hardware";
+  return {
+    label: compatible
+      ? `图形兼容模式：${describeGraphicsMode(graphicsMode)}（点击恢复硬件加速并重启）`
+      : "启用图形兼容模式并重启（画面显示异常时使用）",
+    enabled: !graphicsDecision.overridden,
+    click: () => restartWithGraphicsMode(compatible ? "hardware" : "software"),
+  };
+}
+
 function stopServer(): void {
   if (!serverProcess || serverProcess.killed) return;
   serverProcess.kill("SIGTERM");
@@ -792,6 +930,9 @@ async function reportFatalError(
   error: unknown,
   fatal: boolean,
 ): Promise<void> {
+  // The failure is in the launcher, not in the graphics stack: keep the current
+  // graphics mode instead of degrading it on the next launch.
+  if (fatal) confirmGraphicsMode();
   await writeDesktopLog(`${kind}: ${errorStack(error)}`);
   if (!fatal) return;
   if (!fatalErrorShown) {
@@ -806,6 +947,18 @@ async function reportFatalError(
     }
   }
   app.exit(1);
+}
+
+function writeDesktopLogSync(message: string): void {
+  try {
+    appendFileSync(
+      desktopLogPath,
+      `[${new Date().toISOString()}] ${message}\n`,
+      "utf8",
+    );
+  } catch {
+    // Logging must never prevent the desktop launcher from starting.
+  }
 }
 
 async function writeDesktopLog(message: string): Promise<void> {
