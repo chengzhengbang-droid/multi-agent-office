@@ -174,6 +174,42 @@ export interface ReviewerMatchRecord {
 
 export type ReviewVerdict = "approved" | "changes-requested";
 
+/**
+ * How much weight one objection carries, modelled on clowder-ai's P1/P2/P3
+ * triage (`cat-cafe-skills/receive-review`). Severity, not the verdict, is what
+ * holds a task back: a reviewer with nothing but "minor" left has finished
+ * reviewing and is now commenting, and commentary is not a reason to keep a
+ * human waiting.
+ */
+export type ReviewFindingSeverity =
+  /** Must not ship. Blocks on its own. */
+  | "blocking"
+  /** Wrong or missing enough that the author has to answer it. Blocks. */
+  | "major"
+  /** A nit, a preference, a follow-up idea. Recorded, never blocking. */
+  | "minor";
+
+/**
+ * What kind of thing an objection is. "defect" is settled between the two
+ * peers; "question" cannot be — it names something the human never decided, so
+ * another discussion round would only produce a better-argued guess.
+ */
+export type ReviewFindingKind = "defect" | "question";
+
+export interface ReviewFinding {
+  detail: string;
+  severity: ReviewFindingSeverity;
+  /** Defaults to "defect" when a reviewer does not say. */
+  kind?: ReviewFindingKind;
+}
+
+/**
+ * Findings on the wire. Pre-severity event logs recorded bare strings, and
+ * those replay as blocking-weight objections because that is what they were
+ * when they were written — see `normalizeFindings`.
+ */
+export type ReviewFindingInput = string | ReviewFinding;
+
 /** "cancelled" is an operator action, not a quality signal — it needs no human follow-up. */
 export type ReviewOutcome = "approved" | "escalated" | "cancelled";
 
@@ -185,7 +221,12 @@ export type ReviewEscalation =
   | "inconclusive"
   /** The review run failed, was cancelled, or its reviewer became unavailable. */
   | "review-failed"
-  /** maxReviewRounds rounds of peer discussion ended without consensus. */
+  /**
+   * The same blocking objection survived several rounds unchanged. The peers
+   * are not converging, so more rounds would only restate the same wall.
+   */
+  | "deadlock"
+  /** maxReviewRounds rounds of peer discussion ended with blocking objections still open. */
   | "max-rounds"
   /** The author stopped discussion because a material human decision is missing. */
   | "clarification-needed";
@@ -193,7 +234,12 @@ export type ReviewEscalation =
 export interface ReviewSubmission {
   verdict: ReviewVerdict;
   summary: string;
-  findings?: string[];
+  /**
+   * The reviewer's objections and comments. A `changes-requested` verdict only
+   * holds the task if at least one of them is blocking or major; a submission
+   * carrying nothing but minor findings is consensus with comments attached.
+   */
+  findings?: ReviewFindingInput[];
   /**
    * What the reviewer checked for itself, and how — the files it read, the
    * commands it ran, the outputs it saw. Required to approve: an approval that
@@ -531,7 +577,7 @@ export type PlatformEventPayload =
       reviewerAgentId: Id;
       verdict: ReviewVerdict;
       summary: string;
-      findings?: string[];
+      findings?: ReviewFindingInput[];
       /** What the reviewer verified itself. Absent in pre-skeptical-review logs. */
       checks?: string[];
     }

@@ -96,7 +96,8 @@ const platform = new MultiAgentPlatform({
   maxPingPongHops: 4,
   maxParallelReadRuns: Number(process.env.MAO_MAX_PARALLEL_READ_RUNS ?? 4),
   reviewMode: parseReviewMode(process.env.MAO_REVIEW_GATE),
-  maxReviewRounds: Number(process.env.MAO_MAX_REVIEW_ROUNDS ?? 2),
+  maxReviewRounds: Number(process.env.MAO_MAX_REVIEW_ROUNDS ?? 4),
+  maxStalledRounds: Number(process.env.MAO_REVIEW_STALL_ROUNDS ?? 2),
   approvalStaleAfterMs: Number(process.env.MAO_APPROVAL_STALE_HOURS ?? 24) * 60 * 60 * 1000,
 });
 

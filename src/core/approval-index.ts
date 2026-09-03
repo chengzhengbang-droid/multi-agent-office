@@ -1,4 +1,4 @@
-import type { Id, PlanDecision, StoredPlatformEvent } from "./types.js";
+import type { Id, PlanDecision, ReviewEscalation, StoredPlatformEvent } from "./types.js";
 
 /**
  * A unified index of everything currently waiting on a human, modelled on
@@ -97,6 +97,16 @@ export interface ApprovalIndexOptions {
 }
 
 export const DEFAULT_APPROVAL_STALE_AFTER_MS = 24 * 60 * 60 * 1000;
+
+/** What the index says a review escalation is asking of the human. */
+const REVIEW_ESCALATION_SUMMARIES: Record<ReviewEscalation, string> = {
+  "no-reviewer": "没有第二个 Agent 能审这份交付，需要你把关",
+  inconclusive: "审核 Agent 没有登记正式结论，需要你把关",
+  "review-failed": "审核没有完成，需要你把关",
+  deadlock: "同一条异议多轮没有进展，需要你裁决",
+  "max-rounds": "协商到顶仍有阻塞性异议，需要你裁决",
+  "clarification-needed": "Agent 需要你先回答一个它自己定不了的问题",
+};
 
 interface RunFacts {
   threadId: Id;
@@ -246,7 +256,10 @@ export function projectApprovals(
         ...(originRun ? { chainId: originRun.chainId } : {}),
         taskRunId: event.taskRunId,
         requesterAgentId: originRun?.agentId ?? "unknown",
-        summary: "同侪审核未通过，需要你裁决",
+        // Why the human was called is the first thing they need from the index.
+        // "Review did not pass" is true of all of these and useful for none:
+        // a deadlock wants a ruling, an unanswered question wants an answer.
+        summary: REVIEW_ESCALATION_SUMMARIES[event.escalation ?? "review-failed"],
         ...(event.detail ? { detail: event.detail } : {}),
         inlineApprovable: false,
         origin: originOf(originRun, messages, event.threadId),

@@ -1,6 +1,6 @@
 import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createInterface, type Interface as ReadLineInterface } from "node:readline";
-import type { AccessMode, CodexRuntimeSpec, RuntimeAvailability } from "../core/types.js";
+import type { AccessMode, CodexRuntimeSpec, ReviewFindingInput, RuntimeAvailability } from "../core/types.js";
 import type { PriorArtEntry } from "../core/prior-art.js";
 import { buildSystemPrompt, buildUserPrompt } from "./pi-runtime.js";
 import type { AgentRuntime, RuntimeEvent, RuntimeRequest, RuntimeResult } from "./runtime.js";
@@ -485,13 +485,25 @@ function codexDynamicTools(): Array<Record<string, unknown>> {
       type: "function",
       name: "submit_review",
       description:
-        "Record your current verdict in a peer discussion. Call exactly once. Approve only a final candidate you checked and can stand behind; changes-requested states evidence-backed objections, not orders.",
+        "Record your current verdict in a peer discussion. Call exactly once. Approve only a final candidate you checked and can stand behind; changes-requested states evidence-backed objections, not orders. Severity is what holds the task, not the verdict: with nothing blocking or major left, approve and list the minor findings as comments.",
       inputSchema: {
         type: "object",
         properties: {
           verdict: { type: "string", enum: ["approved", "changes-requested"] },
           summary: { type: "string", minLength: 1, maxLength: 20_000 },
-          findings: stringArray,
+          findings: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                detail: { type: "string", minLength: 1 },
+                severity: { type: "string", enum: ["blocking", "major", "minor"] },
+                kind: { type: "string", enum: ["defect", "question"] },
+              },
+              required: ["detail", "severity"],
+              additionalProperties: false,
+            },
+          },
           checks: stringArray,
         },
         required: ["verdict", "summary"],
@@ -630,7 +642,7 @@ async function executeDynamicTool(
       if (verdict !== "approved" && verdict !== "changes-requested") {
         throw new Error("verdict must be approved or changes-requested");
       }
-      const findings = optionalStringArray(args, "findings");
+      const findings = optionalFindings(args, "findings");
       const checks = optionalStringArray(args, "checks");
       const result = await request.submitReview({
         verdict,
@@ -861,6 +873,39 @@ function optionalRoutingMode(value: unknown): "serial" | "parallel" | undefined 
   if (value === undefined) return undefined;
   if (value === "serial" || value === "parallel") return value;
   throw new Error("routingMode must be serial or parallel");
+}
+
+/**
+ * Findings on the way in from a Codex tool call. Strings are still accepted so
+ * that a model echoing the old flat shape is not silently dropped; they carry
+ * no severity, and the platform reads an unlabelled objection as blocking-weight
+ * rather than as a comment.
+ */
+function optionalFindings(
+  record: Record<string, unknown>,
+  key: string,
+): ReviewFindingInput[] | undefined {
+  const value = record[key];
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value)) throw new Error(`${key} must be an array`);
+  return value.map((item) => {
+    if (typeof item === "string") return item;
+    const finding = asRecord(item);
+    if (!finding) throw new Error(`${key} entries must be strings or objects`);
+    const severity = finding.severity;
+    if (severity !== "blocking" && severity !== "major" && severity !== "minor") {
+      throw new Error(`${key} severity must be blocking, major or minor`);
+    }
+    const kind = finding.kind;
+    if (kind !== undefined && kind !== "defect" && kind !== "question") {
+      throw new Error(`${key} kind must be defect or question`);
+    }
+    return {
+      detail: requiredString(finding, "detail"),
+      severity,
+      ...(kind ? { kind } : {}),
+    };
+  });
 }
 
 function optionalStringArray(record: Record<string, unknown>, key: string): string[] | undefined {

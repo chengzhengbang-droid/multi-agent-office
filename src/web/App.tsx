@@ -83,6 +83,8 @@ import type {
   PlanDecision,
   PlanPeerOutcome,
   ReviewEscalation,
+  ReviewFindingInput,
+  ReviewFindingSeverity,
   ReviewType,
   RunPurpose,
   StoredPlatformEvent,
@@ -90,6 +92,7 @@ import type {
   ThinkingLevel,
   ThreadMessageKind,
 } from "../core/types";
+import { normalizeFindings } from "../core/review-convergence";
 import type { DesktopUpdateSnapshot } from "../desktop/update-contract";
 
 interface WorkspaceSummary {
@@ -178,7 +181,7 @@ interface ReviewState {
   reviewType?: ReviewType;
   round: number;
   summary?: string;
-  findings?: string[];
+  findings?: ReviewFindingInput[];
   /** What the reviewer verified for itself. Present on approvals. */
   checks?: string[];
   escalation?: ReviewEscalation;
@@ -1572,8 +1575,16 @@ const REVIEW_ESCALATION_LABELS: Record<ReviewEscalation, string> = {
   "no-reviewer": "没有可用于审核的其他 Agent",
   inconclusive: "审核 Agent 未登记正式结论",
   "review-failed": "审核未能完成",
-  "max-rounds": "协商轮数已用完，双方仍有分歧，请你裁决",
+  deadlock: "同一条异议连续多轮没有进展，双方已停止收敛，请你裁决",
+  "max-rounds": "协商到达轮数上限，仍有阻塞性异议未解决，请你裁决",
   "clarification-needed": "Agent 需要你先补充关键信息",
+};
+
+/** blocking/major hold the delivery; minor rides along as a comment. */
+const FINDING_SEVERITY_LABELS: Record<ReviewFindingSeverity, string> = {
+  blocking: "阻塞",
+  major: "重要",
+  minor: "建议",
 };
 
 function ReviewCard({ review, agents }: { review: ReviewState; agents: AgentSummary[] }) {
@@ -1585,7 +1596,7 @@ function ReviewCard({ review, agents }: { review: ReviewState; agents: AgentSumm
     : review.status === "changes-requested" ? `${reviewer} 提出异议，正在协商（第 ${review.round} 轮）`
     : review.status === "cancelled" ? `${kind}已随协作链取消`
     : review.unstructured ? `${reviewer} 已给出文字意见，等待你处理`
-    : review.escalation === "max-rounds" ? "双方仍有分歧，需要你裁决"
+    : review.escalation === "deadlock" || review.escalation === "max-rounds" ? "双方仍有实质分歧，需要你裁决"
     : "需要人工介入";
   return (
     <div className={`review-card review-card--${review.status}`}>
@@ -1600,7 +1611,17 @@ function ReviewCard({ review, agents }: { review: ReviewState; agents: AgentSumm
         ? <div className="review-card-unstructured markdown-body"><ReactMarkdown remarkPlugins={[remarkGfm]}>{review.summary}</ReactMarkdown></div>
         : <p>{review.summary}</p>)}
       {review.findings && review.findings.length > 0 && (
-        <ul>{review.findings.map((finding, index) => <li key={`${index}-${finding}`}>{finding}</li>)}</ul>
+        <ul>
+          {normalizeFindings(review.findings).map((finding, index) => (
+            <li key={`${index}-${finding.detail}`}>
+              <span className={`review-finding-severity review-finding-severity--${finding.severity}`}>
+                {FINDING_SEVERITY_LABELS[finding.severity]}
+              </span>
+              {finding.kind === "question" ? <span className="review-finding-severity review-finding-severity--question">待你回答</span> : null}
+              {finding.detail}
+            </li>
+          ))}
+        </ul>
       )}
       {review.checks && review.checks.length > 0 && (
         <>
