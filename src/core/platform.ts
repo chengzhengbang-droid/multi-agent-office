@@ -1423,7 +1423,8 @@ export class MultiAgentPlatform {
     if (!humanAsked) return false;
     // A clarification is conversation before delivery, not a deliverable to
     // review. It only bypasses the gate while the run truly stayed read-only
-    // and made no competing deliverable declaration.
+    // and made no competing deliverable declaration. A question raised inside a
+    // review round never reaches here: advanceReview settles that task first.
     if (this.isClarificationOnly(run)) return false;
     if (this.reviewMode === "required") return true;
     return (
@@ -1484,15 +1485,18 @@ export class MultiAgentPlatform {
       return;
     }
     const taskRunId = this.taskRunIdOf(run);
-    if (this.isClarificationOnly(run)) {
-      // Initial questions simply end this conversational turn. If a material
-      // question surfaced during discussion, close the old review task explicitly
-      // so it cannot keep cycling or leave a stale pending gate behind.
-      if ((run.reviewRound ?? 0) > 0) {
-        await this.resolveClarificationDuringRework(run);
-      }
+    // A question raised during discussion closes the old review task
+    // explicitly, so it cannot keep cycling or leave a stale pending gate
+    // behind. Unlike a first-turn clarification this does not require the run
+    // to have stayed clean: a rework round is allowed to ask after it has
+    // started fixing, and the half-done revision is not a deliverable to
+    // review — the human's answer decides what the rest of it should be.
+    if (this.runClarifications.has(run.id) && (run.reviewRound ?? 0) > 0) {
+      await this.resolveClarificationDuringRework(run);
       return;
     }
+    // Initial questions simply end this conversational turn.
+    if (this.isClarificationOnly(run)) return;
     // A critique judges a plan, so this run's output is the plan under review.
     // Recorded before the gate opens because the no-reviewer path settles the
     // task inside requestReview, and the human still has to see the plan.
@@ -2021,6 +2025,12 @@ export class MultiAgentPlatform {
    * that a human decision is required, end that review without pretending the
    * unfinished plan is ready for the plan-approval gate. The human's reply is
    * a fresh task turn with the missing facts in context.
+   *
+   * The author may already have edited the workspace this round; that is what
+   * addressing the other findings looks like. A half-finished revision is not
+   * something to send back to the reviewer — it is waiting on the same answer
+   * the human is being asked for — so this path takes precedence over the gate
+   * rather than running alongside it.
    */
   private async resolveClarificationDuringRework(run: AgentRun): Promise<void> {
     const taskRunId = this.taskRunIdOf(run);
@@ -2185,7 +2195,14 @@ export class MultiAgentPlatform {
         reason: "this run already declared a deliverable; clarification must happen before submission",
       };
     }
-    if (this.runWriteEffects.has(run.id)) {
+    // Before the first delivery, asking is something you do *instead* of
+    // executing, so a run that already wrote has forfeited the question. Inside
+    // a review round the ordering is reversed: the author is revising work that
+    // is already under review, and a finding that turns on an undecided
+    // question is usually found while addressing the others. Refusing there
+    // leaves guessing as the only way to finish the round — which is exactly
+    // what escalation exists to prevent.
+    if (this.runWriteEffects.has(run.id) && (run.reviewRound ?? 0) === 0) {
       return {
         accepted: false,
         reason: "this run already changed the workspace; clarification must happen before execution",
@@ -3066,7 +3083,7 @@ function buildReviewFeedbackContent(input: {
     "Your next output is the candidate the reviewer will judge, so include the complete final result, not only a rebuttal or a change list.",
     closing,
     "Rounds are not what ends this: an objection that stands unchanged round after round is. Either resolve each blocking finding or answer it with evidence the reviewer has not seen yet — repeating your previous position back is what makes the platform stop and ask the human to decide.",
-    "If a blocking finding turns on something the human never decided, do not guess through another round: call request_clarification and ask them.",
+    "If a blocking finding turns on something the human never decided, do not guess through another round: call request_clarification and ask them. It is accepted even after you have started on the other findings, so you never have to choose between fixing and asking.",
   ].join("\n");
 }
 
