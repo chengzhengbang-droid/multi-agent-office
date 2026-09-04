@@ -349,12 +349,14 @@ test("a plan the peer would not approve still reaches the human, labelled as suc
   await platform.postUserMessage({ content: "@codex 出个方案", planMode: true });
   const events = await platform.getEvents();
 
-  assert.equal(single(events, "review.resolved").escalation, "max-rounds");
+  // The same objection twice over is a stall, and a stall is what a real
+  // disagreement looks like — not a spent round budget.
+  assert.equal(single(events, "review.resolved").escalation, "deadlock");
   const awaiting = single(events, "plan.awaiting-approval");
   // An escalation is exactly when a human is needed, so the plan is handed
   // over with the peer's doubt attached rather than dropped on the floor.
   assert.equal(awaiting.peerOutcome, "escalated");
-  assert.equal(awaiting.escalation, "max-rounds");
+  assert.equal(awaiting.escalation, "deadlock");
   assert.equal(awaiting.peerSummary, "回滚路径还是没写清楚");
   assert.match(awaiting.plan, /方案第 N 版/);
 });

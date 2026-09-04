@@ -17,6 +17,15 @@ import {
   type ReviewerDegradeReason,
 } from "./reviewer-routing.js";
 import {
+  advisoryFindings,
+  findingLabel,
+  gatingFindings,
+  humanQuestions,
+  normalizeFindings,
+  REVIEW_SEVERITY_BRIEF,
+  stalledRounds,
+} from "./review-convergence.js";
+import {
   mergePriorArt,
   priorArtCritiqueBrief,
   summarizePriorArt,
@@ -44,7 +53,9 @@ import type {
   PlanPeerOutcome,
   PlatformEventPayload,
   ReviewEscalation,
+  ReviewFinding,
   ReviewOutcome,
+  ReviewVerdict,
   ReviewerMatchRecord,
   ReviewSubmission,
   ReviewType,
@@ -89,7 +100,18 @@ export interface MultiAgentPlatformOptions {
    * final deliverable.
    */
   reviewMode?: ReviewMode;
+  /**
+   * The hard stop on peer discussion. It is a safety cap, not the normal way a
+   * review ends: a task reaches it only when blocking objections are still
+   * being raised and answered round after round.
+   */
   maxReviewRounds?: number;
+  /**
+   * How many rounds in a row may restate the round before them before the
+   * platform calls it a deadlock and asks the human. This, not the round
+   * budget, is what a genuine disagreement trips.
+   */
+  maxStalledRounds?: number;
   /** How long a pending human gate stays fresh in the approval index. */
   approvalStaleAfterMs?: number;
 }
@@ -232,6 +254,14 @@ export class MultiAgentPlatform {
   private readonly reviewSubmissions = new Map<Id, ReviewSubmission>();
   /** taskRunId -> review rounds requested so far. */
   private readonly reviewRounds = new Map<Id, number>();
+  /**
+   * taskRunId -> the gating objections each round raised, oldest first. Kept as
+   * the full history rather than a stall counter so a replayed log reaches the
+   * same convergence verdict the live run did. Keyed by review run inside, so a
+   * reviewer that calls submit_review twice revises its round rather than
+   * appearing to have stood still for two of them.
+   */
+  private readonly taskObjections = new Map<Id, Array<{ reviewRunId: Id; gating: ReviewFinding[] }>>();
   /** taskRunId values that already carry a terminal review.resolved. */
   private readonly resolvedTaskRuns = new Set<Id>();
   /** reviewRunId -> the Agent whose work that review judges. */
@@ -275,6 +305,7 @@ export class MultiAgentPlatform {
   private readonly maxParallelReadRuns: number;
   private readonly reviewMode: ReviewMode;
   private readonly maxReviewRounds: number;
+  private readonly maxStalledRounds: number;
   private readonly approvalStaleAfterMs: number;
   private defaultAgentId: Id;
   private hydrated = false;
@@ -292,7 +323,8 @@ export class MultiAgentPlatform {
     this.maxPingPongHops = options.maxPingPongHops ?? 4;
     this.maxParallelReadRuns = options.maxParallelReadRuns ?? 4;
     this.reviewMode = options.reviewMode ?? "smart";
-    this.maxReviewRounds = Math.max(1, options.maxReviewRounds ?? 2);
+    this.maxReviewRounds = Math.max(1, options.maxReviewRounds ?? 4);
+    this.maxStalledRounds = Math.max(1, options.maxStalledRounds ?? 2);
     this.approvalStaleAfterMs = Math.max(
       60_000,
       options.approvalStaleAfterMs ?? DEFAULT_APPROVAL_STALE_AFTER_MS,
@@ -676,7 +708,14 @@ export class MultiAgentPlatform {
           verdict: event.verdict,
           summary: event.summary,
           ...(event.findings ? { findings: event.findings } : {}),
+          ...(event.checks ? { checks: event.checks } : {}),
         });
+        this.trackObjections(
+          event.taskRunId,
+          event.reviewRunId,
+          event.verdict,
+          normalizeFindings(event.findings),
+        );
       } else if (event.type === "review.resolved") {
         this.resolvedTaskRuns.add(event.taskRunId);
         this.forgetReviewState(event.taskRunId);
@@ -1795,13 +1834,66 @@ export class MultiAgentPlatform {
       await this.resolveReview(reviewRun, "cancelled", round, undefined, "协作链已取消");
       return;
     }
+
+    const findings = normalizeFindings(submission.findings);
+    const gating = gatingFindings(findings);
+    // Severity is the gate, not the verdict. A reviewer whose objections are
+    // all minor has finished reviewing and is now commenting; holding the task
+    // for that spends a discussion round, and eventually a human, on nits.
+    if (gating.length === 0) {
+      const comments = advisoryFindings(findings).map(findingLabel);
+      await this.resolveReview(
+        reviewRun,
+        "approved",
+        round,
+        undefined,
+        comments.length > 0
+          ? `审核者没有提出阻塞性问题，视为达成共识；以下是不阻塞的建议：${comments.join("；")}`
+          : "审核者没有提出阻塞性问题，视为达成共识",
+      );
+      return;
+    }
+    // Some objections no round of peer discussion can settle: the reviewer is
+    // pointing at something the human never decided. Another round would buy a
+    // better-argued guess, so ask now instead of after the budget runs out.
+    const questions = humanQuestions(findings);
+    if (questions.length > 0) {
+      await this.resolveReview(
+        reviewRun,
+        "escalated",
+        round,
+        "clarification-needed",
+        `审核者认为这些问题只有你能拍板：${questions.map((question) => question.detail).join("；")}`,
+      );
+      return;
+    }
+    // A stall, not a spent budget, is what a real disagreement looks like: the
+    // same objection standing unanswered round after round means the peers have
+    // stopped moving and the gap is above their pay grade (clowder-ai's ≥3-round
+    // escalation rule). Rounds that keep resolving and raising objections are
+    // working, and are left alone until the hard cap below.
+    const stalled = stalledRounds(this.objectionHistory(taskRunId));
+    if (stalled >= this.maxStalledRounds) {
+      await this.resolveReview(
+        reviewRun,
+        "escalated",
+        round,
+        "deadlock",
+        `同一条异议连续 ${stalled + 1} 轮没有被解决也没有被撤回，双方已停止收敛，需要你裁决：${gating
+          .map((finding) => finding.detail)
+          .join("；")}`,
+      );
+      return;
+    }
     if (round >= this.maxReviewRounds) {
       await this.resolveReview(
         reviewRun,
         "escalated",
         round,
         "max-rounds",
-        `${round} 轮协商后作者与审核者仍未达成一致，需要人类裁决`,
+        `${round} 轮协商后仍有未解决的阻塞性异议，需要人类裁决：${gating
+          .map((finding) => finding.detail)
+          .join("；")}`,
       );
       return;
     }
@@ -2046,6 +2138,7 @@ export class MultiAgentPlatform {
   private forgetReviewState(taskRunId: Id): void {
     this.taskReviewTypes.delete(taskRunId);
     this.taskReviewers.delete(taskRunId);
+    this.taskObjections.delete(taskRunId);
     // Normally consumed by awaitPlanApproval; a cancelled critique never gets
     // there, and a draft nobody will read is just a leak. The same holds for
     // the ledger: a plan that ends in a clarification never reaches the
@@ -2282,16 +2375,19 @@ export class MultiAgentPlatform {
     if (summary.length > 20_000) {
       return { accepted: false, reason: "summary must be at most 20,000 characters" };
     }
-    const findings = (input.findings ?? [])
-      .map((finding) => finding.trim())
-      .filter(Boolean)
-      .slice(0, 20);
+    const findings = normalizeFindings(input.findings).slice(0, 20);
+    for (const finding of findings) {
+      if (finding.severity !== "blocking" && finding.severity !== "major" && finding.severity !== "minor") {
+        return { accepted: false, reason: "each finding's severity must be blocking, major or minor" };
+      }
+    }
     if (input.verdict === "changes-requested" && findings.length === 0) {
       return {
         accepted: false,
         reason: "changes-requested must list at least one concrete finding",
       };
     }
+    const gating = gatingFindings(findings);
     const checks = (input.checks ?? [])
       .map((check) => check.trim())
       .filter(Boolean)
@@ -2300,11 +2396,18 @@ export class MultiAgentPlatform {
     // reviewer that cannot name one thing it checked for itself has only
     // relayed the author's claim, which is exactly what the gate exists to
     // stop; rejecting here sends it back to verify rather than passing.
-    if (input.verdict === "approved" && checks.length === 0) {
+    //
+    // Requesting changes on nothing but minor findings is an approval with
+    // comments attached — severity is what gates, so nothing here holds the
+    // task back — and it therefore owes the same evidence as any approval.
+    const passesGate = input.verdict === "approved" || gating.length === 0;
+    if (passesGate && checks.length === 0) {
       return {
         accepted: false,
         reason:
-          "approved must list at least one check you ran yourself (file read, command executed, output observed)",
+          input.verdict === "approved"
+            ? "approved must list at least one check you ran yourself (file read, command executed, output observed)"
+            : "minor findings do not hold the task back, so this reads as consensus with comments: either list a check you ran yourself, or raise a finding to major/blocking if it must not ship as is",
       };
     }
     const submission: ReviewSubmission = {
@@ -2314,6 +2417,7 @@ export class MultiAgentPlatform {
       ...(checks.length > 0 ? { checks } : {}),
     };
     this.reviewSubmissions.set(run.id, submission);
+    this.trackObjections(run.taskRunId, run.id, input.verdict, findings);
     await this.record({
       type: "review.submitted",
       threadId: run.threadId,
@@ -2323,6 +2427,31 @@ export class MultiAgentPlatform {
       ...submission,
     });
     return { accepted: true };
+  }
+
+  /**
+   * Append this round's gating objections to the task's history. Approvals push
+   * an empty round on purpose: it breaks any stall streak, so a reviewer that
+   * withdraws its objections and then finds the same fault again later is not
+   * treated as having stood still the whole time.
+   */
+  private trackObjections(
+    taskRunId: Id,
+    reviewRunId: Id,
+    verdict: ReviewVerdict,
+    findings: ReviewFinding[],
+  ): void {
+    const history = this.taskObjections.get(taskRunId) ?? [];
+    const round = { reviewRunId, gating: verdict === "approved" ? [] : gatingFindings(findings) };
+    const existing = history.findIndex((entry) => entry.reviewRunId === reviewRunId);
+    if (existing >= 0) history[existing] = round;
+    else history.push(round);
+    this.taskObjections.set(taskRunId, history);
+  }
+
+  /** This task's rounds of gating objections, oldest first. */
+  private objectionHistory(taskRunId: Id): ReviewFinding[][] {
+    return (this.taskObjections.get(taskRunId) ?? []).map((entry) => entry.gating);
   }
 
   private projectedPingPongHops(sourceRun: AgentRun, targetAgentId: Id): number {
@@ -2792,8 +2921,8 @@ function buildReviewRequestContent(input: {
     : [];
   const header =
     input.reviewType === "critique"
-      ? `@${input.reviewerAgentId} Independently critique @${input.authorAgentId}'s plan — round ${input.round} of ${input.maxRounds}.`
-      : `@${input.reviewerAgentId} Independently verify @${input.authorAgentId}'s completed work — round ${input.round} of ${input.maxRounds}.`;
+      ? `@${input.reviewerAgentId} Independently critique @${input.authorAgentId}'s plan — round ${input.round} (hard stop after ${input.maxRounds}).`
+      : `@${input.reviewerAgentId} Independently verify @${input.authorAgentId}'s completed work — round ${input.round} (hard stop after ${input.maxRounds}).`;
   // The two briefs differ in what counts as doing the job: a plan is judged on
   // its reasoning, finished work on the artifacts it claims to have produced.
   // Both start from disbelief: an author's "done" is a claim to test, never a
@@ -2821,6 +2950,7 @@ function buildReviewRequestContent(input: {
         "This is a continued peer discussion, not a compliance inspection.",
         "Read the author's latest response and candidate on their merits. They may have changed the work, rebutted your earlier objection with evidence, or proposed a better alternative.",
         "Acknowledge sound reasoning and withdraw or refine objections when warranted. Never repeat an earlier finding without addressing the author's answer to it.",
+        "Restating an unchanged objection is what ends the discussion and puts this in front of the human. Do it when you genuinely cannot move, not as a way of holding your ground.",
       ]
     : [
         "Your findings are peer arguments, not orders. The author may adopt them, rebut them with evidence, or propose an alternative in the next round.",
@@ -2849,10 +2979,11 @@ function buildReviewRequestContent(input: {
     ...priorArt,
     ...deliberation,
     ...independence,
+    ...REVIEW_SEVERITY_BRIEF,
     "Finish by calling submit_review exactly once: approved, or changes-requested with concrete findings.",
     "approved requires listing at least one check you ran yourself; an approval that cannot name one is rejected.",
     "The goal is a final candidate both peers can stand behind, not obedience to the reviewer and not victory for either side.",
-    "Do not manufacture agreement to close the loop. If material disagreement remains in the final round, request changes so the platform asks the human to decide.",
+    "Do not manufacture agreement to close the loop, and do not invent a blocking finding to look rigorous. Both distort the same signal.",
     "Ending without submit_review is not an approval — it escalates the task to the human.",
   ].join("\n");
 }
@@ -2912,22 +3043,30 @@ function buildReviewFeedbackContent(input: {
   maxRounds: number;
   reviewType: ReviewType;
 }): string {
-  const findings = input.submission.findings ?? [];
+  const findings = normalizeFindings(input.submission.findings);
+  const gating = gatingFindings(findings);
+  const advisory = advisoryFindings(findings);
   const closing =
     input.reviewType === "critique"
       ? `Continue the discussion and then submit a complete, self-contained candidate plan for round ${input.round + 1}.`
       : `Continue the discussion and then present the complete candidate delivery for round ${input.round + 1}.`;
   return [
-    `@${input.authorAgentId} Peer review round ${input.round} of ${input.maxRounds}: the reviewer raised objections.`,
+    `@${input.authorAgentId} Peer review round ${input.round} (hard stop after ${input.maxRounds}): the reviewer raised blocking objections.`,
     "",
     input.submission.summary,
-    ...(findings.length > 0 ? ["", "Findings:", ...findings.map((f) => `- ${f}`)] : []),
+    ...(gating.length > 0
+      ? ["", "Blocking findings — these are what hold the delivery:", ...gating.map((finding) => `- ${findingLabel(finding)}`)]
+      : []),
+    ...(advisory.length > 0
+      ? ["", "Comments — take them or leave them; they do not hold anything up:", ...advisory.map((finding) => `- ${findingLabel(finding)}`)]
+      : []),
     "",
     "These are a peer's arguments, not instructions. Judge each one yourself: adopt it when it is right, rebut it with evidence when it is wrong, or propose a better alternative.",
     "Respond naturally in your next delivery; no separate accept/reject action or point-by-point form is required. Explain the reasoning that matters so the reviewer can reconsider rather than merely check compliance.",
     "Your next output is the candidate the reviewer will judge, so include the complete final result, not only a rebuttal or a change list.",
     closing,
-    `If you still disagree after round ${input.maxRounds}, preserve the disputed reasoning clearly; the platform will ask the human to decide rather than forcing either peer to yield.`,
+    "Rounds are not what ends this: an objection that stands unchanged round after round is. Either resolve each blocking finding or answer it with evidence the reviewer has not seen yet — repeating your previous position back is what makes the platform stop and ask the human to decide.",
+    "If a blocking finding turns on something the human never decided, do not guess through another round: call request_clarification and ask them.",
   ].join("\n");
 }
 

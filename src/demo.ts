@@ -32,7 +32,8 @@ const platform = new MultiAgentPlatform({
       : process.env.MAO_REVIEW_GATE === "on" || process.env.MAO_REVIEW_GATE === "required"
         ? "required"
         : "smart",
-  maxReviewRounds: Number(process.env.MAO_MAX_REVIEW_ROUNDS ?? 2),
+  maxReviewRounds: Number(process.env.MAO_MAX_REVIEW_ROUNDS ?? 4),
+  maxStalledRounds: Number(process.env.MAO_REVIEW_STALL_ROUNDS ?? 2),
 });
 
 platform.subscribe(renderEvent);
