@@ -1642,6 +1642,76 @@ test("an objection only the human can settle is asked now, not after the budget"
   assert.doesNotMatch(resolved.detail ?? "", /日志格式/);
 });
 
+test("an author revising work can still stop and ask the human mid-round", async () => {
+  let clarificationAccepted: boolean | undefined;
+  const platform = createReviewPlatform(
+    [agent("pi", "workspace-write"), agent("codex")],
+    {
+      pi: async (request) => {
+        if (request.incoming.kind !== "review-feedback") return emitOutput(request, "实现完成");
+        // What addressing findings actually looks like: fix the ones you can,
+        // and only then hit the one nobody ever decided.
+        await request.emit({ type: "tool_start", toolName: "edit" });
+        await request.emit({ type: "tool_end", toolName: "edit", isError: false });
+        const result = await request.requestClarification({
+          questions: ["超时后是重试还是直接失败？原始任务没有说。"],
+        });
+        clarificationAccepted = result.accepted;
+        return emitOutput(request, "改了错误分支，但重试语义得你先定");
+      },
+      codex: async (request) => {
+        await request.submitReview?.({
+          verdict: "changes-requested",
+          summary: "错误路径没有覆盖",
+          findings: [{ detail: "超时分支既没有重试也没有报错", severity: "blocking" }],
+        });
+        return emitOutput(request, "需要修改");
+      },
+    },
+  );
+
+  await platform.postUserMessage({ content: "@pi 实现" });
+  const events = await platform.getEvents();
+
+  // The edit that came first must not cost the author the question.
+  assert.equal(clarificationAccepted, true);
+  assert.equal(countEvents(events, "clarification.requested"), 1);
+  assert.equal(countEvents(events, "review.rework"), 1);
+  // And the half-done revision is not sent back to the reviewer: it is waiting
+  // on the same answer the human is being asked for.
+  assert.equal(countEvents(events, "review.requested"), 1);
+  const resolved = single(events, "review.resolved");
+  assert.equal(resolved.outcome, "escalated");
+  assert.equal(resolved.escalation, "clarification-needed");
+  assert.match(resolved.detail ?? "", /超时后是重试还是直接失败/);
+  assert.equal(
+    events.filter((event) => event.type === "ball.handed_user").at(-1)?.reason,
+    "clarification",
+  );
+});
+
+test("before the first delivery, a run that already wrote cannot fall back on a question", async () => {
+  let refusal: string | undefined;
+  const platform = createReviewPlatform([agent("pi", "workspace-write"), agent("codex")], {
+    pi: async (request) => {
+      await request.emit({ type: "tool_start", toolName: "write" });
+      await request.emit({ type: "tool_end", toolName: "write", isError: false });
+      const result = await request.requestClarification({ questions: ["要兼容哪个框架？"] });
+      refusal = result.reason;
+      return emitOutput(request, "写完了");
+    },
+    codex: approving([]),
+  });
+
+  await platform.postUserMessage({ content: "@pi 实现" });
+  const events = await platform.getEvents();
+
+  // Asking is what you do instead of executing, not a way out of what you did.
+  assert.match(refusal ?? "", /already changed the workspace/);
+  assert.equal(countEvents(events, "clarification.requested"), 0);
+  assert.equal(single(events, "review.resolved").outcome, "approved");
+});
+
 test("a review run that ends without submit_review is escalated, never approved", async () => {
   const platform = createReviewPlatform([agent("pi"), agent("codex")], {
     pi: async (request) => emitOutput(request, "交付"),

@@ -57,6 +57,11 @@ test("the collaboration prompt makes human clarification a pre-review gate", () 
   assert.match(prompt, /call request_clarification/);
   assert.match(prompt, /Do not create or submit a provisional deliverable/);
   assert.match(prompt, /only then submit the deliverable for peer review/);
+  // The ordering rule the platform actually enforces, stated in both
+  // directions: a first turn must ask before it writes, a review round may ask
+  // after it has started.
+  assert.match(prompt, /Ask before you act/);
+  assert.match(prompt, /even after you have started addressing the other findings/);
 });
 
 test("peer review prompts make later rounds a discussion instead of reviewer commands", () => {
@@ -83,6 +88,9 @@ test("peer review prompts make later rounds a discussion instead of reviewer com
   assert.match(reviewerPrompt, /rebut.*earlier suggestion/i);
   assert.match(reviewerPrompt, /Either peer is allowed to change their mind/);
   assert.match(reviewerPrompt, /human decides/);
+  // An objection phrased as "confirm this with the human" only reaches the
+  // human when it carries kind=question, so the brief says so mechanically.
+  assert.match(reviewerPrompt, /confirm, check with, or align with the human/);
 });
 
 test("DeepSeek runtime requires and recognizes its API key", () => {

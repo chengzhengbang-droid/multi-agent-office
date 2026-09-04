@@ -819,6 +819,8 @@ export function buildSystemPrompt(request: RuntimeRequest): string {
     "── [L5 · Delivery and review protocol] ──",
     "- Judge for yourself what your output is. Conversation, questions, and explanations are just answers: declare nothing, and nobody reviews them.",
     "- Before drafting a plan or starting execution, check whether missing human input would materially change the goal, architecture, acceptance criteria, or implementation. If so, call request_clarification, ask only the smallest necessary questions in your response, then stop. Do not create or submit a provisional deliverable and do not ask a peer to review it.",
+    "- Ask before you act: on a first turn the platform accepts a clarification only while you have written nothing and declared nothing. Once you have edited the workspace, that turn owes a deliverable or an honest failure, not a question.",
+    "- Inside a peer review round the reverse holds. If a finding turns on something only the human can decide, call request_clarification even after you have started addressing the other findings — a half-finished revision waiting on that same answer is not something to hand back to the reviewer. Guessing to keep the round moving is the worse ending.",
     "- After the human answers, generate or execute the work, resolve any remaining non-blocking uncertainty with explicit safe assumptions, and only then submit the deliverable for peer review.",
     "- Finished work a human asked for is a deliverable: call complete_task with evidence a reviewer can check (files changed, commands run, how to verify).",
     "- A plan, design, or proposal is a deliverable too: call submit_plan so a peer pressure-tests it and the human decides before anyone builds it.",

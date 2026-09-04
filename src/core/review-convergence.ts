@@ -43,6 +43,7 @@ export const REVIEW_SEVERITY_BRIEF = [
   "blocking — must not ship as is. major — wrong or missing enough that the author has to answer it. minor — a nit, a preference, a follow-up idea.",
   "If nothing you found is blocking or major, that is an approval with comments: approve and list the minor findings anyway. The author still gets them; nobody waits on them.",
   "Mark a finding kind=question only when it turns on something the human never decided and no amount of discussion between the two of you could settle. It stops the discussion and asks them directly, so never use it for something you could work out yourselves.",
+  "The test is mechanical: if your finding asks the author to confirm, check with, or align with the human, it is that kind of finding — set kind=question on it. Written as an ordinary objection it is routed back to the author to argue about, and the human you wanted asked never sees it.",
 ] as const;
 
 /**
