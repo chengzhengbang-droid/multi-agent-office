@@ -7,6 +7,7 @@ import {
 } from "react";
 import {
   Activity,
+  ArrowDown,
   ArrowRight,
   AtSign,
   Bot,
@@ -61,6 +62,7 @@ import {
   type CustomProviderCatalogV1,
 } from "../config/custom-providers";
 import { agentAvatarTone, agentInitials } from "./agent-identity";
+import { buildReviewAnchors } from "./review-anchors";
 import type { A2ARoutingMode, CollaborationIntent } from "../core/collaboration";
 import type { PriorArtLedger, PriorArtSourceKind, PriorArtVerdict } from "../core/prior-art";
 import {
@@ -156,6 +158,8 @@ type TranscriptItem =
       usage?: RunUsage;
       purpose: RunPurpose;
       reviewRound?: number;
+      /** Set on a review run: the delivery run it reviews. */
+      taskRunId?: string;
       review?: ReviewState;
       /** Set on the plan task run this plan belongs to, across every round. */
       plan?: PlanState;
@@ -254,7 +258,10 @@ export function App() {
     if (saved === "light" || saved === "dark") return saved;
     return window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
   });
-  const conversationEndRef = useRef<HTMLDivElement>(null);
+  const conversationRef = useRef<HTMLElement>(null);
+  // 只有当用户本来就贴着底部时才跟着新内容走。流式输出期间强制滚到底，
+  // 等于把滚动条从用户手里抢走——往上翻一行就被拽回去，前面的内容根本读不了。
+  const [pinnedToBottom, setPinnedToBottom] = useState(true);
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
@@ -355,6 +362,23 @@ export function App() {
   const approvals = useMemo(() => projectApprovals(data?.events ?? []), [data?.events]);
   const pendingApprovals = countPendingApprovals(approvals);
   const attentionRuns = useMemo(() => transcript.filter(isAttentionRun), [transcript]);
+  // 审核结论显示在最新一轮审核消息下面，而不是永远钉在被审核的那条交付下面。
+  const reviewCards = useMemo(() => {
+    const anchors = buildReviewAnchors(
+      transcript.flatMap((item) => (item.type === "agent" ? [{ id: item.id, hasReview: Boolean(item.review), ...(item.taskRunId ? { taskRunId: item.taskRunId } : {}) }] : [])),
+    );
+    const cards = new Map<string, ReviewState>();
+    const moved = new Map<string, ReviewState>();
+    for (const item of transcript) {
+      if (item.type !== "agent" || !item.review) continue;
+      // 升级到人工裁决的那些由下方「需要你处理」统一收口，正文里不再重复一份。
+      if (item.review.status === "escalated" && isAttentionRun(item)) continue;
+      const anchor = anchors.get(item.id) ?? item.id;
+      cards.set(anchor, item.review);
+      if (anchor !== item.id) moved.set(item.id, item.review);
+    }
+    return { cards, moved };
+  }, [transcript]);
   const attentionKey = attentionRuns.map((item) => `${item.id}:${item.review?.status ?? ""}:${item.plan?.decision ?? "pending"}`).join("|");
   const activeChainId = useMemo(() => findActiveChain(data?.events ?? [], selectedThreadId), [data?.events, selectedThreadId]);
   const fallbackAgent = useMemo(
@@ -366,10 +390,22 @@ export function App() {
 
   const lastContent = transcript.at(-1)?.content ?? "";
   useEffect(() => {
-    conversationEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
-  }, [transcript.length, lastContent, attentionKey]);
+    if (!pinnedToBottom) return;
+    const element = conversationRef.current;
+    if (!element) return;
+    // 流式输出一秒钟到几十次，平滑滚动会排队追不上，也会和用户的滚轮打架。
+    element.scrollTop = element.scrollHeight;
+  }, [transcript.length, lastContent, attentionKey, pinnedToBottom]);
+
+  // 换任务等于换了一份阅读材料，重新贴回底部。
+  useEffect(() => {
+    setPinnedToBottom(true);
+    const element = conversationRef.current;
+    if (element) element.scrollTop = element.scrollHeight;
+  }, [selectedThreadId]);
 
   const newTask = () => {
+    setPinnedToBottom(true);
     setSelectedThreadId(undefined);
     setDraft("");
     setActionError("");
@@ -380,6 +416,8 @@ export function App() {
   const sendTask = async (steer = false) => {
     const content = draft.trim();
     if (!content || sending || !configured) return;
+    // 自己刚发了一条，说明注意力回到了最新处。
+    setPinnedToBottom(true);
     setSending(true);
     setActionError("");
     try {
@@ -562,7 +600,16 @@ export function App() {
           </div>
         </header>
 
-        <section className="conversation">
+        <section
+          className="conversation"
+          ref={conversationRef}
+          onScroll={(event) => {
+            const element = event.currentTarget;
+            // 64px 的余量：最后一条消息的内边距和亚像素滚动误差都在这个量级里，
+            // 卡得太死会让"其实已经在底部"被判成"用户翻上去了"。
+            setPinnedToBottom(element.scrollHeight - element.scrollTop - element.clientHeight <= 64);
+          }}
+        >
           {loadError ? <div className="state-card state-card--error">{loadError}</div> : !data ? <div className="loading-state"><span />正在载入工作区…</div> : transcript.length > 0 ? (
             <div className="transcript">
               <div className="conversation-intro"><div className="intro-icon"><Bot size={18} /></div><div className="intro-copy"><strong>协作记录</strong><span>{transcript.filter((item) => item.type === "agent").length} 次 Agent 运行 · {transcript.filter((item) => item.type === "human").length} 条任务指令</span></div>{latestCollaboration ? <CollaborationStateBadge chain={latestCollaboration} /> : activeChainId ? <span className="live-indicator"><i />实时运行中</span> : <span className="conversation-state"><Check size={12} />已同步</span>}</div>
@@ -590,7 +637,9 @@ export function App() {
                 const agent = data.agents.find((candidate) => candidate.id === item.agentId);
                 const name = agentName(data.agents, item.agentId);
                 const runtime = runtimeDetail(agent, name);
-                const reviewNeedsAttention = item.review?.status === "escalated" && !item.plan?.decision;
+                const anchoredReview = reviewCards.cards.get(item.id);
+                // 卡片搬走之后，交付这一侧留一行去向，否则"送审了没有"在原地消失。
+                const reviewMoved = reviewCards.moved.get(item.id);
                 const planNeedsAttention = Boolean(item.plan && !item.plan.decision);
                 return (
                   <article className={`agent-message ${item.replyToAgentId ? "agent-message--peer-reply" : ""}`} key={item.id}>
@@ -599,7 +648,8 @@ export function App() {
                     <div className={`markdown-body ${item.status === "running" ? "markdown-body--streaming" : ""}`}>{item.content ? <ReactMarkdown remarkPlugins={[remarkGfm]}>{item.content}</ReactMarkdown> : <div className="thinking-line"><span /><span /><span /></div>}</div>
                     {item.usage && <RunUsageBar usage={item.usage} />}
                     {item.clarification && <ClarificationCard request={item.clarification} busy={sending} onSubmit={(answers) => answerClarification(item.clarification!, answers)} />}
-                    {item.review && !reviewNeedsAttention && <ReviewCard review={item.review} agents={data.agents} />}
+                    {reviewMoved && <p className="review-moved-note"><ShieldCheck size={12} />{reviewMovedNote(reviewMoved, data.agents)}</p>}
+                    {anchoredReview && <ReviewCard review={anchoredReview} agents={data.agents} />}
                     {item.plan && !planNeedsAttention && <PlanCard plan={item.plan} agents={data.agents} busy={decidingPlan === item.plan.taskRunId} onDecide={decidePlan} />}
                   </article>
                 );
@@ -618,10 +668,19 @@ export function App() {
                   ))}
                 </section>
               )}
-              <div ref={conversationEndRef} />
             </div>
           ) : <EmptyTask agents={data.agents} onSuggestion={setDraft} />}
         </section>
+
+        {!pinnedToBottom && transcript.length > 0 && (
+          <div className="jump-to-latest-slot">
+            <button className="jump-to-latest" type="button" onClick={() => {
+              setPinnedToBottom(true);
+              const element = conversationRef.current;
+              if (element) element.scrollTo({ top: element.scrollHeight, behavior: "smooth" });
+            }}><ArrowDown size={13} />回到最新{activeChainId ? " · 正在输出" : ""}</button>
+          </div>
+        )}
 
         {actionError && <div className="action-error" role="alert"><XCircle size={14} />{actionError}<button type="button" onClick={() => setActionError("")} aria-label="关闭错误"><X size={13} /></button></div>}
         <Composer planMode={planMode} onPlanModeChange={setPlanMode} routingMode={routingMode} onRoutingModeChange={setRoutingMode} agents={data?.agents ?? []} fallbackAgent={fallbackAgent} configured={configured} value={draft} onChange={setDraft} onSend={sendTask} onCancel={cancelTask} attachments={attachments} onAttachmentsChange={setAttachments} sending={sending} cancelling={cancelling} active={Boolean(activeChainId)} workspace={activeWorkspace} onWorkspaceClick={() => setWorkspacePickerOpen(true)} />
@@ -1587,6 +1646,15 @@ const FINDING_SEVERITY_LABELS: Record<ReviewFindingSeverity, string> = {
   minor: "建议",
 };
 
+/** 交付这一侧的去向提示：卡片已经挂到审核者那条消息下面了。 */
+function reviewMovedNote(review: ReviewState, agents: AgentSummary[]): string {
+  const reviewer = review.reviewerAgentId ? agentName(agents, review.reviewerAgentId) : "另一个 Agent";
+  const kind = reviewTypeLabel(review.reviewType);
+  return review.status === "pending"
+    ? `已送 ${reviewer} ${kind}（第 ${review.round} 轮）`
+    : `${reviewer} 的${kind}结论见下方第 ${review.round} 轮`;
+}
+
 function ReviewCard({ review, agents }: { review: ReviewState; agents: AgentSummary[] }) {
   const reviewer = review.reviewerAgentId ? agentName(agents, review.reviewerAgentId) : "另一个 Agent";
   const kind = reviewTypeLabel(review.reviewType);
@@ -1955,7 +2023,7 @@ export function buildTranscript(events: StoredPlatformEvent[], threadId?: string
     }
     if (event.type === "run.queued" && event.run.threadId === threadId) {
       const incoming = messages.get(event.run.incomingMessageId);
-      const item: Extract<TranscriptItem, { type: "agent" }> = { id: event.run.id, type: "agent", agentId: event.run.agentId, content: "", createdAt: event.recordedAt, status: "queued", thinking: "", tools: [], notices: [], purpose: event.run.purpose ?? "task", ...(event.run.reviewRound ? { reviewRound: event.run.reviewRound } : {}), ...(event.run.mode === "plan" ? { planMode: true } : {}), ...(event.run.routing ? { routing: { mode: event.run.routing.mode, index: event.run.routing.index, total: event.run.routing.total } } : {}), ...(incoming?.sender.type === "human" ? { replyToHuman: true } : {}), ...(incoming?.sender.type === "agent" ? { replyToAgentId: incoming.sender.id } : {}), ...(incoming ? { incomingKind: incoming.kind } : {}) };
+      const item: Extract<TranscriptItem, { type: "agent" }> = { id: event.run.id, type: "agent", agentId: event.run.agentId, content: "", createdAt: event.recordedAt, status: "queued", thinking: "", tools: [], notices: [], purpose: event.run.purpose ?? "task", ...(event.run.reviewRound ? { reviewRound: event.run.reviewRound } : {}), ...(event.run.purpose === "review" && event.run.taskRunId ? { taskRunId: event.run.taskRunId } : {}), ...(event.run.mode === "plan" ? { planMode: true } : {}), ...(event.run.routing ? { routing: { mode: event.run.routing.mode, index: event.run.routing.index, total: event.run.routing.total } } : {}), ...(incoming?.sender.type === "human" ? { replyToHuman: true } : {}), ...(incoming?.sender.type === "agent" ? { replyToAgentId: incoming.sender.id } : {}), ...(incoming ? { incomingKind: incoming.kind } : {}) };
       items.push(item);
       runs.set(event.run.id, item);
       if ((event.run.purpose ?? "task") === "review" && event.run.taskRunId) {
