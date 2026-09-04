@@ -1481,8 +1481,165 @@ test("escalates to the human instead of looping past maxReviewRounds", async () 
   assert.equal(resolved.outcome, "escalated");
   assert.equal(resolved.escalation, "max-rounds");
   assert.equal(resolved.rounds, 2);
-  assert.match(resolved.detail ?? "", /仍未达成一致/);
+  assert.match(resolved.detail ?? "", /阻塞性异议/);
   assert.match(resolved.detail ?? "", /人类裁决/);
+});
+
+test("minor findings are consensus with comments, not another discussion round", async () => {
+  // The failure this closes: a reviewer with nothing left but nits used to
+  // spend a round on them, and a task that spent its rounds went to the human.
+  const platform = createReviewPlatform([agent("pi"), agent("codex")], {
+    pi: async (request) => emitOutput(request, "交付"),
+    codex: async (request) => {
+      await request.submitReview?.({
+        verdict: "changes-requested",
+        summary: "能用，只有两个小建议",
+        findings: [
+          { detail: "这个变量名可以更直白", severity: "minor" },
+          { detail: "可以顺手补一句注释", severity: "minor" },
+        ],
+        checks: ["读了 src/core/platform.ts", "跑了 pnpm test"],
+      });
+      return emitOutput(request, "审毕");
+    },
+  });
+
+  await platform.postUserMessage({ content: "@pi 实现" });
+  const events = await platform.getEvents();
+
+  assert.equal(countEvents(events, "review.rework"), 0);
+  assert.equal(countEvents(events, "review.requested"), 1);
+  const resolved = single(events, "review.resolved");
+  assert.equal(resolved.outcome, "approved");
+  assert.equal(resolved.escalation, undefined);
+  // The comments are not lost just because they did not gate.
+  assert.match(resolved.detail ?? "", /不阻塞的建议/);
+  assert.match(resolved.detail ?? "", /这个变量名可以更直白/);
+});
+
+test("a verdict that gates on nothing still owes a check of its own", async () => {
+  const attempts: Array<{ accepted: boolean; reason?: string }> = [];
+  const platform = createReviewPlatform([agent("pi"), agent("codex")], {
+    pi: async (request) => emitOutput(request, "交付"),
+    codex: async (request) => {
+      // Minor-only findings pass the gate, so they carry an approval's burden
+      // of proof: a pass nobody verified is the author's word repeated back.
+      attempts.push(
+        await request.submitReview!({
+          verdict: "changes-requested",
+          summary: "只有小建议",
+          findings: [{ detail: "命名可以更好", severity: "minor" }],
+        }),
+      );
+      attempts.push(
+        await request.submitReview!({
+          verdict: "changes-requested",
+          summary: "只有小建议",
+          findings: [{ detail: "命名可以更好", severity: "minor" }],
+          checks: ["读了改动的那个文件"],
+        }),
+      );
+      return emitOutput(request, "审毕");
+    },
+  });
+
+  await platform.postUserMessage({ content: "@pi 实现" });
+
+  assert.deepEqual(attempts.slice(0, 2).map((attempt) => attempt.accepted), [false, true]);
+  assert.match(attempts[0]?.reason ?? "", /check you ran yourself/);
+  assert.match(attempts[0]?.reason ?? "", /major\/blocking/);
+});
+
+test("peers keep discussing while the discussion is still moving", async () => {
+  // Under the old fixed budget this task reached the human at round 2 with the
+  // peers still converging. Rounds are not the signal; a stall is.
+  const platform = createReviewPlatform([agent("pi"), agent("codex")], {
+    pi: async (request) => emitOutput(request, "又一版"),
+    codex: async (request) => {
+      const round = request.reviewOf?.round ?? 1;
+      if (round >= 3) {
+        await request.submitReview?.({
+          verdict: "approved",
+          summary: "这一版可以",
+          checks: ["跑了 pnpm test，全绿"],
+        });
+      } else {
+        await request.submitReview?.({
+          verdict: "changes-requested",
+          summary: `第 ${round} 轮`,
+          findings: [
+            round === 1
+              ? { detail: "解析失败时没有错误处理分支", severity: "blocking" as const }
+              : { detail: "并发写会互相覆盖", severity: "blocking" as const },
+          ],
+        });
+      }
+      return emitOutput(request, "审毕");
+    },
+  }, { maxReviewRounds: 4 });
+
+  await platform.postUserMessage({ content: "@pi 实现" });
+  const events = await platform.getEvents();
+
+  assert.equal(countEvents(events, "review.rework"), 2);
+  const resolved = single(events, "review.resolved");
+  assert.equal(resolved.outcome, "approved");
+  assert.equal(resolved.rounds, 3);
+});
+
+test("the same objection restated twice ends the discussion as a deadlock", async () => {
+  const platform = createReviewPlatform([agent("pi"), agent("codex")], {
+    pi: async (request) => emitOutput(request, "我还是认为原来的写法是对的"),
+    codex: async (request) => {
+      await request.submitReview?.({
+        verdict: "changes-requested",
+        summary: "还是不行",
+        findings: [{ detail: "解析失败时没有错误处理分支", severity: "blocking" }],
+      });
+      return emitOutput(request, "审毕");
+    },
+  }, { maxReviewRounds: 8 });
+
+  await platform.postUserMessage({ content: "@pi 实现" });
+  const events = await platform.getEvents();
+
+  // Three rounds of the same wall, and the platform stops — well short of the
+  // eight it was allowed to spend, and for a reason it can name.
+  const resolved = single(events, "review.resolved");
+  assert.equal(resolved.outcome, "escalated");
+  assert.equal(resolved.escalation, "deadlock");
+  assert.equal(resolved.rounds, 3);
+  assert.match(resolved.detail ?? "", /连续 3 轮/);
+  assert.match(resolved.detail ?? "", /错误处理分支/);
+});
+
+test("an objection only the human can settle is asked now, not after the budget", async () => {
+  const platform = createReviewPlatform([agent("pi"), agent("codex")], {
+    pi: async (request) => emitOutput(request, "交付"),
+    codex: async (request) => {
+      await request.submitReview?.({
+        verdict: "changes-requested",
+        summary: "原始任务没说清楚要哪种行为",
+        findings: [
+          { detail: "超时后是重试还是直接失败，原始任务没有说", severity: "blocking", kind: "question" },
+          { detail: "顺带一提，日志格式不统一", severity: "minor" },
+        ],
+      });
+      return emitOutput(request, "审毕");
+    },
+  });
+
+  await platform.postUserMessage({ content: "@pi 实现" });
+  const events = await platform.getEvents();
+
+  // No rework round: another round would only buy a better-argued guess.
+  assert.equal(countEvents(events, "review.rework"), 0);
+  const resolved = single(events, "review.resolved");
+  assert.equal(resolved.outcome, "escalated");
+  assert.equal(resolved.escalation, "clarification-needed");
+  assert.match(resolved.detail ?? "", /超时后是重试还是直接失败/);
+  // The nit rode along without becoming a question for the human.
+  assert.doesNotMatch(resolved.detail ?? "", /日志格式/);
 });
 
 test("a review run that ends without submit_review is escalated, never approved", async () => {
@@ -1848,6 +2005,110 @@ test("a pre-routing-policy log keeps its reviewer and describes the pairing from
   assert.equal(assignment?.authorAgentId, "pi");
   assert.deepEqual(assignment?.degradeReasons, ["same-family"]);
   assert.equal(assignment?.independent, true);
+});
+
+test("a resumed discussion counts the rounds the old log already spent", async () => {
+  // Convergence is judged from the event log, so a restart mid-discussion must
+  // inherit what was already argued — including a pre-severity round, whose
+  // bare-string findings were blocking objections when they were written.
+  const store = new InMemoryEventStore();
+  const at = (seconds: number) => `2026-01-01T00:00:${String(seconds).padStart(2, "0")}.000Z`;
+  const seeded: PlatformEventPayload[] = [
+    { type: "thread.created", thread: { id: "thread-1", title: "旧任务", createdAt: at(0) } },
+    {
+      type: "message.created",
+      message: {
+        id: "msg-1", threadId: "thread-1", sender: { type: "human", id: "operator" },
+        kind: "chat", mentions: ["pi"], content: "@pi 实现", createdAt: at(0),
+      },
+    },
+    {
+      type: "run.queued",
+      run: {
+        id: "run-task", threadId: "thread-1", agentId: "pi", incomingMessageId: "msg-1",
+        status: "queued", accessMode: "read-only", causal: { chainId: "chain-1", depth: 0 },
+        createdAt: at(0), purpose: "task",
+      },
+    },
+    { type: "run.started", runId: "run-task", threadId: "thread-1", agentId: "pi" },
+    { type: "run.completed", runId: "run-task", threadId: "thread-1", agentId: "pi", output: "交付" },
+    {
+      type: "message.created",
+      message: {
+        id: "msg-2", threadId: "thread-1", sender: { type: "agent", id: "pi" },
+        kind: "review-request", mentions: ["codex"], content: "@codex 请审核", createdAt: at(1),
+        causal: { chainId: "chain-1", parentRunId: "run-task", depth: 0 },
+      },
+    },
+    {
+      type: "review.requested", threadId: "thread-1", taskRunId: "run-task",
+      reviewRunId: "run-review-1", authorAgentId: "pi", reviewerAgentId: "codex",
+      round: 1, messageId: "msg-2",
+    },
+    {
+      type: "run.queued",
+      run: {
+        id: "run-review-1", threadId: "thread-1", agentId: "codex", incomingMessageId: "msg-2",
+        status: "queued", accessMode: "read-only",
+        causal: { chainId: "chain-1", parentRunId: "run-task", depth: 0 },
+        createdAt: at(1), purpose: "review", taskRunId: "run-task", reviewRound: 1,
+      },
+    },
+    { type: "run.started", runId: "run-review-1", threadId: "thread-1", agentId: "codex" },
+    { type: "run.completed", runId: "run-review-1", threadId: "thread-1", agentId: "codex", output: "审毕" },
+    // The old shape: findings as bare strings, with no severity to read.
+    {
+      type: "review.submitted", threadId: "thread-1", taskRunId: "run-task",
+      reviewRunId: "run-review-1", reviewerAgentId: "codex", verdict: "changes-requested",
+      summary: "还是不行", findings: ["解析失败时没有错误处理分支"],
+    },
+    {
+      type: "message.created",
+      message: {
+        id: "msg-3", threadId: "thread-1", sender: { type: "agent", id: "codex" },
+        kind: "review-feedback", mentions: ["pi"], content: "@pi 请修改", createdAt: at(2),
+        causal: { chainId: "chain-1", parentRunId: "run-review-1", depth: 0 },
+      },
+    },
+    {
+      type: "review.rework", threadId: "thread-1", taskRunId: "run-task",
+      reworkRunId: "run-rework-1", authorAgentId: "pi", round: 1, messageId: "msg-3",
+    },
+    {
+      type: "run.queued",
+      run: {
+        id: "run-rework-1", threadId: "thread-1", agentId: "pi", incomingMessageId: "msg-3",
+        status: "queued", accessMode: "read-only",
+        causal: { chainId: "chain-1", parentRunId: "run-review-1", depth: 0 },
+        createdAt: at(2), purpose: "task", taskRunId: "run-task", reviewRound: 1,
+      },
+    },
+  ];
+  for (const [index, event] of seeded.entries()) {
+    await store.append({ ...event, eventId: `seed-${index}`, recordedAt: at(index) } as StoredPlatformEvent);
+  }
+
+  const platform = createReviewPlatform([agent("pi"), agent("codex")], {
+    pi: async (request) => emitOutput(request, "我还是认为原来的写法是对的"),
+    codex: async (request) => {
+      await request.submitReview?.({
+        verdict: "changes-requested",
+        summary: "还是不行",
+        findings: [{ detail: "解析失败时没有错误处理分支", severity: "blocking" }],
+      });
+      return emitOutput(request, "审毕");
+    },
+  }, { eventStore: store, maxReviewRounds: 8 });
+  await platform.initialize();
+  await waitFor(async () => (await platform.getEvents()).some((event) => event.type === "review.resolved"));
+  const events = await platform.getEvents();
+
+  // Rounds 2 and 3 restate round 1's objection, so the deadlock lands on round
+  // 3. Had the replayed round been dropped, it would have taken until round 4.
+  const resolved = single(events, "review.resolved");
+  assert.equal(resolved.outcome, "escalated");
+  assert.equal(resolved.escalation, "deadlock");
+  assert.equal(resolved.rounds, 3);
 });
 
 test("a pre-review event log replays without retro-requesting reviews", async () => {

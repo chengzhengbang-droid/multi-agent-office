@@ -13,6 +13,7 @@ import { providerEnvKeys } from "../config/provider-presets.js";
 import type { PiRuntimeSpec, RuntimeAvailability } from "../core/types.js";
 import { REVIEWER_DEGRADE_BRIEF } from "../core/reviewer-routing.js";
 import { PRIOR_ART_AUTHOR_BRIEF, priorArtCritiqueBrief } from "../core/prior-art.js";
+import { REVIEW_SEVERITY_BRIEF } from "../core/review-convergence.js";
 import { PiSharedRuntime, RequestResourceLoader } from "./pi-shared.js";
 import type {
   AgentRuntime,
@@ -126,16 +127,36 @@ export class PiRuntimeAdapter implements AgentRuntime {
       name: "submit_review",
       label: "Submit a peer-review verdict",
       description:
-        "Record your current verdict in a peer discussion. Only available while reviewing another Agent's deliverable. Approve a final candidate you checked and can stand behind; changes-requested states objections for continued discussion. Call it exactly once.",
+        "Record your current verdict in a peer discussion. Only available while reviewing another Agent's deliverable. Approve a final candidate you checked and can stand behind; changes-requested states objections for continued discussion. Severity is what holds the task, not the verdict: if nothing you found is blocking or major, approve and list the minor findings as comments. Call it exactly once.",
       parameters: Type.Object({
         verdict: Type.Union([Type.Literal("approved"), Type.Literal("changes-requested")], {
-          description: "approved when the work can ship as is",
+          description:
+            "approved when nothing blocking or major remains — minor comments still travel with an approval",
         }),
         summary: Type.String({ description: "Justification handed back to the author verbatim" }),
         findings: Type.Optional(
-          Type.Array(Type.String(), {
-            description: "Concrete, actionable changes. Required for changes-requested.",
-          }),
+          Type.Array(
+            Type.Object({
+              detail: Type.String({ description: "The concrete, actionable objection or comment" }),
+              severity: Type.Union(
+                [Type.Literal("blocking"), Type.Literal("major"), Type.Literal("minor")],
+                {
+                  description:
+                    "blocking: must not ship. major: the author has to answer it. minor: a nit or preference, never holds the task.",
+                },
+              ),
+              kind: Type.Optional(
+                Type.Union([Type.Literal("defect"), Type.Literal("question")], {
+                  description:
+                    "question only when the human never decided this and no discussion between the two of you could settle it; it stops the discussion and asks them.",
+                }),
+              ),
+            }),
+            {
+              description:
+                "Your objections and comments. changes-requested needs at least one blocking or major finding.",
+            },
+          ),
         ),
         checks: Type.Optional(
           Type.Array(Type.String(), {
@@ -894,14 +915,21 @@ function reviewBrief(assignment: ReviewAssignment): string[] {
     ...assignment.degradeReasons.flatMap((reason) =>
       REVIEWER_DEGRADE_BRIEF[reason].map((line) => `- ${line}`),
     ),
+    ...REVIEW_SEVERITY_BRIEF.map((line) => `- ${line}`),
     "- Finish by calling submit_review exactly once, approved or changes-requested.",
-    "- changes-requested requires at least one concrete finding.",
+    "- changes-requested requires at least one blocking or major finding; minor findings alone are an approval with comments.",
     "- approved requires listing in checks what you ran yourself; an approval that cannot name one is rejected.",
     "- Ending without submit_review is not an approval: the task is escalated to the human.",
     "- The goal is a final candidate both peers can stand behind, not obedience to you and not victory for either side.",
-    "- Do not manufacture agreement to close the loop. If material disagreement remains in the final round, request changes so the human decides.",
+    "- Do not manufacture agreement to close the loop, and do not inflate a nit into a blocking finding to look rigorous.",
+    ...(assignment.round > 1
+      ? [
+          "- What ends this discussion is a stall, not the round count: an objection you restate unchanged tells the platform the two of you have stopped converging, and it stops to ask the human.",
+          "- So restate an objection only when you genuinely cannot move on it. If the author answered it, say so and withdraw it.",
+        ]
+      : []),
     ...(assignment.round >= assignment.maxRounds
-      ? ["- This is the final round. If material disagreement remains, request changes so the human decides."]
+      ? ["- This is the last round before the hard stop. Anything still blocking after it goes to the human."]
       : []),
   ];
 }
