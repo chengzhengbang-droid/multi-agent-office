@@ -338,10 +338,18 @@ pnpm test
 pnpm build
 ```
 
-改完代码除了跑绿这三条，还要更新 [LESSONS.md](LESSONS.md)——这个项目踩过的坑和沉淀下来的
-规矩都在那里，只记判断不记流水账。对 Agent 的完整约定见 [CLAUDE.md](CLAUDE.md)。
+`pnpm run check` 除了两个 TypeScript 工程，还跑一道 **lessons 闸门**（`pnpm run check:lessons`）：
+这次改动碰了 `src/`、`test/` 或构建配置，[lessons/](lessons/) 的某一卷就必须多出一条变更日志条目。
+这个项目踩过的坑和沉淀下来的规矩按维度分卷记在那里，只记判断不记流水账；
+真的没有值得记的判断，就写一条 `### YYYY-MM-DD · 无教训 · <为什么>`——出口留着，
+但要付一句话，否则"这次没有"和"忘了写"在记录上分不出来。判断逻辑在
+`src/tools/lessons-guard.ts`（纯函数，有单元测试），git 那一侧在 `src/tools/lessons-check.ts`。
+CI 在每个 PR 上跑同一道闸门（`.github/workflows/checks.yml`）。
 
-测试覆盖花名册、mention 解析、显式串行/并行路由、球权事件投影、`hold_ball` 唤醒、A2A、幂等与乒乓限制、读写调度、整链取消、上下文游标、业界先例台账的校验与三态留痕、session 隔离、Codex app-server 首次执行与 resume、原生动态 tool 调用、Pi 凭据判定、多 provider 凭据互不覆盖、Agent 头像标识去重、可观测性事件投影、运行中插话与回退、图片附件，以及现有历史事件的完整兼容回放。
+先读 [lessons/rules.md](lessons/rules.md)，路由表在 [lessons/README.md](lessons/README.md)。
+对 Agent 的完整约定见 [CLAUDE.md](CLAUDE.md)。
+
+测试覆盖花名册、mention 解析、显式串行/并行路由、球权事件投影、`hold_ball` 唤醒、A2A、幂等与乒乓限制、读写调度、整链取消、上下文游标、业界先例台账的校验与三态留痕、session 隔离、Codex app-server 首次执行与 resume、原生动态 tool 调用、Pi 凭据判定、多 provider 凭据互不覆盖、Agent 头像标识去重、可观测性事件投影、运行中插话与回退、图片附件、现有历史事件的完整兼容回放，以及 lessons 闸门的裁决规则（哪些路径算欠教训、无教训记录的理由长度下限、只往规矩卷里加不算数、分卷骨架校验）。
 
 审核相关覆盖：强制送审与审核者选取（配置优先、离线回退、同链共作者让位给未参与的同侪、无人可让时仍然送审并标记为不中立）、怀疑立场与平等协商（审核简报要求自己查一手材料、意见不是命令、作者可自然反驳、后续轮必须重新评价、`approved` 缺少自查项被拒、`changes-requested` 不要求自查项）、达成共识后终结、存在异议时继续协商、硬止损轮数用尽仍有阻塞性异议时交给人类裁决、无结论/无审核者/审核失败一律不通过、审核中取消、重启后中断的审核升级、审核 run 不占用链额度与深度、审核者不会变成 Thread 的默认应答者，以及旧日志回放不补发审核。smart 门另有覆盖：闲聊不送审、阻塞性问题先澄清且不送审、计划模式与强制门同样尊重澄清、协商时发现人类决策会终止审核循环、声明完成走 verify 且证据进入审核简报、提交方案走 critique 且协商轮仍是 critique、改文件不声明也送审、只读运行与 shell 读命令不触发、审核者不能自我声明、声明不能改口径，以及带声明的日志回放。
 
