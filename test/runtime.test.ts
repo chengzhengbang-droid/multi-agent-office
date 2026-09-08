@@ -201,7 +201,7 @@ createInterface({ input: process.stdin }).on("line", (line) => {
     send({ id: message.id, result: { turn: { id: currentTurn, status: "inProgress", items: [] } } });
     toolCall = process.env.FAKE_CODEX_TOOL;
     const args = toolCall === "submit_review"
-      ? { verdict: "changes-requested", summary: "needs revision", findings: ["define the input schema"], checks: ["read implementation", "ran tests"] }
+      ? { verdict: "changes-requested", summary: "needs revision", findings: [{ detail: "Choose input format", severity: "minor", kind: "question", options: [{ label: "JSON", value: "json", recommended: true }, { label: "CSV", value: "csv" }] }], checks: ["read implementation", "ran tests"] }
       : toolCall === "request_clarification"
         ? { questions: ["Which target framework must be supported?"] }
         : { summary: "implemented feature", evidence: ["test passed"] };
@@ -267,7 +267,7 @@ process.on("SIGTERM", () => process.exit(0));
     const second = await adapter.execute(secondRequest);
     assert.equal(second.output, "resumed answer");
     assert.equal(review?.verdict, "changes-requested");
-    assert.deepEqual(review?.findings, ["define the input schema"]);
+    assert.deepEqual(review?.findings, [{ detail: "Choose input format", severity: "minor", kind: "question", options: [{ label: "JSON", value: "json", recommended: true }, { label: "CSV", value: "csv" }] }]);
     assert.deepEqual(review?.checks, ["read implementation", "ran tests"]);
     assert.equal(secondEvents.find((event) => event.type === "tool_start")?.toolName, "submit_review");
 
@@ -418,3 +418,4 @@ function request(runId: string, events: RuntimeEvent[], signal = new AbortContro
     declareDeliverable: async () => ({ accepted: true }),
   };
 }
+

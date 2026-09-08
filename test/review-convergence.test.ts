@@ -41,12 +41,12 @@ test("severity, not the verdict, decides what holds the task", () => {
     ["错误分支没有处理", "缺少一个测试", "要不要支持离线模式，原始任务没说"],
   );
   assert.deepEqual(advisoryFindings(findings).map((item) => item.detail), ["这个名字可以更好"]);
-  // A question only counts when it also gates: a minor "just wondering" is a
-  // comment, and comments do not interrupt a human's day.
+  // An explicit human decision cannot disappear just because it is minor.
   assert.deepEqual(humanQuestions(findings).map((item) => item.detail), [
     "要不要支持离线模式，原始任务没说",
   ]);
-  assert.deepEqual(humanQuestions([finding("随便问问", "minor", "question")]), []);
+  const question = finding("是否补充每日表？", "minor", "question");
+  assert.deepEqual(humanQuestions([question]), [question]);
 });
 
 test("a rephrased objection is still the same objection", () => {
@@ -81,3 +81,4 @@ test("stalled rounds are counted from the history, not from a counter", () => {
   // The streak restarts as soon as a round moves.
   assert.equal(stalledRounds([wall, wall, [finding("并发写会互相覆盖")]]), 0);
 });
+

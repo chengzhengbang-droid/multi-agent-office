@@ -127,22 +127,27 @@ export class PiRuntimeAdapter implements AgentRuntime {
       name: "submit_review",
       label: "Submit a peer-review verdict",
       description:
-        "Record your current verdict in a peer discussion. Only available while reviewing another Agent's deliverable. Approve a final candidate you checked and can stand behind; changes-requested states objections for continued discussion. Severity is what holds the task, not the verdict: if nothing you found is blocking or major, approve and list the minor findings as comments. Call it exactly once.",
+        "Record your current verdict in a peer discussion. Only available while reviewing another Agent's deliverable. Approve a final candidate you checked and can stand behind; changes-requested states objections for continued discussion. Severity is what holds the task, not the verdict: if nothing you found is blocking or major and no human questions remain, approve and list the minor findings as comments. Call it exactly once.",
       parameters: Type.Object({
         verdict: Type.Union([Type.Literal("approved"), Type.Literal("changes-requested")], {
           description:
-            "approved when nothing blocking or major remains — minor comments still travel with an approval",
+            "approved when no blocking/major defect or human question remains — minor comments still travel with an approval",
         }),
         summary: Type.String({ description: "Justification handed back to the author verbatim" }),
         findings: Type.Optional(
           Type.Array(
             Type.Object({
               detail: Type.String({ description: "The concrete, actionable objection or comment" }),
+              options: Type.Optional(Type.Array(Type.Object({
+                label: Type.String(),
+                value: Type.Optional(Type.String()),
+                recommended: Type.Optional(Type.Boolean()),
+              }), { description: "For kind=question, provide concrete choices when possible so the human can click an answer." })),
               severity: Type.Union(
                 [Type.Literal("blocking"), Type.Literal("major"), Type.Literal("minor")],
                 {
                   description:
-                    "blocking: must not ship. major: the author has to answer it. minor: a nit or preference, never holds the task.",
+                    "blocking: must not ship. major: the author has to answer it. minor: a nit or preference; kind=question still pauses for the human.",
                 },
               ),
               kind: Type.Optional(
@@ -154,7 +159,7 @@ export class PiRuntimeAdapter implements AgentRuntime {
             }),
             {
               description:
-                "Your objections and comments. changes-requested needs at least one blocking or major finding.",
+                "Your objections and comments. changes-requested needs a blocking/major finding or an unresolved kind=question of any severity.",
             },
           ),
         ),
@@ -202,7 +207,7 @@ export class PiRuntimeAdapter implements AgentRuntime {
       name: "request_clarification",
       label: "Ask the human before planning or executing",
       description:
-        "Call before submit_plan or complete_task when missing, ambiguous, or conflicting information would materially change the result or next action and cannot be resolved from the conversation, accessible evidence, or existing authorization. Each question may include options with label/value/recommended to give the human a choice. Ask only the smallest focused set of questions, put the same questions in your assistant response, then stop and wait. Do not use this for details you can discover locally or resolve with a safe reversible assumption.",
+        "Call before submit_plan or complete_task when missing, ambiguous, or conflicting information would materially change the result or next action and cannot be resolved from the conversation, accessible evidence, or existing authorization. When the answer is a choice, provide 2–3 concrete options with label/value/recommended so the human can click an answer. Ask only the smallest focused set of questions, put the same questions in your assistant response, then stop and wait. Do not use this for details you can discover locally or resolve with a safe reversible assumption.",
       parameters: Type.Object({
         questions: Type.Array(Type.Union([Type.String(), Type.Object({ question: Type.String(), options: Type.Optional(Type.Array(Type.Object({ label: Type.String(), value: Type.Optional(Type.String()), recommended: Type.Optional(Type.Boolean()) }))) })]), {
           minItems: 1,
@@ -919,7 +924,7 @@ function reviewBrief(assignment: ReviewAssignment): string[] {
     ),
     ...REVIEW_SEVERITY_BRIEF.map((line) => `- ${line}`),
     "- Finish by calling submit_review exactly once, approved or changes-requested.",
-    "- changes-requested requires at least one blocking or major finding; minor findings alone are an approval with comments.",
+    "- changes-requested requires a blocking/major finding or an unresolved kind=question of any severity; minor defects alone are an approval with comments.",
     "- approved requires listing in checks what you ran yourself; an approval that cannot name one is rejected.",
     "- Ending without submit_review is not an approval: the task is escalated to the human.",
     "- The goal is a final candidate both peers can stand behind, not obedience to you and not victory for either side.",

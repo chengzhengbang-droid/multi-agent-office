@@ -41,9 +41,9 @@ const SAME_OBJECTION_CONTAINMENT = 0.85;
 export const REVIEW_SEVERITY_BRIEF = [
   "Severity, not the verdict, is what holds the task: give every finding a severity.",
   "blocking — must not ship as is. major — wrong or missing enough that the author has to answer it. minor — a nit, a preference, a follow-up idea.",
-  "If nothing you found is blocking or major, that is an approval with comments: approve and list the minor findings anyway. The author still gets them; nobody waits on them.",
+  "If nothing you found is blocking or major and no kind=question remains, that is an approval with comments: approve and list the minor findings anyway. The author still gets them; nobody waits on them.",
   "Mark a finding kind=question only when it turns on something the human never decided and no amount of discussion between the two of you could settle. It stops the discussion and asks them directly, so never use it for something you could work out yourselves.",
-  "Treat missing, ambiguous, or conflicting information as a human question when different answers would materially change the result or next action and the uncertainty cannot be resolved from the conversation, accessible evidence, or existing authorization. State the smallest concrete question in detail and mark it major/blocking with kind=question. A revised assumption, default, or disclaimer does not resolve a decision that belongs to the human. Do not ask again about information already supplied or decisions already delegated.",
+  "Treat missing, ambiguous, or conflicting information as a human question when different answers would materially change the result or next action and the uncertainty cannot be resolved from the conversation, accessible evidence, or existing authorization. State the smallest concrete question in detail with kind=question. Questions pause for the human regardless of severity, including minor. Provide 2–3 concrete options [{label,value,recommended}] when the answer is a choice; mark a recommendation only when justified. Use changes-requested until the human has answered. A revised assumption, default, or disclaimer does not resolve a decision that belongs to the human. Do not ask again about information already supplied or decisions already delegated.",
   "The test is mechanical: if your finding asks the author to confirm, check with, or align with the human, it is that kind of finding — set kind=question on it. Written as an ordinary objection it is routed back to the author to argue about, and the human you wanted asked never sees it.",
 ] as const;
 
@@ -61,6 +61,7 @@ export function normalizeFindings(findings: ReviewFindingInput[] | undefined): R
             detail: finding.detail.trim(),
             severity: finding.severity,
             kind: finding.kind ?? ("defect" as const),
+            ...(finding.options ? { options: finding.options } : {}),
           },
     )
     .filter((finding) => finding.detail.length > 0);
@@ -77,12 +78,12 @@ export function advisoryFindings(findings: ReviewFinding[]): ReviewFinding[] {
 }
 
 /**
- * Gating objections that no further peer round can settle, because they are
+ * Questions that no further peer round can settle, regardless of severity: they are
  * about something the human never decided. Peers can argue a defect to a
  * conclusion; they can only guess at an unstated requirement.
  */
 export function humanQuestions(findings: ReviewFinding[]): ReviewFinding[] {
-  return gatingFindings(findings).filter((finding) => finding.kind === "question");
+  return findings.filter((finding) => finding.kind === "question");
 }
 
 /** One finding as a line in a brief or a thread message. */
