@@ -448,13 +448,13 @@ export function App() {
     }
   };
 
-  const answerClarification = async (request: ClarificationRequest, answers: string[]) => {
+  const answerClarification = async (request: ClarificationRequest, answers: string[], clarificationPlanMode = false) => {
     if (sending || !selectedThreadId) return false;
     setSending(true);
     setActionError("");
     try {
-      const content = `@${request.agentId} ` + answers.map((answer, index) => `第 ${index + 1} 题：${answer}`).join("\n");
-      const response = await fetch("/api/messages", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ content, threadId: selectedThreadId }) });
+      const content = `@${request.agentId} ` + answers.map((answer, index) => `第 ${index + 1} 题：${typeof request.questions[index] === "string" ? request.questions[index] : (request.questions[index] as ClarificationQuestion).question}\n回答：${answer}`).join("\n");
+      const response = await fetch("/api/messages", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ content, threadId: selectedThreadId, planMode: clarificationPlanMode }) });
       const result = (await response.json()) as { error?: string };
       if (!response.ok) throw new Error(result.error ?? "回复失败");
       return true;
@@ -647,7 +647,7 @@ export function App() {
                     <RunActivity item={item} />
                     <div className={`markdown-body ${item.status === "running" ? "markdown-body--streaming" : ""}`}>{item.content ? <ReactMarkdown remarkPlugins={[remarkGfm]}>{item.content}</ReactMarkdown> : <div className="thinking-line"><span /><span /><span /></div>}</div>
                     {item.usage && <RunUsageBar usage={item.usage} />}
-                    {item.clarification && <ClarificationCard request={item.clarification} busy={sending} onSubmit={(answers) => answerClarification(item.clarification!, answers)} />}
+                    {item.clarification && <ClarificationCard request={item.clarification} settled={approvals.some((approval) => approval.id === `clarification:${item.id}` && approval.status === "settled")} busy={sending} onSubmit={(answers) => answerClarification(item.clarification!, answers, item.planMode)} />}
                     {reviewMoved && <p className="review-moved-note"><ShieldCheck size={12} />{reviewMovedNote(reviewMoved, data.agents)}</p>}
                     {anchoredReview && <ReviewCard review={anchoredReview} agents={data.agents} />}
                     {item.plan && !planNeedsAttention && <PlanCard plan={item.plan} agents={data.agents} busy={decidingPlan === item.plan.taskRunId} onDecide={decidePlan} />}
@@ -1701,7 +1701,7 @@ function ReviewCard({ review, agents }: { review: ReviewState; agents: AgentSumm
   );
 }
 
-function ClarificationCard({ request, busy, onSubmit }: { request: ClarificationRequest; busy: boolean; onSubmit(answers: string[]): Promise<boolean> }) {
+function ClarificationCard({ request, busy, settled, onSubmit }: { request: ClarificationRequest; busy: boolean; settled: boolean; onSubmit(answers: string[]): Promise<boolean> }) {
   const [step, setStep] = useState(0);
   const [answers, setAnswers] = useState<string[]>([]);
   const [custom, setCustom] = useState("");
@@ -1717,7 +1717,7 @@ function ClarificationCard({ request, busy, onSubmit }: { request: Clarification
   return <div className="clarification-card">
     <div className="clarification-title"><MessageSquare size={14} /><strong>需要你确认</strong><span>{step + 1} / {request.questions.length}</span></div>
     <p className="clarification-question">{question.question}</p>
-    {submitted ? <p className="clarification-submitted"><Check size={13} />已提交，等待 Agent 继续</p> : <><div className="clarification-options">{question.options?.map((option) => <button type="button" key={`${option.label}-${option.value ?? ""}`} disabled={busy} onClick={() => choose(option.value ?? option.label)}>{option.label}{option.recommended && <em>推荐</em>}</button>)}</div><div className="clarification-custom"><input value={custom} disabled={busy} onChange={(event) => setCustom(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && custom.trim()) choose(custom.trim()); }} placeholder={question.options?.length ? "或输入其他答案…" : "输入你的答案…"} /><button type="button" disabled={busy || !custom.trim()} onClick={() => choose(custom.trim())}>{step + 1 === request.questions.length ? "提交" : "下一题"}<ArrowRight size={13} /></button></div></>}
+    {settled || submitted ? <p className="clarification-submitted"><Check size={13} />{settled ? "此问题已处理" : "已提交，等待 Agent 继续"}</p> : <><div className="clarification-options">{question.options?.map((option) => <button type="button" key={`${option.label}-${option.value ?? ""}`} disabled={busy} onClick={() => choose(option.value ?? option.label)}>{option.label}{option.recommended && <em>推荐</em>}</button>)}</div><div className="clarification-custom"><input value={custom} disabled={busy} onChange={(event) => setCustom(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && custom.trim()) choose(custom.trim()); }} placeholder={question.options?.length ? "或输入其他答案…" : "输入你的答案…"} /><button type="button" disabled={busy || !custom.trim()} onClick={() => choose(custom.trim())}>{step + 1 === request.questions.length ? "提交" : "下一题"}<ArrowRight size={13} /></button></div></>}
   </div>;
 }
 
@@ -2230,3 +2230,4 @@ function shortId(id: string): string { return id.split("_")[1]?.slice(0, 8) ?? i
 function formatClock(value: string): string { return new Intl.DateTimeFormat("zh-CN", { hour: "2-digit", minute: "2-digit", hour12: false }).format(new Date(value)); }
 function formatRelativeTime(value: string): string { const difference = Date.now() - new Date(value).getTime(); const minutes = Math.max(0, Math.floor(difference / 60_000)); if (minutes < 1) return "刚刚"; if (minutes < 60) return `${minutes} 分钟前`; const hours = Math.floor(minutes / 60); if (hours < 24) return `${hours} 小时前`; const days = Math.floor(hours / 24); return days < 7 ? `${days} 天前` : new Intl.DateTimeFormat("zh-CN", { month: "short", day: "numeric" }).format(new Date(value)); }
 function errorMessage(error: unknown): string { return error instanceof Error ? error.message : String(error); }
+

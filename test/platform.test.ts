@@ -1648,6 +1648,68 @@ test("an objection only the human can settle is asked now, not after the budget"
   assert.doesNotMatch(resolved.detail ?? "", /日志格式/);
 });
 
+for (const planMode of [false, true]) for (const severity of ["minor", "major", "blocking"] as const) {
+  test(`review question (${severity}, plan=${planMode}) keeps choices through restart and resumes the author`, async () => {
+    const store = new InMemoryEventStore();
+    const question = "是否补充一份按天安排的表格？";
+    const options = [
+      { label: "补充每日表", value: "补充每日表", recommended: true },
+      { label: "保留通用清单", value: "保留通用清单" },
+    ];
+    const handlers = {
+      pi: async (request: RuntimeRequest) => {
+        const answered = request.incoming.content.includes("回答：补充每日表");
+        if (answered) {
+          assert.ok(request.incoming.content.includes(question));
+          assert.equal(request.planMode === true, planMode);
+        }
+        await request.declareDeliverable({ kind: planMode ? "plan" : "completion", summary: answered ? "已补充每日表" : "通用清单" });
+        return emitOutput(request, answered ? "完整交付：已补充每日表" : "通用清单");
+      },
+      codex: async (request: RuntimeRequest) => {
+        if (request.incoming.content.includes("完整交付：已补充每日表")) {
+          const result = await request.submitReview!({ verdict: "approved", summary: "已按选择完成", checks: ["核对每日表及用户选择"] });
+          assert.equal(result.accepted, true);
+        } else {
+          const findings = [
+            { detail: question, severity, kind: "question" as const, options },
+            { detail: "标题还可以简短一些", severity: "minor" as const },
+          ];
+          const invalid = await request.submitReview!({ verdict: "approved", summary: "尚有用户选择", findings, checks: ["读取清单"] });
+          assert.equal(invalid.accepted, false);
+          const result = await request.submitReview!({ verdict: "changes-requested", summary: "等待用户选择", findings });
+          assert.equal(result.accepted, true);
+        }
+        return emitOutput(request, "审毕");
+      },
+    };
+    const agents = [agent("pi"), agent("codex")];
+    const platform = createReviewPlatform(agents, handlers, { eventStore: store });
+    const first = await platform.postUserMessage({ content: "@pi 制作清单", planMode });
+    const events = await platform.getEvents();
+    assert.deepEqual(single(events, "clarification.requested").questions, [{ question, options }]);
+    assert.equal(single(events, "clarification.requested").agentId, "pi");
+    assert.equal(countEvents(events, "task.done"), 0);
+    assert.equal(countEvents(events, "review.rework"), 0);
+    assert.equal(countEvents(events, "plan.awaiting-approval"), 0);
+    assert.equal(single(events, "review.resolved").escalation, "clarification-needed");
+    assert.deepEqual(projectApprovals(events).map((item) => item.kind), ["clarification"]);
+
+    const restarted = createReviewPlatform(agents, handlers, { eventStore: store });
+    assert.deepEqual(single(await restarted.getEvents(), "clarification.requested").questions, [{ question, options }]);
+    await restarted.postUserMessage({
+      threadId: first.threadId,
+      content: `@pi 第 1 题：${question}\n回答：${options[0]!.value}`,
+      planMode,
+    });
+    const resumed = await restarted.getEvents();
+    assert.equal(countEvents(resumed, "clarification.requested"), 1);
+    assert.equal(resumed.filter((event) => event.type === "review.resolved").at(-1)?.outcome, "approved");
+    assert.equal(projectApprovals(resumed).filter((item) => item.kind === "clarification" && item.status === "pending").length, 0);
+    assert.equal(countEvents(resumed, planMode ? "plan.awaiting-approval" : "task.done"), 1);
+  });
+}
+
 test("an author revising work can still stop and ask the human mid-round", async () => {
   let clarificationAccepted: boolean | undefined;
   const platform = createReviewPlatform(

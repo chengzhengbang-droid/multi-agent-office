@@ -45,7 +45,7 @@ interface TurnCompletion {
  * changes so sessions created by the old `codex exec` + MCP adapter are not
  * resumed without the native tools.
  */
-export const CODEX_SESSION_PROTOCOL = "app-server-dynamic-tools-v4-prior-art";
+export const CODEX_SESSION_PROTOCOL = "app-server-dynamic-tools-v5-review-choices";
 
 export class CodexRuntimeAdapter implements AgentRuntime {
   public readonly id: string;
@@ -485,7 +485,7 @@ function codexDynamicTools(): Array<Record<string, unknown>> {
       type: "function",
       name: "submit_review",
       description:
-        "Record your current verdict in a peer discussion. Call exactly once. Approve only a final candidate you checked and can stand behind; changes-requested states evidence-backed objections, not orders. Severity is what holds the task, not the verdict: with nothing blocking or major left, approve and list the minor findings as comments.",
+        "Record your current verdict in a peer discussion. Call exactly once. Approve only a final candidate you checked and can stand behind; changes-requested states evidence-backed objections, not orders. Severity is what holds the task, not the verdict: with nothing blocking or major left and no human questions, approve and list the minor findings as comments.",
       inputSchema: {
         type: "object",
         properties: {
@@ -499,6 +499,7 @@ function codexDynamicTools(): Array<Record<string, unknown>> {
                 detail: { type: "string", minLength: 1 },
                 severity: { type: "string", enum: ["blocking", "major", "minor"] },
                 kind: { type: "string", enum: ["defect", "question"] },
+                options: { type: "array", items: { type: "object", properties: { label: { type: "string" }, value: { type: "string" }, recommended: { type: "boolean" } }, required: ["label"], additionalProperties: false } },
               },
               required: ["detail", "severity"],
               additionalProperties: false,
@@ -514,7 +515,7 @@ function codexDynamicTools(): Array<Record<string, unknown>> {
       type: "function",
       name: "request_clarification",
       description:
-        "Ask promptly when missing, ambiguous, or conflicting information would materially change the result or next action and cannot be resolved from the conversation, accessible evidence, or existing authorization. This applies throughout execution and review rework, including after edits and before submission. Reuse prior answers and delegated decisions; do not substitute assumptions, defaults, or disclaimers for a required human answer. questions may be strings, or objects with question and optional options [{label,value,recommended}]; use recommended for the best default. Ask the same focused questions in your response, then stop without submitting a deliverable.",
+        "Ask promptly when missing, ambiguous, or conflicting information would materially change the result or next action and cannot be resolved from the conversation, accessible evidence, or existing authorization. This applies throughout execution and review rework, including after edits and before submission. Reuse prior answers and delegated decisions; do not substitute assumptions, defaults, or disclaimers for a required human answer. questions may be strings, or objects with question and optional options [{label,value,recommended}]; provide 2–3 concrete options whenever the answer is a choice, and use recommended only for a justified recommendation. Ask the same focused questions in your response, then stop without submitting a deliverable.",
       inputSchema: {
         type: "object",
         properties: {
@@ -904,6 +905,15 @@ function optionalFindings(
       detail: requiredString(finding, "detail"),
       severity,
       ...(kind ? { kind } : {}),
+      ...(Array.isArray(finding.options) ? { options: finding.options.map((item) => {
+        const option = asRecord(item);
+        if (!option) throw new Error("finding options must be objects");
+        return {
+          label: requiredString(option, "label"),
+          ...(typeof option.value === "string" ? { value: option.value } : {}),
+          ...(typeof option.recommended === "boolean" ? { recommended: option.recommended } : {}),
+        };
+      }) } : {}),
     };
   });
 }

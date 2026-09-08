@@ -1839,9 +1839,9 @@ export class MultiAgentPlatform {
     const findings = normalizeFindings(submission.findings);
     const gating = gatingFindings(findings);
     // Severity is the gate, not the verdict. A reviewer whose objections are
-    // all minor has finished reviewing and is now commenting; holding the task
+    // all minor defects has finished reviewing and is now commenting; holding the task
     // for that spends a discussion round, and eventually a human, on nits.
-    if (gating.length === 0) {
+    if (gating.length === 0 && humanQuestions(findings).length === 0) {
       const comments = advisoryFindings(findings).map(findingLabel);
       await this.resolveReview(
         reviewRun,
@@ -1863,7 +1863,9 @@ export class MultiAgentPlatform {
       // back to the executor, not to the reviewer. This is a clarification,
       // never an executable plan awaiting approval.
       const authorRun = this.runs.get(taskRunId) ?? reviewRun;
-      const prompts = questions.map((question) => question.detail);
+      const prompts = questions.map((question) => question.options?.length
+        ? { question: question.detail, options: question.options }
+        : question.detail);
       this.runClarifications.set(authorRun.id, prompts);
       await this.record({
         type: "clarification.requested",
@@ -2424,9 +2426,10 @@ export class MultiAgentPlatform {
     // stop; rejecting here sends it back to verify rather than passing.
     //
     // Requesting changes on nothing but minor findings is an approval with
-    // comments attached — severity is what gates, so nothing here holds the
+    // comments attached (unless a human question remains), so nothing here holds the
     // task back — and it therefore owes the same evidence as any approval.
-    const passesGate = input.verdict === "approved" || gating.length === 0;
+    const passesGate = input.verdict === "approved" ||
+      (gating.length === 0 && humanQuestions(findings).length === 0);
     if (passesGate && checks.length === 0) {
       return {
         accepted: false,

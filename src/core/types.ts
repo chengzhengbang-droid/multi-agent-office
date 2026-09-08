@@ -201,6 +201,8 @@ export interface ReviewFinding {
   severity: ReviewFindingSeverity;
   /** Defaults to "defect" when a reviewer does not say. */
   kind?: ReviewFindingKind;
+  /** Concrete choices for a human question; omitted for open-ended answers. */
+  options?: Array<{ label: string; value?: string; recommended?: boolean }>;
 }
 
 /**
