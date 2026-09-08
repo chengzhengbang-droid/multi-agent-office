@@ -1,3 +1,4 @@
+import { projectApprovals } from "../src/core/approval-index.js";
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { RecentContextCompiler } from "../src/core/context-compiler.js";
@@ -136,6 +137,49 @@ test("a material question found during plan rework stops the review loop", async
   assert.equal(single(events, "review.resolved").escalation, "clarification-needed");
   assert.equal(countEvents(events, "plan.awaiting-approval"), 0);
   assert.equal(queuedRuns(events).length, 3);
+});
+
+for (const scenario of [
+  { task: "设计知识库", question: "内容面向人阅读还是供自动化系统消费？", answer: "供自动化系统消费" },
+  { task: "整理评估方案", question: "两处要求的优先级相互冲突，应以哪一处为准？", answer: "以最新补充的要求为准" },
+]) test(`material human question pauses and resumes planning: ${scenario.task}`, async () => {
+  const store = new InMemoryEventStore();
+  const { task, question, answer } = scenario;
+  const handlers = {
+    codex: async (request: RuntimeRequest) => {
+      if (request.incoming.content.includes(answer)) {
+        assert.ok(request.context.recentMessages.some((message) => message.content.includes(task)));
+        await request.declareDeliverable({ kind: "plan", summary: `已确认：${answer}` });
+        return emitOutput(request, `完整方案，依据用户回答：${answer}`);
+      }
+      await request.declareDeliverable({ kind: "plan", summary: task });
+      return emitOutput(request, `${task}的候选方案`);
+    },
+    pi: async (request: RuntimeRequest) => {
+      if (request.incoming.content.includes(`完整方案，依据用户回答：${answer}`)) {
+        await request.submitReview?.({ verdict: "approved", summary: "已按用户回答修订", checks: ["核对用户回答及完整候选"] });
+      } else {
+        const findings = [{ detail: question, severity: "major" as const, kind: "question" as const }];
+        const invalid = await request.submitReview?.({ verdict: "approved", summary: "关键信息待确认", findings, checks: ["核对原始需求"] });
+        assert.equal(invalid?.accepted, false);
+        await request.submitReview?.({ verdict: "changes-requested", summary: "存在需要用户消除的不确定性", findings });
+      }
+      return emitOutput(request, "审核结束");
+    },
+  };
+  const agents = [agent("codex"), agent("pi")];
+  const platform = createPlanPlatform(agents, handlers, { eventStore: store });
+  const first = await platform.postUserMessage({ content: `@codex ${task}`, planMode: true });
+  const events = await platform.getEvents();
+  assert.deepEqual(single(events, "clarification.requested").questions, [question]);
+  assert.equal(single(events, "clarification.requested").agentId, "codex");
+  assert.equal(countEvents(events, "review.rework"), 0);
+  assert.equal(countEvents(events, "plan.awaiting-approval"), 0);
+  assert.equal(single(events, "review.resolved").escalation, "clarification-needed");
+  assert.deepEqual(projectApprovals(events).map((item) => item.kind), ["clarification"]);
+  const restarted = createPlanPlatform(agents, handlers, { eventStore: store });
+  await restarted.postUserMessage({ threadId: first.threadId, content: `@codex ${answer}`, planMode: true });
+  assert.equal(countEvents(await restarted.getEvents(), "plan.awaiting-approval"), 1);
 });
 
 test("a peer-approved plan waits for the human instead of being executed", async () => {

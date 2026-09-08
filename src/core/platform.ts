@@ -1421,10 +1421,8 @@ export class MultiAgentPlatform {
       this.messages.get(run.incomingMessageId)?.sender.type === "human" ||
       (run.reviewRound ?? 0) > 0;
     if (!humanAsked) return false;
-    // A clarification is conversation before delivery, not a deliverable to
-    // review. It only bypasses the gate while the run truly stayed read-only
-    // and made no competing deliverable declaration. A question raised inside a
-    // review round never reaches here: advanceReview settles that task first.
+    // An unfinished task waiting for human input is not a candidate delivery,
+    // even if the missing requirement was discovered after an edit.
     if (this.isClarificationOnly(run)) return false;
     if (this.reviewMode === "required") return true;
     return (
@@ -1440,8 +1438,7 @@ export class MultiAgentPlatform {
   private isClarificationOnly(run: AgentRun): boolean {
     return (
       this.runClarifications.has(run.id) &&
-      !this.runDeliverables.has(run.id) &&
-      !this.runWriteEffects.has(run.id)
+      !this.runDeliverables.has(run.id)
     );
   }
 
@@ -1492,7 +1489,7 @@ export class MultiAgentPlatform {
     // started fixing, and the half-done revision is not a deliverable to
     // review — the human's answer decides what the rest of it should be.
     if (this.runClarifications.has(run.id) && (run.reviewRound ?? 0) > 0) {
-      await this.resolveClarificationDuringRework(run);
+      await this.resolveReviewClarification(run);
       return;
     }
     // Initial questions simply end this conversational turn.
@@ -1862,13 +1859,28 @@ export class MultiAgentPlatform {
     // better-argued guess, so ask now instead of after the budget runs out.
     const questions = humanQuestions(findings);
     if (questions.length > 0) {
-      await this.resolveReview(
-        reviewRun,
-        "escalated",
-        round,
-        "clarification-needed",
-        `审核者认为这些问题只有你能拍板：${questions.map((question) => question.detail).join("；")}`,
-      );
+      // Put the actual questions on the author's card so the answer routes
+      // back to the executor, not to the reviewer. This is a clarification,
+      // never an executable plan awaiting approval.
+      const authorRun = this.runs.get(taskRunId) ?? reviewRun;
+      const prompts = questions.map((question) => question.detail);
+      this.runClarifications.set(authorRun.id, prompts);
+      await this.record({
+        type: "clarification.requested",
+        runId: authorRun.id,
+        threadId: authorRun.threadId,
+        agentId: authorRun.agentId,
+        questions: prompts,
+      });
+      this.runCustodyActions.set(reviewRun.id, "human");
+      await this.record({
+        type: "ball.handed_user",
+        threadId: reviewRun.threadId,
+        chainId: reviewRun.causal.chainId,
+        runId: authorRun.id,
+        reason: "clarification",
+      });
+      await this.resolveReviewClarification(authorRun, round, reviewType);
       return;
     }
     // A stall, not a spent budget, is what a real disagreement looks like: the
@@ -2032,7 +2044,11 @@ export class MultiAgentPlatform {
    * the human is being asked for — so this path takes precedence over the gate
    * rather than running alongside it.
    */
-  private async resolveClarificationDuringRework(run: AgentRun): Promise<void> {
+  private async resolveReviewClarification(
+    run: AgentRun,
+    rounds = run.reviewRound ?? 0,
+    reviewType = run.reviewType,
+  ): Promise<void> {
     const taskRunId = this.taskRunIdOf(run);
     if (this.resolvedTaskRuns.has(taskRunId)) return;
     this.resolvedTaskRuns.add(taskRunId);
@@ -2042,12 +2058,12 @@ export class MultiAgentPlatform {
       threadId: run.threadId,
       taskRunId,
       outcome: "escalated",
-      rounds: run.reviewRound ?? 0,
+      rounds,
       escalation: "clarification-needed",
       detail: questions.length > 0
-        ? `执行者需要你先补充：${questions.map((question) => typeof question === "string" ? question : question.question).join("；")}`
-        : "执行者需要你先补充关键信息，再继续方案或执行",
-      ...(run.reviewType ? { reviewType: run.reviewType } : {}),
+        ? `需要你先补充：${questions.map((question) => typeof question === "string" ? question : question.question).join("；")}`
+        : "需要你先补充关键信息，再继续方案或执行",
+      ...(reviewType ? { reviewType } : {}),
     });
     this.forgetReviewState(taskRunId);
   }
@@ -2195,19 +2211,9 @@ export class MultiAgentPlatform {
         reason: "this run already declared a deliverable; clarification must happen before submission",
       };
     }
-    // Before the first delivery, asking is something you do *instead* of
-    // executing, so a run that already wrote has forfeited the question. Inside
-    // a review round the ordering is reversed: the author is revising work that
-    // is already under review, and a finding that turns on an undecided
-    // question is usually found while addressing the others. Refusing there
-    // leaves guessing as the only way to finish the round — which is exactly
-    // what escalation exists to prevent.
-    if (this.runWriteEffects.has(run.id) && (run.reviewRound ?? 0) === 0) {
-      return {
-        accepted: false,
-        reason: "this run already changed the workspace; clarification must happen before execution",
-      };
-    }
+    // Missing requirements can surface during execution as well as review.
+    // Preserve the write evidence, but do not force a guessed delivery merely
+    // because the author has already made partial progress.
     const custodyAction = this.runCustodyActions.get(run.id);
     if (custodyAction) {
       return { accepted: false, reason: `this run already chose ${custodyAction} as its next custody action` };
@@ -2403,6 +2409,9 @@ export class MultiAgentPlatform {
         accepted: false,
         reason: "changes-requested must list at least one concrete finding",
       };
+    }
+    if (humanQuestions(findings).length > 0 && input.verdict === "approved") {
+      return { accepted: false, reason: "unresolved human questions require changes-requested, not approval" };
     }
     const gating = gatingFindings(findings);
     const checks = (input.checks ?? [])
@@ -3080,7 +3089,9 @@ function buildReviewFeedbackContent(input: {
     "",
     "These are a peer's arguments, not instructions. Judge each one yourself: adopt it when it is right, rebut it with evidence when it is wrong, or propose a better alternative.",
     "Respond naturally in your next delivery; no separate accept/reject action or point-by-point form is required. Explain the reasoning that matters so the reviewer can reconsider rather than merely check compliance.",
-    "Your next output is the candidate the reviewer will judge, so include the complete final result, not only a rebuttal or a change list.",
+    "Before revising, check whether each finding needs a missing human fact or decision. If so, call request_clarification now and stop; the candidate instructions below apply only once those questions are resolved.",
+    "Use this test for missing, ambiguous, or conflicting information: would different answers materially change the result or next action, and can the uncertainty be resolved from the conversation, accessible evidence, or existing authorization? If it matters and only the human can resolve it, ask now. Do not replace the answer with an assumption, default, or disclaimer. Reuse existing answers and delegated decisions; resolve non-material details yourself.",
+    "When no material human question remains, your next output is the candidate the reviewer will judge: include the complete final result, not only a rebuttal or a change list.",
     closing,
     "Rounds are not what ends this: an objection that stands unchanged round after round is. Either resolve each blocking finding or answer it with evidence the reviewer has not seen yet — repeating your previous position back is what makes the platform stop and ask the human to decide.",
     "If a blocking finding turns on something the human never decided, do not guess through another round: call request_clarification and ask them. It is accepted even after you have started on the other findings, so you never have to choose between fixing and asking.",

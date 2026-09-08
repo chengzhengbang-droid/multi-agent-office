@@ -57,10 +57,9 @@ test("the collaboration prompt makes human clarification a pre-review gate", () 
   assert.match(prompt, /call request_clarification/);
   assert.match(prompt, /Do not create or submit a provisional deliverable/);
   assert.match(prompt, /only then submit the deliverable for peer review/);
-  // The ordering rule the platform actually enforces, stated in both
-  // directions: a first turn must ask before it writes, a review round may ask
-  // after it has started.
-  assert.match(prompt, /Ask before you act/);
+  // Discovering a missing requirement after an edit must still allow asking.
+  assert.match(prompt, /including during initial execution after edits/);
+  assert.doesNotMatch(prompt, /only while you have written nothing/);
   assert.match(prompt, /even after you have started addressing the other findings/);
 });
 
