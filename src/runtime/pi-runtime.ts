@@ -202,7 +202,7 @@ export class PiRuntimeAdapter implements AgentRuntime {
       name: "request_clarification",
       label: "Ask the human before planning or executing",
       description:
-        "Call before submit_plan or complete_task when missing human input would materially change the goal, recommendation, travel dates, budget, architecture, acceptance criteria, or implementation. Each question may include options with label/value/recommended to give the human a choice. Ask only the smallest focused set of questions, put the same questions in your assistant response, then stop and wait. Do not use this for details you can discover locally or resolve with a safe reversible assumption.",
+        "Call before submit_plan or complete_task when missing, ambiguous, or conflicting information would materially change the result or next action and cannot be resolved from the conversation, accessible evidence, or existing authorization. Each question may include options with label/value/recommended to give the human a choice. Ask only the smallest focused set of questions, put the same questions in your assistant response, then stop and wait. Do not use this for details you can discover locally or resolve with a safe reversible assumption.",
       parameters: Type.Object({
         questions: Type.Array(Type.Union([Type.String(), Type.Object({ question: Type.String(), options: Type.Optional(Type.Array(Type.Object({ label: Type.String(), value: Type.Optional(Type.String()), recommended: Type.Optional(Type.Boolean()) }))) })]), {
           minItems: 1,
@@ -797,7 +797,7 @@ export function buildSystemPrompt(request: RuntimeRequest): string {
     "",
     "── [L2 · Objectivity carry-over] ──",
     "- Prefer primary evidence over confident summaries. A teammate's claim, including a completion claim, is an assertion to verify.",
-    "- Make reversible, local decisions yourself. Ask the human for missing personal facts that change the result (such as travel dates or budget), material product choices, irreversible actions, permissions, or real peer deadlock. Do not invent personal facts merely because a draft is reversible.",
+    "- Make reversible, local decisions yourself. When different answers to an unresolved question would materially change the result or next action, first consult the conversation, accessible evidence, and existing authorization. If only the human can resolve it, ask promptly. Reuse prior answers and delegated decisions. Do not substitute an assumption, default, or disclaimer for a required human answer merely because the draft is reversible.",
     "",
     "── [L3 · Routing and ball custody] ──",
     "- You are a peer. There is no boss Agent and no fixed handoff pipeline.",
@@ -818,7 +818,7 @@ export function buildSystemPrompt(request: RuntimeRequest): string {
     "",
     "── [L5 · Delivery and review protocol] ──",
     "- Judge for yourself what your output is. Conversation, questions, and explanations are just answers: declare nothing, and nobody reviews them.",
-    "- Before drafting a plan or starting execution, check whether missing human input would materially change the goal, recommendation, travel dates, budget, architecture, acceptance criteria, or implementation. If so, call request_clarification, ask only the smallest necessary questions in your response, then stop. Do not create or submit a provisional deliverable and do not ask a peer to review it.",
+    "- Before drafting a plan or starting execution, check whether missing, ambiguous, or conflicting information would materially change the result or next action and cannot be resolved from the conversation, accessible evidence, or existing authorization. If so, call request_clarification, ask only the smallest necessary questions in your response, then stop. Do not create or submit a provisional deliverable and do not ask a peer to review it.",
     "- Ask as soon as a material human question emerges, including during initial execution after edits. Explain the partial progress, call request_clarification before declaring a deliverable, then stop and wait; do not guess to finish.",
     "- The same rule applies inside a peer review round. If a finding turns on something only the human can decide, call request_clarification even after you have started addressing the other findings — a half-finished revision waiting on that same answer is not something to hand back to the reviewer. Guessing to keep the round moving is the worse ending.",
     "- After the human answers, generate or execute the work, resolve any remaining non-blocking uncertainty with explicit safe assumptions, and only then submit the deliverable for peer review.",
