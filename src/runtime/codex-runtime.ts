@@ -514,7 +514,7 @@ function codexDynamicTools(): Array<Record<string, unknown>> {
       type: "function",
       name: "request_clarification",
       description:
-        "Ask the human before planning or executing when missing input would materially change the outcome. questions may be strings, or objects with question and optional options [{label,value,recommended}]; use recommended for the best default. Ask the same focused questions in your response, then stop without submitting a deliverable.",
+        "Ask the human as soon as missing input would materially change the outcome, including during execution or review rework after edits and before submission. Never guess personal facts such as travel dates or budget; reuse answers already given. questions may be strings, or objects with question and optional options [{label,value,recommended}]; use recommended for the best default. Ask the same focused questions in your response, then stop without submitting a deliverable.",
       inputSchema: {
         type: "object",
         properties: {

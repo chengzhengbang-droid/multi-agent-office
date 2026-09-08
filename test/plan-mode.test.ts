@@ -1,3 +1,4 @@
+import { projectApprovals } from "../src/core/approval-index.js";
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { RecentContextCompiler } from "../src/core/context-compiler.js";
@@ -136,6 +137,46 @@ test("a material question found during plan rework stops the review loop", async
   assert.equal(single(events, "review.resolved").escalation, "clarification-needed");
   assert.equal(countEvents(events, "plan.awaiting-approval"), 0);
   assert.equal(queuedRuns(events).length, 3);
+});
+
+test("October date question from the reviewer asks the author instead of offering plan approval", async () => {
+  const store = new InMemoryEventStore();
+  const question = "你具体是10月上旬、中旬还是下旬出发？最好提供日期。";
+  const handlers = {
+    codex: async (request: RuntimeRequest) => {
+      if (request.incoming.content.includes("10月下旬")) {
+        assert.ok(request.context.recentMessages.some((message) => message.content.includes("新疆")));
+        await request.declareDeliverable({ kind: "plan", summary: "10月下旬穿搭" });
+        return emitOutput(request, "10月下旬的完整穿搭计划");
+      }
+      await request.declareDeliverable({ kind: "plan", summary: "10月新疆穿搭" });
+      return emitOutput(request, "10月新疆7天穿搭候选");
+    },
+    pi: async (request: RuntimeRequest) => {
+      if (request.incoming.content.includes("10月下旬的完整")) {
+        await request.submitReview?.({ verdict: "approved", summary: "已按实际日期修订", checks: ["核对用户回答及完整候选"] });
+      } else {
+        const findings = [{ detail: question, severity: "major" as const, kind: "question" as const }];
+        const invalid = await request.submitReview?.({ verdict: "approved", summary: "日期未定", findings, checks: ["核对原始需求"] });
+        assert.equal(invalid?.accepted, false);
+        await request.submitReview?.({ verdict: "changes-requested", summary: "缺少实际出发日期", findings });
+      }
+      return emitOutput(request, "审核结束");
+    },
+  };
+  const agents = [agent("codex"), agent("pi")];
+  const platform = createPlanPlatform(agents, handlers, { eventStore: store });
+  const first = await platform.postUserMessage({ content: "@codex 10月新疆7天穿搭", planMode: true });
+  const events = await platform.getEvents();
+  assert.deepEqual(single(events, "clarification.requested").questions, [question]);
+  assert.equal(single(events, "clarification.requested").agentId, "codex");
+  assert.equal(countEvents(events, "review.rework"), 0);
+  assert.equal(countEvents(events, "plan.awaiting-approval"), 0);
+  assert.equal(single(events, "review.resolved").escalation, "clarification-needed");
+  assert.deepEqual(projectApprovals(events).map((item) => item.kind), ["clarification"]);
+  const restarted = createPlanPlatform(agents, handlers, { eventStore: store });
+  await restarted.postUserMessage({ threadId: first.threadId, content: "@codex 10月下旬出发", planMode: true });
+  assert.equal(countEvents(await restarted.getEvents(), "plan.awaiting-approval"), 1);
 });
 
 test("a peer-approved plan waits for the human instead of being executed", async () => {

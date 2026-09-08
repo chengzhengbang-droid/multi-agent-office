@@ -1,3 +1,4 @@
+import { projectApprovals } from "../src/core/approval-index.js";
 import assert from "node:assert/strict";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -1638,6 +1639,11 @@ test("an objection only the human can settle is asked now, not after the budget"
   assert.equal(resolved.outcome, "escalated");
   assert.equal(resolved.escalation, "clarification-needed");
   assert.match(resolved.detail ?? "", /超时后是重试还是直接失败/);
+  const clarification = single(events, "clarification.requested");
+  assert.equal(clarification.agentId, "pi");
+  assert.deepEqual(clarification.questions, ["超时后是重试还是直接失败，原始任务没有说"]);
+  assert.equal(events.filter((event) => event.type === "ball.handed_user").at(-1)?.reason, "clarification");
+  assert.deepEqual(projectApprovals(events).map((item) => item.kind), ["clarification"]);
   // The nit rode along without becoming a question for the human.
   assert.doesNotMatch(resolved.detail ?? "", /日志格式/);
 });
@@ -1690,15 +1696,15 @@ test("an author revising work can still stop and ask the human mid-round", async
   );
 });
 
-test("before the first delivery, a run that already wrote cannot fall back on a question", async () => {
-  let refusal: string | undefined;
+test("a material question discovered after initial edits pauses without reviewing partial work", async () => {
+  let accepted: boolean | undefined;
   const platform = createReviewPlatform([agent("pi", "workspace-write"), agent("codex")], {
     pi: async (request) => {
       await request.emit({ type: "tool_start", toolName: "write" });
       await request.emit({ type: "tool_end", toolName: "write", isError: false });
       const result = await request.requestClarification({ questions: ["要兼容哪个框架？"] });
-      refusal = result.reason;
-      return emitOutput(request, "写完了");
+      accepted = result.accepted;
+      return emitOutput(request, "已完成不受影响的部分，请先确认兼容框架。");
     },
     codex: approving([]),
   });
@@ -1706,10 +1712,11 @@ test("before the first delivery, a run that already wrote cannot fall back on a 
   await platform.postUserMessage({ content: "@pi 实现" });
   const events = await platform.getEvents();
 
-  // Asking is what you do instead of executing, not a way out of what you did.
-  assert.match(refusal ?? "", /already changed the workspace/);
-  assert.equal(countEvents(events, "clarification.requested"), 0);
-  assert.equal(single(events, "review.resolved").outcome, "approved");
+  assert.equal(accepted, true);
+  assert.equal(countEvents(events, "clarification.requested"), 1);
+  assert.equal(countEvents(events, "review.requested"), 0);
+  assert.equal(countEvents(events, "review.resolved"), 0);
+  assert.equal(events.filter((event) => event.type === "ball.handed_user").at(-1)?.reason, "clarification");
 });
 
 test("a review run that ends without submit_review is escalated, never approved", async () => {

@@ -247,6 +247,11 @@ export function projectApprovals(
       // gate and make the badge lie.
       if (event.outcome !== "escalated" || event.reviewType === "critique") continue;
       const originRun = runs.get(event.taskRunId);
+      // New clarification paths already have an answerable item. Keep the
+      // old escalation card for historical logs without a clarification event.
+      if (event.escalation === "clarification-needed" && originRun?.chainId &&
+          [...items.values()].some((item) => item.kind === "clarification" &&
+            item.chainId === originRun.chainId && item.status !== "settled")) continue;
       const id = `review:${event.taskRunId}`;
       items.set(id, {
         id,
