@@ -22,6 +22,7 @@ test("continued Agent sessions receive unseen peer messages but not their own pe
   ];
   const context = await compiler.compile({ agent: peer("pi"), incoming: messages[3]!, threadMessages: messages, lastDeliveredMessageId: "m1" });
   assert.deepEqual(context.recentMessages.map((item) => item.id), ["m3"]);
+  assert.deepEqual(context.reviewSources, [{ messageId: "m2", preview: "own answer" }]);
 });
 
 test("context compiler emits a visible truncation flag for its character budget", async () => {

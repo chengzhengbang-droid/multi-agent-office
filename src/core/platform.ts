@@ -680,6 +680,7 @@ export class MultiAgentPlatform {
         this.runDeliverables.set(event.runId, {
           kind: event.kind,
           summary: event.summary,
+          ...(event.sourceMessageId ? { sourceMessageId: event.sourceMessageId } : {}),
           ...(event.evidence ? { evidence: event.evidence } : {}),
         });
       } else if (event.type === "clarification.requested") {
@@ -932,6 +933,7 @@ export class MultiAgentPlatform {
     });
 
     let completedOutput: string | undefined;
+    let completedMessageId: Id | undefined;
     try {
       const workingDirectory = this.threads.get(run.threadId)?.workingDirectory;
       const attachments = incoming.attachments ?? [];
@@ -974,8 +976,9 @@ export class MultiAgentPlatform {
         await this.recordCancelled(run, abortReason(controller.signal));
         return;
       }
+      completedMessageId = createId("msg");
       await this.addMessage({
-        id: createId("msg"),
+        id: completedMessageId,
         threadId: run.threadId,
         sender: { type: "agent", id: run.agentId },
         kind: "chat",
@@ -990,6 +993,7 @@ export class MultiAgentPlatform {
         threadId: run.threadId,
         agentId: run.agentId,
         output: result.output,
+        messageId: completedMessageId,
       });
       // A reviewer answering the gate is not "the Agent handling this thread";
       // letting it win here would silently rewrite resolveFallbackAgent.
@@ -1028,7 +1032,7 @@ export class MultiAgentPlatform {
     // enqueueRun's incrementPending lands before the scheduler's
     // finishPendingRun — the chain cannot resolve while a review is owed.
     if (completedOutput !== undefined) {
-      await this.advanceReview(run, completedOutput);
+      await this.advanceReview(run, completedOutput, completedMessageId);
       await this.maybeResolveBall(run);
     } else if (this.runStatuses.get(run.id) === "failed") {
       await this.maybeResolveBall(run);
@@ -1477,7 +1481,7 @@ export class MultiAgentPlatform {
   }
 
   /** Runs after every completed run: opens the gate, or settles it. */
-  private async advanceReview(run: AgentRun, output: string): Promise<void> {
+  private async advanceReview(run: AgentRun, output: string, completedMessageId?: Id): Promise<void> {
     if (run.purpose === "review") {
       await this.settleReview(run);
       return;
@@ -1495,6 +1499,12 @@ export class MultiAgentPlatform {
     }
     // Initial questions simply end this conversational turn.
     if (this.isClarificationOnly(run)) return;
+    // Resolve the candidate once. Review and human approval must read the same
+    // immutable message, never a second model-written summary of it.
+    const declaration = this.runDeliverables.get(run.id);
+    const sourceMessageId = declaration?.sourceMessageId ?? completedMessageId;
+    const source = sourceMessageId ? this.messages.get(sourceMessageId) : undefined;
+    output = source?.content ?? output;
     // A critique judges a plan, so this run's output is the plan under review.
     // Recorded before the gate opens because the no-reviewer path settles the
     // task inside requestReview, and the human still has to see the plan.
@@ -1514,10 +1524,10 @@ export class MultiAgentPlatform {
       if (run.mode === "plan") await this.awaitPlanApproval(run.threadId, taskRunId, "skipped", 0);
       return;
     }
-    await this.requestReview(run, output);
+    await this.requestReview(run, output, sourceMessageId);
   }
 
-  private async requestReview(run: AgentRun, output: string): Promise<void> {
+  private async requestReview(run: AgentRun, output: string, sourceMessageId?: Id): Promise<void> {
     const taskRunId = this.taskRunIdOf(run);
     if (this.resolvedTaskRuns.has(taskRunId)) return;
     if (this.cancelledChains.has(run.causal.chainId)) return;
@@ -1558,6 +1568,7 @@ export class MultiAgentPlatform {
         authorAgentId: run.agentId,
         task: task?.content ?? "(原始任务不可用)",
         deliverable: output,
+        ...(sourceMessageId ? { sourceMessageId } : {}),
         round,
         maxRounds: this.maxReviewRounds,
         reviewType,
@@ -1607,6 +1618,7 @@ export class MultiAgentPlatform {
       round,
       messageId: message.id,
       reviewType,
+      ...(sourceMessageId ? { sourceMessageId } : {}),
       reviewerMatch: match,
     });
     await this.enqueueRun(reviewRun);
@@ -2350,7 +2362,14 @@ export class MultiAgentPlatform {
       };
     }
     const summary = input.summary?.trim() ?? "";
-    if (!summary) return { accepted: false, reason: "summary is required" };
+    if (input.sourceMessageId !== undefined) {
+      const source = this.messages.get(input.sourceMessageId);
+      if (!source || source.threadId !== run.threadId || source.sender.type !== "agent"
+        || source.sender.id !== run.agentId || source.kind !== "chat" || !source.content.trim()) {
+        return { accepted: false, reason: "sourceMessageId must identify your own non-empty chat message in this thread" };
+      }
+      if (summary) return { accepted: false, reason: "choose sourceMessageId without rewriting a summary" };
+    }
     if (summary.length > 20_000) {
       return { accepted: false, reason: "summary must be at most 20,000 characters" };
     }
@@ -2368,6 +2387,7 @@ export class MultiAgentPlatform {
     const declaration: DeliverableDeclaration = {
       kind: input.kind,
       summary,
+      ...(input.sourceMessageId ? { sourceMessageId: input.sourceMessageId } : {}),
       ...(evidence.length > 0 ? { evidence } : {}),
     };
     this.runDeliverables.set(run.id, declaration);
@@ -2934,6 +2954,7 @@ function buildReviewRequestContent(input: {
   authorAgentId: Id;
   task: string;
   deliverable: string;
+  sourceMessageId?: Id;
   round: number;
   maxRounds: number;
   reviewType: ReviewType;
@@ -2944,7 +2965,7 @@ function buildReviewRequestContent(input: {
   priorArt?: PriorArtSummary;
 }): string {
   const evidence = input.declaration?.evidence ?? [];
-  const claim = input.declaration
+  const claim = input.declaration && !input.sourceMessageId
     ? [
         "",
         `<author-claim kind="${input.declaration.kind}">`,
@@ -3003,12 +3024,16 @@ function buildReviewRequestContent(input: {
     header,
     "",
     "<original-task>",
-    excerpt(input.task),
+    input.task,
     "</original-task>",
     ...claim,
+    ...(input.sourceMessageId ? [
+      `Review source message: ${input.sourceMessageId}. The deliverable below is its complete, unchanged text. Judge this version only; other summaries are not the candidate.`,
+      ...evidence.map((item) => `Author-provided verification evidence: ${item}`),
+    ] : []),
     "",
     "<deliverable>",
-    excerpt(input.deliverable),
+    input.deliverable,
     "</deliverable>",
     "",
     ...brief,

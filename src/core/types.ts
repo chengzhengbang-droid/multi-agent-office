@@ -155,6 +155,8 @@ export type DeliverableKind = "completion" | "plan";
 export interface DeliverableDeclaration {
   kind: DeliverableKind;
   summary: string;
+  /** Immutable message selected as the review candidate; absent in old logs. */
+  sourceMessageId?: Id;
   /** How a reviewer can check the claim: files touched, commands to run. */
   evidence?: string[];
 }
@@ -369,6 +371,7 @@ export type PlatformEventPayload =
       threadId: Id;
       agentId: Id;
       output: string;
+      messageId?: Id;
     }
   | {
       type: "run.failed";
@@ -529,6 +532,7 @@ export type PlatformEventPayload =
       agentId: Id;
       kind: DeliverableKind;
       summary: string;
+      sourceMessageId?: Id;
       evidence?: string[];
     }
   | {
@@ -563,6 +567,7 @@ export type PlatformEventPayload =
       reviewerAgentId: Id;
       round: number;
       messageId: Id;
+      sourceMessageId?: Id;
       /** Absent in pre-smart-gate logs; replay treats that as "verify". */
       reviewType?: ReviewType;
       /**
@@ -666,4 +671,6 @@ export interface CompiledContext {
   recentMessages: ThreadMessage[];
   deliveryCursor: Id;
   truncated: boolean;
+  /** Small index retained even when continuation history omits own replies. */
+  reviewSources?: Array<{ messageId: Id; preview: string }>;
 }

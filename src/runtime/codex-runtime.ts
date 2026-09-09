@@ -46,7 +46,7 @@ interface TurnCompletion {
  * changes so sessions created by the old `codex exec` + MCP adapter are not
  * resumed without the native tools.
  */
-export const CODEX_SESSION_PROTOCOL = "app-server-dynamic-tools-v6-atomic-questions";
+export const CODEX_SESSION_PROTOCOL = "app-server-dynamic-tools-v7-review-source";
 
 export class CodexRuntimeAdapter implements AgentRuntime {
   public readonly id: string;
@@ -574,10 +574,11 @@ function codexDynamicTools(): Array<Record<string, unknown>> {
       inputSchema: {
         type: "object",
         properties: {
-          summary: { type: "string", minLength: 1, maxLength: 20_000 },
+          summary: { type: "string", maxLength: 20_000, description: "Optional short label; omit to share the final response without rewriting it." },
+          sourceMessageId: { type: "string", minLength: 1, description: "Your own existing chat message ID in this thread. Review its full original text; do not also supply summary. Omit to review this run’s final response." },
           evidence: stringArray,
         },
-        required: ["summary"],
+        required: [],
         additionalProperties: false,
       },
     })),
@@ -692,7 +693,8 @@ async function executeDynamicTool(
       const evidence = optionalStringArray(args, "evidence");
       const result = await request.declareDeliverable({
         kind,
-        summary: requiredString(args, "summary"),
+        ...(typeof args.summary === "string" ? { summary: args.summary } : {}),
+        ...(typeof args.sourceMessageId === "string" ? { sourceMessageId: args.sourceMessageId } : {}),
         ...(evidence ? { evidence } : {}),
       });
       return toolResult(

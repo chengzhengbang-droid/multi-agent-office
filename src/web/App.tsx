@@ -161,6 +161,10 @@ type TranscriptItem =
       /** Set on a review run: the delivery run it reviews. */
       taskRunId?: string;
       review?: ReviewState;
+      roundReview?: ReviewState;
+      source?: { messageId: string; content: string; runId?: string };
+      outputMessageId?: string;
+      deliverableKind?: "plan" | "completion";
       /** Set on the plan task run this plan belongs to, across every round. */
       plan?: PlanState;
       /** True while this run itself was asked for a plan rather than the work. */
@@ -192,6 +196,7 @@ interface ReviewState {
   detail?: string;
   /** Reviewer text recovered when the run ended without submit_review. */
   unstructured?: boolean;
+  historical?: boolean;
 }
 
 interface PlanState {
@@ -637,15 +642,17 @@ export function App() {
                 const agent = data.agents.find((candidate) => candidate.id === item.agentId);
                 const name = agentName(data.agents, item.agentId);
                 const runtime = runtimeDetail(agent, name);
-                const anchoredReview = reviewCards.cards.get(item.id);
+                const anchoredReview = reviewCards.cards.get(item.id) ?? item.roundReview;
                 // 卡片搬走之后，交付这一侧留一行去向，否则"送审了没有"在原地消失。
                 const reviewMoved = reviewCards.moved.get(item.id);
                 const planNeedsAttention = Boolean(item.plan && !item.plan.decision);
                 return (
-                  <article className={`agent-message ${item.replyToAgentId ? "agent-message--peer-reply" : ""}`} key={item.id}>
+                  <article id={`run-${item.id}`} className={`agent-message ${item.replyToAgentId ? "agent-message--peer-reply" : ""} ${item.purpose === "review" ? "agent-message--review" : item.planMode || item.deliverableKind === "plan" ? "agent-message--plan" : ""}`} key={item.id}>
                     <div className="agent-message-meta"><AgentAvatar agentId={item.agentId} variant={item.purpose === "review" ? "reviewer" : undefined} /><span>{name}</span>{runtime && <small>{runtime}</small>}<span className="agent-reply-context"><ArrowRight size={11} />{agentReplyLabel(item, data.agents)}</span>{item.routing && item.routing.total > 1 && <span className="status-label status-label--routing">{item.routing.mode === "parallel" ? "并行" : "串行"} · {item.routing.index}/{item.routing.total}</span>}{item.purpose === "review" && <span className="status-label status-label--review">审核 · 第 {item.reviewRound ?? 1} 轮</span>}{item.planMode && <span className="status-label status-label--plan"><ListChecks size={11} />计划模式</span>}<span className={`status-label status-label--${item.status}`}>{statusLabel(item.status, agent?.accessMode)}</span></div>
+                    <div className="document-heading"><strong>{item.purpose === "review" ? "审核意见" : item.planMode || item.deliverableKind === "plan" ? "方案正文" : item.deliverableKind === "completion" ? "交付结果" : "Agent 回复"}</strong>{(item.reviewRound ?? 0) > 0 && <span>第 {item.reviewRound} 轮</span>}</div>
+                    {item.source && <div className="review-source"><div><span>审核对象 · 原文共享</span>{item.source.runId && <a href={`#run-${item.source.runId}`}>定位原始消息 ↗</a>}</div><details><summary>查看本轮审核的完整原文 · {item.source.content.length.toLocaleString()} 字符</summary><div className="markdown-body"><ReactMarkdown remarkPlugins={[remarkGfm]}>{item.source.content}</ReactMarkdown></div></details></div>}
                     <RunActivity item={item} />
-                    <div className={`markdown-body ${item.status === "running" ? "markdown-body--streaming" : ""}`}>{item.content ? <ReactMarkdown remarkPlugins={[remarkGfm]}>{item.content}</ReactMarkdown> : <div className="thinking-line"><span /><span /><span /></div>}</div>
+                    {item.purpose === "review" && item.status === "completed" && anchoredReview && !anchoredReview.unstructured ? <details className="review-original"><summary>查看审核过程原始回复</summary><div className="markdown-body"><ReactMarkdown remarkPlugins={[remarkGfm]}>{item.content}</ReactMarkdown></div></details> : <div className={`markdown-body ${item.status === "running" ? "markdown-body--streaming" : ""}`}>{item.content ? <ReactMarkdown remarkPlugins={[remarkGfm]}>{item.content}</ReactMarkdown> : item.status === "running" || item.status === "queued" ? <div className="thinking-line"><span /><span /><span /></div> : null}</div>}
                     {item.usage && <RunUsageBar usage={item.usage} />}
                     {item.clarification && <ClarificationCard request={item.clarification} settled={approvals.some((approval) => approval.id === `clarification:${item.id}` && approval.status === "settled")} busy={sending} onSubmit={(answers) => answerClarification(item.clarification!, answers, item.planMode)} />}
                     {reviewMoved && <p className="review-moved-note"><ShieldCheck size={12} />{reviewMovedNote(reviewMoved, data.agents)}</p>}
@@ -1659,7 +1666,8 @@ function ReviewCard({ review, agents }: { review: ReviewState; agents: AgentSumm
   const reviewer = review.reviewerAgentId ? agentName(agents, review.reviewerAgentId) : "另一个 Agent";
   const kind = reviewTypeLabel(review.reviewType);
   const title =
-    review.status === "pending" ? `等待 ${reviewer} ${kind}（第 ${review.round} 轮）`
+    review.historical ? `第 ${review.round} 轮审核记录 · ${review.status === "approved" ? "通过" : "提出修改意见"}`
+    : review.status === "pending" ? `等待 ${reviewer} ${kind}（第 ${review.round} 轮）`
     : review.status === "approved" ? (review.reviewType === "critique" ? `双方就方案达成共识` : `双方就交付结果达成共识`)
     : review.status === "changes-requested" ? `${reviewer} 提出异议，正在协商（第 ${review.round} 轮）`
     : review.status === "cancelled" ? `${kind}已随协作链取消`
@@ -1675,9 +1683,7 @@ function ReviewCard({ review, agents }: { review: ReviewState; agents: AgentSumm
       {review.status === "escalated" && review.escalation && <p>{REVIEW_ESCALATION_LABELS[review.escalation]}</p>}
       {review.detail && <p>{review.detail}</p>}
       {review.unstructured && <p className="review-card-unstructured-note">以下是审核者的原始回复；由于没有调用 submit_review，它不是已登记的正式结论。</p>}
-      {review.summary && (review.unstructured
-        ? <div className="review-card-unstructured markdown-body"><ReactMarkdown remarkPlugins={[remarkGfm]}>{review.summary}</ReactMarkdown></div>
-        : <p>{review.summary}</p>)}
+      {review.summary && <div className={`markdown-body ${review.unstructured ? "review-card-unstructured" : ""}`}><ReactMarkdown remarkPlugins={[remarkGfm]}>{review.summary}</ReactMarkdown></div>}
       {review.findings && review.findings.length > 0 && (
         <ul>
           {normalizeFindings(review.findings).map((finding, index) => (
@@ -1817,7 +1823,7 @@ function PlanCard({
     <div className="plan-card plan-card--pending">
       <div className="plan-card-title">
         <ListChecks size={13} />
-        <strong>{author} 的计划等待你确认</strong>
+        <strong>等待你批准 · {author} 的方案</strong>
       </div>
       <p className="plan-card-peer">
         {PLAN_PEER_LABELS[plan.peerOutcome]}
@@ -1827,9 +1833,9 @@ function PlanCard({
       </p>
       {plan.peerSummary && <p className="plan-card-summary">{plan.peerSummary}</p>}
       <PriorArtSection {...(plan.priorArt ? { ledger: plan.priorArt } : {})} />
-      <div className="plan-card-body markdown-body">
+      <details className="plan-original"><summary>查看待批准方案全文</summary><div className="plan-card-body markdown-body">
         <ReactMarkdown remarkPlugins={[remarkGfm]}>{plan.plan}</ReactMarkdown>
-      </div>
+      </div></details>
       <textarea
         className="plan-card-input"
         value={note}
@@ -2061,10 +2067,26 @@ export function buildTranscript(events: StoredPlatformEvent[], threadId?: string
     else if (event.type === "run.lifecycle") run.notices.push(lifecycleLabel(event.phase, event.detail));
     else if (event.type === "run.diagnostic") run.notices.push(`${event.source === "extension" ? "扩展" : "运行时"}：${event.message}`);
     else if (event.type === "run.steered") { run.notices.push("已插入新的用户消息"); addUnique(humanMessages.get(event.messageId)?.targets, event.agentId); }
-    else if (event.type === "run.completed") { run.content = event.output; run.status = "completed"; }
+    else if (event.type === "run.completed") { run.content = event.output; run.status = "completed"; if (event.messageId) run.outputMessageId = event.messageId; }
+    else if (event.type === "deliverable.declared") run.deliverableKind = event.kind;
     else if (event.type === "run.failed") { run.content = event.error; run.status = "failed"; }
     else if (event.type === "run.cancelled") { run.content = event.reason; run.status = "cancelled"; }
     else if (event.type === "run.interrupted") { run.content = event.reason; run.status = "interrupted"; }
+  }
+  // Preserve each round's verdict and exact candidate independently of the
+  // task-level latest status. Never label legacy reviews as source-linked.
+  const roundTypes = new Map(events.flatMap((event) => event.type === "review.requested" && event.threadId === threadId ? [[event.reviewRunId, event.reviewType ?? "verify"] as const] : []));
+  const sourceRuns = new Map([...runs.values()].filter((run) => run.outputMessageId).map((run) => [run.outputMessageId!, run.id]));
+  for (const event of events) {
+    if (event.type === "review.requested" && event.threadId === threadId && event.sourceMessageId) {
+      const run = runs.get(event.reviewRunId);
+      const source = messages.get(event.sourceMessageId);
+      const sourceRunId = sourceRuns.get(event.sourceMessageId);
+      if (run && source) run.source = { messageId: source.id, content: source.content, ...(sourceRunId ? { runId: sourceRunId } : {}) };
+    } else if (event.type === "review.submitted" && event.threadId === threadId) {
+      const run = runs.get(event.reviewRunId);
+      if (run) run.roundReview = { historical: true, reviewType: roundTypes.get(event.reviewRunId) ?? "verify", status: event.verdict, round: run.reviewRound ?? 1, reviewerAgentId: event.reviewerAgentId, summary: event.summary, findings: event.findings, ...(event.checks ? { checks: event.checks } : {}) };
+    }
   }
   return items.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
 }

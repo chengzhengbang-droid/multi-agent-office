@@ -775,11 +775,13 @@ test("declaring a completion opens a verify review carrying the evidence", async
   const requested = single(events, "review.requested");
   assert.equal(requested.reviewType, "verify");
   assert.equal(requested.reviewerAgentId, "pi");
-  // The reviewer is handed the claim and the evidence, not just the output.
+  // The original output is the sole candidate; verification evidence still travels with it.
   const brief = (await platform.getThreadMessages(requested.threadId)).find(
     (message) => message.id === requested.messageId,
   );
-  assert.match(brief?.content ?? "", /修好了解析器/);
+  assert.doesNotMatch(brief?.content ?? "", /修好了解析器/);
+  assert.match(brief?.content ?? "", /<deliverable>\n已修复\n<\/deliverable>/);
+  assert.ok(requested.sourceMessageId);
   assert.match(brief?.content ?? "", /src\/parser\.ts/);
   assert.match(brief?.content ?? "", /they prove nothing by themselves/);
   assert.equal(single(events, "review.resolved").outcome, "approved");
