@@ -1,3 +1,4 @@
+import { CLARIFICATION_QUESTION_BRIEF } from "../core/clarification.js";
 import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createInterface, type Interface as ReadLineInterface } from "node:readline";
 import type { AccessMode, CodexRuntimeSpec, ReviewFindingInput, RuntimeAvailability } from "../core/types.js";
@@ -45,7 +46,7 @@ interface TurnCompletion {
  * changes so sessions created by the old `codex exec` + MCP adapter are not
  * resumed without the native tools.
  */
-export const CODEX_SESSION_PROTOCOL = "app-server-dynamic-tools-v5-review-choices";
+export const CODEX_SESSION_PROTOCOL = "app-server-dynamic-tools-v6-atomic-questions";
 
 export class CodexRuntimeAdapter implements AgentRuntime {
   public readonly id: string;
@@ -515,7 +516,7 @@ function codexDynamicTools(): Array<Record<string, unknown>> {
       type: "function",
       name: "request_clarification",
       description:
-        "Ask promptly when missing, ambiguous, or conflicting information would materially change the result or next action and cannot be resolved from the conversation, accessible evidence, or existing authorization. This applies throughout execution and review rework, including after edits and before submission. Reuse prior answers and delegated decisions; do not substitute assumptions, defaults, or disclaimers for a required human answer. questions may be strings, or objects with question and optional options [{label,value,recommended}]; provide 2–3 concrete options whenever the answer is a choice, and use recommended only for a justified recommendation. Ask the same focused questions in your response, then stop without submitting a deliverable.",
+        "Ask promptly when missing, ambiguous, or conflicting information would materially change the result or next action and cannot be resolved from the conversation, accessible evidence, or existing authorization. This applies throughout execution and review rework, including after edits and before submission. Reuse prior answers and delegated decisions; do not substitute assumptions, defaults, or disclaimers for a required human answer. questions may be strings, or objects with question and optional options [{label,value,recommended}]; provide 2–3 concrete options whenever the answer is a choice, and use recommended only for a justified recommendation. Ask the same focused questions in your response, then stop without submitting a deliverable." + " " + CLARIFICATION_QUESTION_BRIEF,
       inputSchema: {
         type: "object",
         properties: {

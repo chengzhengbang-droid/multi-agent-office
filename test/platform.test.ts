@@ -717,6 +717,39 @@ test("material clarification stops before deliverable declaration and peer revie
   assert.equal(countEvents(events, "run.queued"), 1);
 });
 
+for (const planMode of [false, true]) {
+  test(`compound clarification is rejected without consuming the turn (plan=${planMode})`, async () => {
+    const questions = [
+      { question: "具体是 10 月几号到几号？" },
+      { question: "你更希望侧重哪种穿搭？", options: [
+        { label: "保暖实用", value: "warm", recommended: true },
+        { label: "保暖＋出片", value: "photo" },
+        { label: "轻装少带", value: "light" },
+      ] },
+    ];
+    const platform = createSmartPlatform([agent("codex"), agent("pi")], {
+      codex: async (request) => {
+        const refused = await request.requestClarification({ questions: [{
+          question: "具体是 10 月几号到几号？另外你更希望侧重保暖实用，还是兼顾拍照出片？",
+          options: questions[1]!.options!,
+        }] });
+        assert.equal(refused.accepted, false);
+        assert.match(refused.reason ?? "", /Split independent/);
+        const before = await platform.getEvents();
+        assert.equal(countEvents(before, "clarification.requested"), 0);
+        assert.equal(countEvents(before, "ball.handed_user"), 0);
+        assert.equal((await request.requestClarification({ questions })).accepted, true);
+        return emitOutput(request, "请分别回答日期和穿搭偏好。");
+      },
+    });
+    await platform.postUserMessage({ content: "@codex 帮我准备旅行", planMode });
+    const events = await platform.getEvents();
+    assert.deepEqual(single(events, "clarification.requested").questions, questions);
+    assert.equal(countEvents(events, "ball.handed_user"), 1);
+    assert.equal(countEvents(events, "review.requested"), 0);
+  });
+}
+
 test("declaring a completion opens a verify review carrying the evidence", async () => {
   const order: string[] = [];
   const platform = createSmartPlatform([agent("codex"), agent("pi")], {
@@ -1671,6 +1704,12 @@ for (const planMode of [false, true]) for (const severity of ["minor", "major", 
           const result = await request.submitReview!({ verdict: "approved", summary: "已按选择完成", checks: ["核对每日表及用户选择"] });
           assert.equal(result.accepted, true);
         } else {
+          const compound = await request.submitReview!({
+            verdict: "changes-requested", summary: "等待用户选择",
+            findings: [{ detail: "具体哪天出发？另外是否需要每日表？", severity, kind: "question", options }],
+          });
+          assert.equal(compound.accepted, false);
+          assert.match(compound.reason ?? "", /Split independent/);
           const findings = [
             { detail: question, severity, kind: "question" as const, options },
             { detail: "标题还可以简短一些", severity: "minor" as const },

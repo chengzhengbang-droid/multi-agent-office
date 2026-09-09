@@ -1,3 +1,4 @@
+import { hasMultipleQuestionSentences, SPLIT_QUESTION_REASON } from "./clarification.js";
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { createId } from "./ids.js";
@@ -2234,6 +2235,9 @@ export class MultiAgentPlatform {
     if (questions.some((question) => (typeof question === "string" ? question : question.question).length > 2_000)) {
       return { accepted: false, reason: "each clarification question must be at most 2,000 characters" };
     }
+    if (questions.some((question) => hasMultipleQuestionSentences(typeof question === "string" ? question : question.question))) {
+      return { accepted: false, reason: SPLIT_QUESTION_REASON };
+    }
     if (this.runClarifications.has(run.id)) {
       return { accepted: false, reason: "this run already requested clarification" };
     }
@@ -2414,6 +2418,9 @@ export class MultiAgentPlatform {
     }
     if (humanQuestions(findings).length > 0 && input.verdict === "approved") {
       return { accepted: false, reason: "unresolved human questions require changes-requested, not approval" };
+    }
+    if (humanQuestions(findings).some((finding) => hasMultipleQuestionSentences(finding.detail))) {
+      return { accepted: false, reason: SPLIT_QUESTION_REASON };
     }
     const gating = gatingFindings(findings);
     const checks = (input.checks ?? [])
