@@ -901,3 +901,23 @@ button, .thread-item, .provider-option, .runtime-choice, .suggestion-grid button
 .approval-origin { color: var(--faint); font-size: 10px; }
 .approval-actions button { height: 28px; display: inline-flex; align-items: center; gap: 5px; padding: 0 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); color: var(--text); cursor: pointer; font-size: 11px; font-weight: 600; }
 .approval-actions button:hover { border-color: var(--accent); background: var(--accent-soft); color: var(--accent-strong); }
+
+
+/* Document roles stay readable without relying on badge color alone. */
+.agent-message--plan, .agent-message--review { border: 1px solid var(--border-soft); border-radius: 14px; padding: 22px; scroll-margin-top: 24px; }
+.agent-message--plan { border-left: 4px solid var(--accent); background: var(--surface-elevated); }
+.agent-message--review { border-left: 4px solid #9a75b4; background: color-mix(in srgb, #9a75b4 5%, var(--surface-elevated)); }
+.agent-message:target { outline: 2px solid var(--accent); outline-offset: 4px; }
+.document-heading { display: flex; align-items: center; gap: 12px; margin: 18px 0 14px; font-size: 17px; color: var(--text); }
+.document-heading > span { font-size: 12px; font-weight: 400; color: var(--muted); }
+.review-source { margin-bottom: 16px; padding: 12px 14px; border: 1px solid color-mix(in srgb, #9a75b4 25%, var(--border-soft)); border-radius: 9px; background: color-mix(in srgb, #9a75b4 8%, var(--surface)); font-size: 12px; color: var(--muted); }
+.review-source > div:first-child { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 8px; }
+.review-source a { color: var(--accent); text-decoration: underline; text-underline-offset: 3px; }
+.review-source details { margin-top: 10px; }
+.review-source summary, .review-original summary, .plan-original summary { cursor: pointer; padding: 6px 0; font-size: 13px; font-weight: 500; }
+.review-original { margin: 12px 0; color: var(--muted); }
+.review-source .markdown-body, .review-original .markdown-body { margin-top: 12px; color: var(--text); }
+.review-card .markdown-body { font-size: 14px; line-height: 1.8; }
+.review-card > ul { display: grid; gap: 10px; }
+.plan-original { margin: 14px 0; }
+@media (max-width: 640px) { .agent-message--plan, .agent-message--review { padding: 14px; } }

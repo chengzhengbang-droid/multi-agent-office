@@ -237,13 +237,15 @@ export class PiRuntimeAdapter implements AgentRuntime {
     // the platform decides whether a declaration is admissible.
     const declare = async (
       kind: "completion" | "plan",
-      summary: string,
+      summary: string | undefined,
       evidence: string[] | undefined,
       verb: string,
+      sourceMessageId?: string,
     ) => {
       const result = await request.declareDeliverable({
         kind,
-        summary,
+        ...(summary !== undefined ? { summary } : {}),
+        ...(sourceMessageId !== undefined ? { sourceMessageId } : {}),
         ...(evidence ? { evidence } : {}),
       });
       return {
@@ -338,7 +340,8 @@ export class PiRuntimeAdapter implements AgentRuntime {
       description:
         "Call when you have FINISHED work a human asked for and produced a real deliverable. Include evidence a reviewer can check: files you changed, commands you ran, how to verify it. This submits your work to a peer for verification — your own word that it is done is not enough. Do not call it for conversation, questions, explanations, or while material human questions remain unresolved; use request_clarification first.",
       parameters: Type.Object({
-        summary: Type.String({ description: "What you delivered, in your own words" }),
+        summary: Type.Optional(Type.String({ description: "Optional short label, never rewrite the deliverable here. Omit to review the final response." })),
+        sourceMessageId: Type.Optional(Type.String({ description: "ID of your own existing chat message in this thread to review verbatim. Omit to share this run’s final response. Do not also supply summary." })),
         evidence: Type.Optional(
           Type.Array(Type.String(), {
             description:
@@ -347,7 +350,7 @@ export class PiRuntimeAdapter implements AgentRuntime {
         ),
       }),
       execute: async (_toolCallId, params) =>
-        declare("completion", params.summary, params.evidence, "Completed work"),
+        declare("completion", params.summary, params.evidence, "Completed work", params.sourceMessageId),
     });
 
     const submitPlanTool = defineTool({
@@ -356,7 +359,8 @@ export class PiRuntimeAdapter implements AgentRuntime {
       description:
         "Call only when your plan, design, or proposal is ready to be pressure-tested as written. A teammate critiques it, then the human decides whether it gets built. Do not submit a plan that still contains blocking questions or choices for the human; call request_clarification first and wait. Do not call it for conversation or finished work.",
       parameters: Type.Object({
-        summary: Type.String({ description: "The plan you are proposing, in your own words" }),
+        summary: Type.Optional(Type.String({ description: "Optional short label, not a second plan. Omit to review the final response." })),
+        sourceMessageId: Type.Optional(Type.String({ description: "ID of your own existing chat message to review verbatim. Omit to share this run’s final response. Do not also supply summary." })),
         evidence: Type.Optional(
           Type.Array(Type.String(), {
             description:
@@ -365,7 +369,7 @@ export class PiRuntimeAdapter implements AgentRuntime {
         ),
       }),
       execute: async (_toolCallId, params) =>
-        declare("plan", params.summary, params.evidence, "Plan"),
+        declare("plan", params.summary, params.evidence, "Plan", params.sourceMessageId),
     });
     const { loader: sharedLoader, settingsManager } =
       await this.options.shared.resourcesFor(cwd);
@@ -823,6 +827,7 @@ export function buildSystemPrompt(request: RuntimeRequest): string {
     "- Work selected for peer review must be checked by a different Agent; never approve your own deliverable.",
     "",
     "── [L5 · Delivery and review protocol] ──",
+    "- submit_plan / complete_task share an immutable original message. Prefer calling without summary, then write the complete final response once. Or select sourceMessageId from your own earlier chat message; do not rewrite or shorten it for review. The platform forwards the full original text after the run ends.",
     "- Judge for yourself what your output is. Conversation, questions, and explanations are just answers: declare nothing, and nobody reviews them.",
     CLARIFICATION_QUESTION_BRIEF,
     "- Before drafting a plan or starting execution, check whether missing, ambiguous, or conflicting information would materially change the result or next action and cannot be resolved from the conversation, accessible evidence, or existing authorization. If so, call request_clarification, ask only the smallest necessary questions in your response, then stop. Do not create or submit a provisional deliverable and do not ask a peer to review it.",
@@ -953,7 +958,7 @@ export function buildUserPrompt(request: RuntimeRequest): string {
       const mentions = message.mentions.length > 0
         ? ` mentions=${message.mentions.map((id) => `@${id}`).join(",")}`
         : "";
-      return `[${sender}; kind=${message.kind}${mentions}] ${message.content}`;
+      return `[message_id=${message.id}; ${sender}; kind=${message.kind}${mentions}] ${message.content}`;
     })
     .join("\n\n");
   return [
@@ -961,8 +966,13 @@ export function buildUserPrompt(request: RuntimeRequest): string {
     history || "(none)",
     request.context.truncated ? "[Earlier unseen messages were truncated by the context budget.]" : "",
     "</new-shared-thread-context>",
+    "<available-review-sources>",
+    "Select sourceMessageId to share an earlier own message verbatim. Previews are for selection only; the platform forwards the full original.",
+    ...(request.context.reviewSources ?? []).map((source) => `${source.messageId}: ${source.preview}`),
+    "</available-review-sources>",
     "",
     "<incoming-message>",
+    `message_id: ${request.incoming.id}`,
     `sender_type: ${request.incoming.sender.type}`,
     `sender_id: ${request.incoming.sender.id}`,
     `intent: ${request.incoming.intent ?? "unspecified"}`,

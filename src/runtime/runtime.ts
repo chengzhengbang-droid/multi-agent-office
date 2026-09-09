@@ -91,7 +91,7 @@ export interface SubmitReviewResult {
   reason?: string;
 }
 
-export type DeclareDeliverableInput = DeliverableDeclaration;
+export type DeclareDeliverableInput = Omit<DeliverableDeclaration, "summary"> & { summary?: string };
 
 export interface DeclareDeliverableResult {
   accepted: boolean;

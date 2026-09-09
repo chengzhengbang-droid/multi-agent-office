@@ -660,3 +660,82 @@ async function waitForQuiet(platform: MultiAgentPlatform): Promise<void> {
   }
   throw new Error("runs did not settle in time");
 }
+
+test("review and approval share the full final message, not a second summary", async () => {
+  const original = `# 完整方案\n${"保留约束、步骤及核验依据。\n".repeat(3000)}末尾不可丢失`;
+  const platform = createPlanPlatform([agent("codex"), agent("pi")], {
+    codex: async (request) => {
+      assert.equal((await request.declareDeliverable({ kind: "plan", summary: "简化版不应成为审核正文" })).accepted, true);
+      return emitOutput(request, original);
+    },
+    pi: async (request) => {
+      assert.ok(request.incoming.content.includes(`<deliverable>\n${original}\n</deliverable>`));
+      assert.ok(!request.incoming.content.includes("简化版不应成为审核正文"));
+      return approving()(request);
+    },
+  });
+  await platform.postUserMessage({ content: "@codex 出方案", planMode: true });
+  const events = await platform.getEvents();
+  const review = single(events, "review.requested");
+  const source = events.find((event) => event.type === "message.created" && event.message.id === review.sourceMessageId);
+  assert.ok(source?.type === "message.created");
+  assert.equal(source.message.content, original);
+  assert.equal(single(events, "plan.awaiting-approval").plan, original);
+});
+
+test("an author can select an earlier own message without regenerating its plan", async () => {
+  const original = "# 原始方案\n第一步读取，第二步验证。";
+  const store = new InMemoryEventStore();
+  let sourceMessageId = "";
+  const handlers = {
+    codex: async (request: RuntimeRequest) => {
+      if (!sourceMessageId) return emitOutput(request, original);
+      assert.equal((await request.declareDeliverable({ kind: "plan", sourceMessageId })).accepted, true);
+      return emitOutput(request, "已将指定原文提交审核。");
+    },
+    pi: async (request: RuntimeRequest) => {
+      assert.ok(request.incoming.content.includes(`<deliverable>\n${original}\n</deliverable>`));
+      assert.ok(!request.incoming.content.includes("已将指定原文提交审核。"));
+      return approving()(request);
+    },
+  };
+  let platform = createPlanPlatform([agent("codex"), agent("pi")], handlers, { eventStore: store });
+  const first = await platform.postUserMessage({ content: "@codex 讨论一下" });
+  const completed = single(await platform.getEvents(), "run.completed");
+  sourceMessageId = completed.messageId!;
+  assert.ok(sourceMessageId);
+  // Message references must survive hydration, not just the live run's memory.
+  platform = createPlanPlatform([agent("codex"), agent("pi")], handlers, { eventStore: store });
+  await platform.postUserMessage({ threadId: first.threadId, content: "@codex 审核刚才原文", planMode: true });
+  assert.equal(single(await platform.getEvents(), "review.requested").sourceMessageId, sourceMessageId);
+  assert.equal(single(await platform.getEvents(), "plan.awaiting-approval").plan, original);
+  const replay = createPlanPlatform([agent("codex"), agent("pi")], handlers, { eventStore: store });
+  assert.equal((await replay.getPendingPlanApprovals())[0]?.plan, original);
+});
+
+test("source references reject missing, human, peer, cross-thread and competing text", async () => {
+  let invalidIds: string[] = ["missing"];
+  let ownId = "";
+  const platform = createPlanPlatform([agent("codex"), agent("pi")], {
+    codex: async (request) => {
+      if (request.incoming.content.includes("验证引用")) {
+        for (const sourceMessageId of [...invalidIds, request.incoming.id]) {
+          assert.equal((await request.declareDeliverable({ kind: "plan", sourceMessageId })).accepted, false);
+        }
+        assert.equal((await request.declareDeliverable({ kind: "plan", sourceMessageId: ownId, summary: "另一版本" })).accepted, false);
+        assert.equal((await request.declareDeliverable({ kind: "plan" })).accepted, true);
+      }
+      return emitOutput(request, "原文");
+    },
+    pi: async (request) => request.reviewOf ? approving()(request) : emitOutput(request, "同伴消息"),
+  });
+  await platform.postUserMessage({ content: "@codex 别的线程" });
+  invalidIds.push(single(await platform.getEvents(), "run.completed").messageId!);
+  const current = await platform.postUserMessage({ content: "@pi 当前线程" });
+  const peer = (await platform.getEvents()).filter((e) => e.type === "run.completed").at(-1)!;
+  invalidIds.push(peer.messageId!);
+  await platform.postUserMessage({ threadId: current.threadId, content: "@codex 先说一下" });
+  ownId = (await platform.getEvents()).filter((e) => e.type === "run.completed").at(-1)!.messageId!;
+  await platform.postUserMessage({ threadId: current.threadId, content: "@codex 验证引用", planMode: true });
+  assert.equal(single(await platform.getEvents(), "review.requested").reviewType, "critique");
+});

@@ -68,6 +68,12 @@ export class RecentContextCompiler implements ContextCompiler {
       recentMessages: selected.reverse(),
       deliveryCursor: input.incoming.id,
       truncated: selected.length < allCandidates.length,
+      reviewSources: input.threadMessages.slice(0, upperBound)
+        .filter((message) => message.threadId === input.incoming.threadId
+          && message.sender.type === "agent" && message.sender.id === input.agent.id
+          && message.kind === "chat" && message.content.trim())
+        .slice(-this.maxMessages)
+        .map((message) => ({ messageId: message.id, preview: message.content.slice(0, 120) })),
     };
   }
 }
