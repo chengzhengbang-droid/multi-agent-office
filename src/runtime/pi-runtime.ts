@@ -1,3 +1,4 @@
+import { checkRequirements, REQUIREMENTS_CHECK_BRIEF } from "./requirements-check.js";
 import { CLARIFICATION_QUESTION_BRIEF } from "../core/clarification.js";
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
@@ -49,7 +50,22 @@ export class PiRuntimeAdapter implements AgentRuntime {
   }
 
   public async execute(request: RuntimeRequest): Promise<RuntimeResult> {
+    if (!request.reviewOf && !request.requirementsChecked) {
+      return checkRequirements(request, (phase) => this.execute(phase));
+    }
     const cwd = request.workingDirectory ?? this.options.cwd;
+    const confirmRequirementsTool = defineTool({
+      name: "confirm_requirements",
+      label: "Confirm requirements are ready",
+      description: "Only during the requirements check: explain why all result-changing facts are known or explicitly delegated, then stop. Never use assumptions to bypass a required human answer.",
+      parameters: Type.Object({ reason: Type.String({ minLength: 1 }) }),
+      execute: async (_id, params) => {
+        const result = request.confirmRequirements
+          ? await request.confirmRequirements(params.reason)
+          : { accepted: false, reason: "Not in a requirements check." };
+        return { content: [{ type: "text", text: result.accepted ? "Requirements confirmed. Stop; execution starts in a separate turn." : result.reason ?? "Rejected" }], details: result };
+      },
+    });
     const postMessageTool = defineTool({
       name: "post_message",
       label: "Post a visible collaboration message",
@@ -208,7 +224,7 @@ export class PiRuntimeAdapter implements AgentRuntime {
       name: "request_clarification",
       label: "Ask the human before planning or executing",
       description:
-        "Call before submit_plan or complete_task when missing, ambiguous, or conflicting information would materially change the result or next action and cannot be resolved from the conversation, accessible evidence, or existing authorization. When the answer is a choice, provide 2–3 concrete options with label/value/recommended so the human can click an answer. Ask only the smallest focused set of questions, put the same questions in your assistant response, then stop and wait. Do not use this for details you can discover locally or resolve with a safe reversible assumption." + " " + CLARIFICATION_QUESTION_BRIEF,
+        "Call before submit_plan or complete_task when missing, ambiguous, or conflicting information would materially change the result or next action and cannot be resolved from the conversation, accessible evidence, or existing authorization. When the answer is a choice, provide 2–3 concrete options with label/value/recommended so the human can click an answer. Ask only the smallest focused set of questions, put the same questions in your assistant response, then stop and wait. Do not use this for details you can discover locally or details that do not affect the result." + " " + CLARIFICATION_QUESTION_BRIEF,
       parameters: Type.Object({
         questions: Type.Array(Type.Union([Type.String(), Type.Object({ question: Type.String(), options: Type.Optional(Type.Array(Type.Object({ label: Type.String(), value: Type.Optional(Type.String()), recommended: Type.Optional(Type.Boolean()) }))) })]), {
           minItems: 1,
@@ -409,6 +425,7 @@ export class PiRuntimeAdapter implements AgentRuntime {
       settingsManager,
       modelRuntime,
       customTools: [
+        confirmRequirementsTool,
         postMessageTool,
         holdBallTool,
         submitReviewTool,
@@ -437,10 +454,11 @@ export class PiRuntimeAdapter implements AgentRuntime {
         });
       },
     });
-    // Activate every tool the registry ended up with, so extension-registered
-    // tools are usable. Access mode is enforced by excludeTools above, which
-    // keeps the excluded built-ins out of the registry entirely.
-    session.setActiveToolsByName(session.getAllTools().map((tool) => tool.name));
+    // Intake deliberately limits even extension tools: their effects are unknown.
+    // Execution restores the normal registry and access-mode exclusions.
+    session.setActiveToolsByName(request.confirmRequirements
+      ? ["request_clarification", "confirm_requirements", "read"]
+      : session.getAllTools().map((tool) => tool.name));
 
     const sessionFile = session.sessionFile;
     if (sessionFile) {
@@ -845,13 +863,14 @@ export function buildSystemPrompt(request: RuntimeRequest): string {
     "- A handoff without a recognized teammate mention is a void pass: it is visible but wakes nobody and is recorded as dropped custody.",
     "- Ordinary assistant output, including @handles, never routes to another Agent.",
     "- Do not retry a rejected post_message with a new idempotency key.",
-    "- Do not request clarification for facts you can inspect yourself or details that a safe reversible assumption can settle.",
+    "- Do not request clarification for facts you can inspect yourself or details that do not affect the result. Reversibility alone never justifies guessing a missing user fact.",
     ...(request.planMode ? planBrief() : []),
     ...(request.reviewOf ? reviewBrief(request.reviewOf) : []),
     "",
     "── [L6 · Teammate roster] ──",
     roster || "(none)",
     "",
+    ...(request.confirmRequirements ? ["── Requirements check ──", REQUIREMENTS_CHECK_BRIEF, ""] : []),
     "── [L7 · Collaboration philosophy] ──",
     "You are a persistent teammate, not an isolated tool call. Use peers to broaden judgment, preserve evidence in the shared thread, and make the collaboration legible enough that the human does not have to become a manual router.",
   ].join("\n");

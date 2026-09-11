@@ -1,3 +1,4 @@
+import { checkRequirements } from "./requirements-check.js";
 import { CLARIFICATION_QUESTION_BRIEF } from "../core/clarification.js";
 import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createInterface, type Interface as ReadLineInterface } from "node:readline";
@@ -46,7 +47,7 @@ interface TurnCompletion {
  * changes so sessions created by the old `codex exec` + MCP adapter are not
  * resumed without the native tools.
  */
-export const CODEX_SESSION_PROTOCOL = "app-server-dynamic-tools-v7-review-source";
+export const CODEX_SESSION_PROTOCOL = "app-server-dynamic-tools-v8-requirements-check";
 
 export class CodexRuntimeAdapter implements AgentRuntime {
   public readonly id: string;
@@ -59,6 +60,9 @@ export class CodexRuntimeAdapter implements AgentRuntime {
   }
 
   public async execute(request: RuntimeRequest): Promise<RuntimeResult> {
+    if (!request.reviewOf && !request.requirementsChecked) {
+      return checkRequirements(request, (phase) => this.execute(phase));
+    }
     const cwd = request.workingDirectory ?? this.options.cwd;
     const binding = await this.options.sessionStore.get(request.threadId, request.agent.id);
     const resumeSessionId =
@@ -441,6 +445,12 @@ function codexDynamicTools(): Array<Record<string, unknown>> {
   return [
     {
       type: "function",
+      name: "confirm_requirements",
+      description: "During requirements check only: explain why all result-changing user facts are known or explicitly delegated, then stop. Never guess through missing information.",
+      inputSchema: { type: "object", properties: { reason: { type: "string", minLength: 1 } }, required: ["reason"], additionalProperties: false },
+    },
+    {
+      type: "function",
       name: "post_message",
       description:
         "Post a visible structured collaboration message. handoff transfers the next action; fyi does not. Multi-target dispatch is serial unless routingMode is explicitly parallel.",
@@ -593,6 +603,15 @@ async function executeDynamicTool(
   try {
     const args = asRecord(rawArguments);
     if (!args) throw new Error("Tool arguments must be an object");
+    if (request.confirmRequirements && !["confirm_requirements", "request_clarification"].includes(tool)) {
+      return toolResult(false, "Requirements check only: ask the human or confirm_requirements, then stop.");
+    }
+    if (tool === "confirm_requirements") {
+      const result = request.confirmRequirements
+        ? await request.confirmRequirements(requiredString(args, "reason"))
+        : { accepted: false, reason: "Not in a requirements check." };
+      return toolResult(result.accepted, result.accepted ? "Requirements confirmed. Stop; execution starts in a separate turn." : result.reason ?? "Rejected");
+    }
     if (tool === "post_message") {
       const intent = optionalString(args, "intent");
       const collaborationIntent = optionalCollaborationIntent(args.collaborationIntent);
