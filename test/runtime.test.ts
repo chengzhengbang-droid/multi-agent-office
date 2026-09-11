@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { checkRequirements } from "../src/runtime/requirements-check.js";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -199,8 +200,9 @@ createInterface({ input: process.stdin }).on("line", (line) => {
         ? "turn-3"
         : "turn-1";
     send({ id: message.id, result: { turn: { id: currentTurn, status: "inProgress", items: [] } } });
-    toolCall = process.env.FAKE_CODEX_TOOL;
-    const args = toolCall === "submit_review"
+    const checking = message.params.input[0].text.includes("This turn is REQUIREMENTS CHECK ONLY");
+    toolCall = checking && process.env.FAKE_CODEX_TOOL !== "request_clarification" ? "confirm_requirements" : process.env.FAKE_CODEX_TOOL;
+    const args = toolCall === "confirm_requirements" ? { reason: "The task has all necessary facts" } : toolCall === "submit_review"
       ? { verdict: "changes-requested", summary: "needs revision", findings: [{ detail: "Choose input format", severity: "minor", kind: "question", options: [{ label: "JSON", value: "json", recommended: true }, { label: "CSV", value: "csv" }] }], checks: ["read implementation", "ran tests"] }
       : toolCall === "request_clarification"
         ? { questions: ["Which target framework must be supported?"] }
@@ -243,8 +245,8 @@ process.on("SIGTERM", () => process.exit(0));
     const first = await adapter.execute(firstRequest);
     assert.equal(first.output, "first answer");
     assert.equal(declaredKind, "completion");
-    assert.deepEqual(firstEvents.filter((event) => event.type === "tool_start" || event.type === "tool_end").map((event) => event.type), ["tool_start", "tool_end"]);
-    assert.equal(firstEvents.find((event) => event.type === "tool_start")?.toolName, "complete_task");
+    assert.deepEqual(firstEvents.filter((event) => event.type === "tool_start" || event.type === "tool_end").map((event) => event.type), ["tool_start", "tool_end", "tool_start", "tool_end"]);
+    assert.equal(firstEvents.filter((event) => event.type === "tool_start").map((event) => event.toolName).join(","), "confirm_requirements,complete_task");
     assert.equal((await sessions.get("thread-1", "codex"))?.locator, "codex-session-123");
 
     process.env.FAKE_CODEX_TOOL = "submit_review";
@@ -280,7 +282,8 @@ process.on("SIGTERM", () => process.exit(0));
       return { accepted: true };
     };
     const third = await adapter.execute(thirdRequest);
-    assert.equal(third.output, "clarification answer");
+    assert.match(third.output, /Which target framework/);
+    assert.equal(thirdEvents.some((event) => event.type === "text_delta"), false);
     assert.deepEqual(clarificationQuestions, ["Which target framework must be supported?"]);
     assert.equal(thirdEvents.find((event) => event.type === "tool_start")?.toolName, "request_clarification");
 
@@ -292,7 +295,11 @@ process.on("SIGTERM", () => process.exit(0));
     const rpc = records.filter((record) => record.kind === "rpc").map((record) => record.value as Record<string, unknown>);
     const started = rpc.find((message) => message.method === "thread/start");
     const startParams = started?.params as { dynamicTools?: Array<{ name: string }> };
-    assert.deepEqual(startParams.dynamicTools?.map((tool) => tool.name), ["post_message", "hold_ball", "submit_review", "request_clarification", "record_prior_art", "complete_task", "submit_plan"]);
+    assert.deepEqual(startParams.dynamicTools?.map((tool) => tool.name), ["confirm_requirements", "post_message", "hold_ball", "submit_review", "request_clarification", "record_prior_art", "complete_task", "submit_plan"]);
+    assert.equal((started?.params as { sandbox: string }).sandbox, "read-only");
+    const resumed = rpc.filter((message) => message.method === "thread/resume");
+    assert.equal((resumed[0]?.params as { sandbox: string }).sandbox, "workspace-write");
+    assert.equal(invocations.length, 4); // check + execution, peer review, clarification only
     assert.equal(JSON.stringify(started).includes("mcp_servers"), false);
     assert.equal(rpc.some((message) => message.method === "thread/resume" && (message.params as { threadId?: string }).threadId === "codex-session-123"), true);
   } finally {
@@ -419,3 +426,82 @@ function request(runId: string, events: RuntimeEvent[], signal = new AbortContro
   };
 }
 
+
+
+test("requirements check blocks delivery and hides speculative prose until a tool decision", async () => {
+  const events: RuntimeEvent[] = [];
+  const original = request("check-missing", events);
+  let calls = 0;
+  await assert.rejects(checkRequirements(original, async (phase) => {
+    calls++;
+    assert.equal(phase.agent.accessMode, "read-only");
+    assert.equal((await phase.declareDeliverable({ kind: "completion", summary: "guessed" })).accepted, false);
+    assert.equal((await phase.postMessage({ content: "@pi do it", idempotencyKey: "x" })).accepted, false);
+    await phase.emit({ type: "text_delta", text: "Here is a guessed packing list" });
+    return { output: "guessed answer without calling a tool" };
+  }), /需求检查未完成/);
+  assert.equal(calls, 1);
+  assert.deepEqual(events, []);
+});
+
+test("accepted clarification preserves options and stops without executing", async () => {
+  const original = request("check-question", []);
+  const questions = [{ question: "Which style?", options: [{ label: "Practical", recommended: true }, { label: "Photo focused" }] }];
+  original.requestClarification = async (input) => {
+    assert.deepEqual(input.questions, questions);
+    return { accepted: true };
+  };
+  let calls = 0;
+  const result = await checkRequirements(original, async (phase) => {
+    calls++;
+    assert.equal((await phase.requestClarification({ questions })).accepted, true);
+    assert.equal((await phase.confirmRequirements!("skip the answer")).accepted, false);
+    return { output: "should not be delivered" };
+  });
+  assert.equal(calls, 1);
+  assert.match(result.output, /Which style/);
+});
+
+test("ready check restores original access and retains history and plan mode", async () => {
+  const events: RuntimeEvent[] = [];
+  const original = request("check-ready", events);
+  original.planMode = true;
+  let calls = 0;
+  const result = await checkRequirements(original, async (phase) => {
+    calls++;
+    assert.equal(phase.context, original.context);
+    assert.equal(phase.incoming, original.incoming);
+    assert.equal(phase.planMode, true);
+    if (phase.confirmRequirements) {
+      assert.equal((await phase.confirmRequirements(" ")).accepted, false);
+      assert.equal((await phase.confirmRequirements("User already supplied dates and style")).accepted, true);
+      return { output: "internal check" };
+    }
+    assert.equal(phase.agent.accessMode, original.agent.accessMode);
+    return { output: "final answer" };
+  });
+  assert.equal(calls, 2);
+  assert.equal(result.output, "final answer");
+  assert.match(JSON.stringify(events), /User already supplied dates/);
+});
+
+test("rejected questions and cancellation cannot fall through to execution", async () => {
+  const controller = new AbortController();
+  const original = request("check-cancel", [], controller.signal);
+  original.requestClarification = async () => ({ accepted: false, reason: "invalid" });
+  let calls = 0;
+  await assert.rejects(checkRequirements(original, async (phase) => {
+    calls++;
+    await phase.requestClarification({ questions: [] });
+    return { output: "" };
+  }), /需求检查未完成/);
+  assert.equal(calls, 1);
+  calls = 0;
+  await assert.rejects(checkRequirements(original, async (phase) => {
+    calls++;
+    await phase.confirmRequirements!("Ready");
+    controller.abort();
+    return { output: "" };
+  }), /cancelled/);
+  assert.equal(calls, 1);
+});

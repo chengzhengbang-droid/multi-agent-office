@@ -159,6 +159,9 @@ export interface RuntimeImage {
 }
 
 export interface RuntimeRequest {
+  /** Internal phase marker; never accepted from the user API. */
+  requirementsChecked?: boolean;
+  confirmRequirements?(reason: string): Promise<RequestClarificationResult>;
   runId: Id;
   threadId: Id;
   workingDirectory?: string;
