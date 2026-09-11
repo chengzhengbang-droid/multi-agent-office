@@ -161,6 +161,8 @@ export interface RuntimeImage {
 export interface RuntimeRequest {
   /** Internal phase marker; never accepted from the user API. */
   requirementsChecked?: boolean;
+  /** Internal correction for a check that ended without an accepted decision. */
+  requirementsCheckFeedback?: string;
   confirmRequirements?(reason: string): Promise<RequestClarificationResult>;
   runId: Id;
   threadId: Id;
