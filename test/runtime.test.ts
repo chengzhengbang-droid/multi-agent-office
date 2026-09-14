@@ -16,6 +16,7 @@ import type {
 } from "../src/runtime/runtime.js";
 import {
   buildSystemPrompt,
+  buildUserPrompt,
   piExcludedTools,
   resolvePiAvailability,
   summarizeToolPayload,
@@ -201,7 +202,12 @@ createInterface({ input: process.stdin }).on("line", (line) => {
         : "turn-1";
     send({ id: message.id, result: { turn: { id: currentTurn, status: "inProgress", items: [] } } });
     const checking = message.params.input[0].text.includes("This turn is REQUIREMENTS CHECK ONLY");
-    toolCall = checking && process.env.FAKE_CODEX_TOOL !== "request_clarification" ? "confirm_requirements" : process.env.FAKE_CODEX_TOOL;
+    if (process.env.FAKE_CODEX_TOOL === "recover" && checking && !message.params.input[0].text.includes("previous check ended without a successful tool decision")) {
+      send({ method: "item/completed", params: { turnId: currentTurn, item: { id: "omitted-decision", type: "agentMessage", text: "guessed answer" } } });
+      send({ method: "turn/completed", params: { turn: { id: currentTurn, status: "completed", items: [] } } });
+      return;
+    }
+    toolCall = checking && process.env.FAKE_CODEX_TOOL !== "request_clarification" ? "confirm_requirements" : process.env.FAKE_CODEX_TOOL === "recover" ? "complete_task" : process.env.FAKE_CODEX_TOOL;
     const args = toolCall === "confirm_requirements" ? { reason: "The task has all necessary facts" } : toolCall === "submit_review"
       ? { verdict: "changes-requested", summary: "needs revision", findings: [{ detail: "Choose input format", severity: "minor", kind: "question", options: [{ label: "JSON", value: "json", recommended: true }, { label: "CSV", value: "csv" }] }], checks: ["read implementation", "ran tests"] }
       : toolCall === "request_clarification"
@@ -300,6 +306,17 @@ process.on("SIGTERM", () => process.exit(0));
     const resumed = rpc.filter((message) => message.method === "thread/resume");
     assert.equal((resumed[0]?.params as { sandbox: string }).sandbox, "workspace-write");
     assert.equal(invocations.length, 4); // check + execution, peer review, clarification only
+
+    process.env.FAKE_CODEX_TOOL = "recover";
+    const recoveryEvents: RuntimeEvent[] = [];
+    const recovered = await adapter.execute(request("run-recovery", recoveryEvents));
+    assert.equal(recovered.output, "first answer");
+    assert.equal(recoveryEvents.some((event) => event.type === "diagnostic" && event.message.includes("自动纠正重试")), true);
+    assert.deepEqual(recoveryEvents.filter((event) => event.type === "text_delta").map((event) => event.text), ["first answer"]);
+    const recoveryRpc = (await readFile(logPath, "utf8")).trim().split("\n").slice(records.length)
+      .map((line) => JSON.parse(line) as { kind: string; value: { method?: string; params?: { sandbox?: string } } });
+    assert.equal(recoveryRpc.filter((record) => record.kind === "args").length, 3);
+    assert.deepEqual(recoveryRpc.filter((record) => record.value.method === "thread/resume").map((record) => record.value.params?.sandbox), ["read-only", "read-only", "workspace-write"]);
     assert.equal(JSON.stringify(started).includes("mcp_servers"), false);
     assert.equal(rpc.some((message) => message.method === "thread/resume" && (message.params as { threadId?: string }).threadId === "codex-session-123"), true);
   } finally {
@@ -440,8 +457,9 @@ test("requirements check blocks delivery and hides speculative prose until a too
     await phase.emit({ type: "text_delta", text: "Here is a guessed packing list" });
     return { output: "guessed answer without calling a tool" };
   }), /需求检查未完成/);
-  assert.equal(calls, 1);
-  assert.deepEqual(events, []);
+  assert.equal(calls, 2);
+  assert.equal(events.length, 1);
+  assert.match(JSON.stringify(events), /自动纠正重试/);
 });
 
 test("accepted clarification preserves options and stops without executing", async () => {
@@ -495,7 +513,7 @@ test("rejected questions and cancellation cannot fall through to execution", asy
     await phase.requestClarification({ questions: [] });
     return { output: "" };
   }), /需求检查未完成/);
-  assert.equal(calls, 1);
+  assert.equal(calls, 2);
   calls = 0;
   await assert.rejects(checkRequirements(original, async (phase) => {
     calls++;
@@ -505,3 +523,104 @@ test("rejected questions and cancellation cannot fall through to execution", asy
   }), /cancelled/);
   assert.equal(calls, 1);
 });
+
+
+test("clarification answer recovers a missed decision and preserves task context", async () => {
+  const events: RuntimeEvent[] = [];
+  const original = request("answered-date", events);
+  original.incoming.content = "第 1 题：10 月哪几天出发？\n回答：early";
+  original.context.recentMessages = [{ ...original.incoming, id: "original-task", content: "10 月新疆七天穿搭，休闲风" }];
+  let calls = 0;
+  const result = await checkRequirements(original, async (phase) => {
+    calls++;
+    assert.equal(phase.context, original.context);
+    assert.equal(phase.incoming, original.incoming);
+    const prompt = buildUserPrompt(phase);
+    assert.match(prompt, /10 月新疆七天穿搭/);
+    assert.match(prompt, /回答：early/);
+    if (phase.confirmRequirements) {
+      assert.equal(phase.agent.accessMode, "read-only");
+      assert.match(prompt, /This turn is REQUIREMENTS CHECK ONLY/);
+      assert.doesNotMatch(prompt, /Respond to the incoming message now/);
+      assert.equal((await phase.holdBall({ wakeAfterMs: 100, waitSourceRef: { kind: "test", value: "x", expectedSignal: "x" } })).accepted, false);
+      if (calls === 1) {
+        assert.equal(phase.requirementsCheckFeedback, undefined);
+        await phase.emit({ type: "text_delta", text: "speculative packing list" });
+        await phase.emit({ type: "thinking_delta", text: "hidden thought" });
+        await phase.emit({ type: "output_reset", reason: "retry" });
+        return { output: "speculative packing list" };
+      }
+      assert.match(prompt, /previous check ended without a successful tool decision/);
+      await phase.confirmRequirements("The user answered early October and already chose casual style");
+      return { output: "internal decision" };
+    }
+    assert.equal(phase.agent.accessMode, "workspace-write");
+    assert.equal(phase.requirementsCheckFeedback, undefined);
+    assert.match(prompt, /This is the execution turn/);
+    assert.doesNotMatch(prompt, /This turn is REQUIREMENTS CHECK ONLY/);
+    await phase.emit({ type: "text_delta", text: "final packing list" });
+    return { output: "final packing list" };
+  });
+  assert.equal(calls, 3);
+  assert.equal(result.output, "final packing list");
+  assert.deepEqual(events.filter((event) => ["text_delta", "thinking_delta", "output_reset"].includes(event.type)), [{ type: "text_delta", text: "final packing list" }]);
+});
+
+test("corrective check can repair a rejected question without executing", async () => {
+  const original = request("repair-question", []);
+  const questions = [{ question: "Which dates?", options: [{ label: "Early October", value: "early" }, { label: "Late October", value: "late" }] }];
+  original.requestClarification = async (input) => ({ accepted: input.questions.length > 0 });
+  let calls = 0;
+  const result = await checkRequirements(original, async (phase) => {
+    calls++;
+    assert.ok(phase.confirmRequirements);
+    const result = await phase.requestClarification({ questions: calls === 1 ? [] : questions });
+    assert.equal(result.accepted, calls === 2);
+    return { output: "hidden" };
+  });
+  assert.equal(calls, 2);
+  assert.match(result.output, /Which dates/);
+});
+
+test("requirements recovery never retries runtime errors or cancelled checks", async () => {
+  let calls = 0;
+  await assert.rejects(checkRequirements(request("runtime-error", []), async () => {
+    calls++;
+    throw new Error("provider unavailable");
+  }), /provider unavailable/);
+  assert.equal(calls, 1);
+  const controller = new AbortController();
+  calls = 0;
+  await assert.rejects(checkRequirements(request("cancel-before-retry", [], controller.signal), async () => {
+    calls++;
+    controller.abort();
+    return { output: "no decision" };
+  }), /cancelled/);
+  assert.equal(calls, 1);
+  await assert.rejects(checkRequirements(request("already-cancelled", [], controller.signal), async () => {
+    assert.fail("cancelled checks must not start");
+  }), /cancelled/);
+});
+
+for (const kind of ["codex", "pi"] as const) {
+  test(`${kind} usage remains cumulative across corrective checks and execution`, async () => {
+    const events: RuntimeEvent[] = [];
+    const original = request("retry-usage", events);
+    if (kind === "pi") original.agent = { ...original.agent, runtime: { kind: "pi", provider: "deepseek", model: "deepseek-v4-pro", thinkingLevel: "medium" } };
+    let calls = 0;
+    await checkRequirements(original, async (phase) => {
+      calls++;
+      for (const update of [1, 2]) {
+        const total = kind === "pi" ? (calls - 1) * 2 + update : update;
+        await phase.emit({ type: "usage", inputTokens: total, outputTokens: total, cacheReadTokens: total, cacheWriteTokens: total, totalTokens: total, costUsd: total });
+      }
+      if (calls === 2) await phase.confirmRequirements!("All facts supplied");
+      return { output: "answer" };
+    });
+    assert.equal(calls, 3);
+    const usage = events.filter((event) => event.type === "usage");
+    for (const key of ["inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens", "totalTokens", "costUsd"] as const) {
+      assert.deepEqual(usage.map((event) => event[key]), [1, 2, 3, 4, 5, 6]);
+    }
+  });
+}

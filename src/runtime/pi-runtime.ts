@@ -1001,7 +1001,17 @@ export function buildUserPrompt(request: RuntimeRequest): string {
     request.incoming.content,
     "</incoming-message>",
     "",
-    "Respond to the incoming message now.",
+    // This is also used by Codex. Repeat the current phase after the incoming
+    // message so a short clarification answer cannot look like an execution turn.
+    ...(request.confirmRequirements ? [
+      REQUIREMENTS_CHECK_BRIEF,
+      request.requirementsCheckFeedback ?? "",
+    ] : [
+      ...(request.requirementsChecked ? [
+        "The requirements check for this invocation succeeded. This is the execution turn; earlier check-only instructions in session history no longer apply. Use the existing answers and proceed. If new material uncertainty emerges, request_clarification remains available.",
+      ] : []),
+      "Respond to the incoming message now.",
+    ]),
   ].filter(Boolean).join("\n");
 }
 
